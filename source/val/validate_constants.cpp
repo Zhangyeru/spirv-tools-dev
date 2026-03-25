@@ -255,7 +255,8 @@ spv_result_t ValidateConstantComposite(ValidationState_t& _,
       }
     } break;
     case spv::Op::OpTypeCooperativeMatrixKHR:
-    case spv::Op::OpTypeCooperativeMatrixNV: {
+    case spv::Op::OpTypeCooperativeMatrixNV:
+    case spv::Op::OpTypeCooperativeMatrixAD: {
       if (1 != constituent_count) {
         return _.diag(SPV_ERROR_INVALID_ID, inst)
                << opcode_name << " Constituent <id> "
@@ -321,6 +322,7 @@ bool IsTypeNullable(const std::vector<uint32_t>& instruction,
       return true;
     case spv::Op::OpTypeArray:
     case spv::Op::OpTypeMatrix:
+    case spv::Op::OpTypeCooperativeMatrixAD:
     case spv::Op::OpTypeCooperativeMatrixNV:
     case spv::Op::OpTypeCooperativeMatrixKHR:
     case spv::Op::OpTypeCooperativeVectorNV:

@@ -615,6 +615,8 @@ spv_result_t ValidateTypeForwardPointer(ValidationState_t& _,
 
 spv_result_t ValidateTypeCooperativeMatrix(ValidationState_t& _,
                                            const Instruction* inst) {
+  const bool is_ad = inst->opcode() == spv::Op::OpTypeCooperativeMatrixAD;
+  const char* opcode_name = spvOpcodeString(inst->opcode());
   const auto component_type_index = 1;
   const auto component_type_id =
       inst->GetOperandAs<uint32_t>(component_type_index);
@@ -622,38 +624,41 @@ spv_result_t ValidateTypeCooperativeMatrix(ValidationState_t& _,
   if (!component_type || (spv::Op::OpTypeFloat != component_type->opcode() &&
                           spv::Op::OpTypeInt != component_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrix Component Type <id> "
+           << opcode_name << " Component Type <id> "
            << _.getIdName(component_type_id)
            << " is not a scalar numerical type.";
   }
 
-  const auto scope_index = 2;
-  const auto scope_id = inst->GetOperandAs<uint32_t>(scope_index);
-  const auto scope = _.FindDef(scope_id);
-  if (!scope || !_.IsIntScalarType(scope->type_id()) ||
-      !spvOpcodeIsConstant(scope->opcode())) {
-    return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrix Scope <id> " << _.getIdName(scope_id)
-           << " is not a constant instruction with scalar integer type.";
+  uint32_t scope_id = 0;
+  if (!is_ad) {
+    const auto scope_index = 2;
+    scope_id = inst->GetOperandAs<uint32_t>(scope_index);
+    const auto scope = _.FindDef(scope_id);
+    if (!scope || !_.IsIntScalarType(scope->type_id()) ||
+        !spvOpcodeIsConstant(scope->opcode())) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " Scope <id> " << _.getIdName(scope_id)
+             << " is not a constant instruction with scalar integer type.";
+    }
   }
 
-  const auto rows_index = 3;
+  const auto rows_index = is_ad ? 2 : 3;
   const auto rows_id = inst->GetOperandAs<uint32_t>(rows_index);
   const auto rows = _.FindDef(rows_id);
   if (!rows || !_.IsIntScalarType(rows->type_id()) ||
       !spvOpcodeIsConstant(rows->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrix Rows <id> " << _.getIdName(rows_id)
+           << opcode_name << " Rows <id> " << _.getIdName(rows_id)
            << " is not a constant instruction with scalar integer type.";
   }
 
-  const auto cols_index = 4;
+  const auto cols_index = is_ad ? 3 : 4;
   const auto cols_id = inst->GetOperandAs<uint32_t>(cols_index);
   const auto cols = _.FindDef(cols_id);
   if (!cols || !_.IsIntScalarType(cols->type_id()) ||
       !spvOpcodeIsConstant(cols->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrix Cols <id> " << _.getIdName(cols_id)
+           << opcode_name << " Cols <id> " << _.getIdName(cols_id)
            << " is not a constant instruction with scalar integer type.";
   }
 
@@ -669,30 +674,32 @@ spv_result_t ValidateTypeCooperativeMatrix(ValidationState_t& _,
     }
   }
 
-  uint64_t scope_value;
-  if (_.EvalConstantValUint64(scope_id, &scope_value)) {
-    if (scope_value == static_cast<uint32_t>(spv::Scope::Workgroup)) {
-      for (auto entry_point_id : _.entry_points()) {
-        if (!_.EntryPointHasLocalSizeOrId(entry_point_id)) {
-          return _.diag(SPV_ERROR_INVALID_ID, inst)
-                 << "OpTypeCooperativeMatrixKHR with ScopeWorkgroup "
-                 << "used without specifying LocalSize or LocalSizeId "
-                 << "for entry point <id> " << _.getIdName(entry_point_id);
-        }
-        const auto local_size = _.EntryPointLocalSizeOrId(entry_point_id);
-        const auto mode = local_size->GetOperandAs<spv::ExecutionMode>(1);
-        if (mode == spv::ExecutionMode::LocalSizeId) {
-          uint32_t local_size_ids[3] = {
-              local_size->GetOperandAs<uint32_t>(2),
-              local_size->GetOperandAs<uint32_t>(3),
-              local_size->GetOperandAs<uint32_t>(4),
-          };
-          for (auto id : local_size_ids) {
-            if (_.FindDef(id) > inst) {
-              return _.diag(SPV_ERROR_INVALID_ID, inst)
-                     << "OpTypeCooperativeMatrixKHR with ScopeWorkgroup "
-                     << "used before LocalSizeId constant value <id> "
-                     << _.getIdName(id) << " is defined.";
+  if (!is_ad) {
+    uint64_t scope_value;
+    if (_.EvalConstantValUint64(scope_id, &scope_value)) {
+      if (scope_value == static_cast<uint32_t>(spv::Scope::Workgroup)) {
+        for (auto entry_point_id : _.entry_points()) {
+          if (!_.EntryPointHasLocalSizeOrId(entry_point_id)) {
+            return _.diag(SPV_ERROR_INVALID_ID, inst)
+                   << "OpTypeCooperativeMatrixKHR with ScopeWorkgroup "
+                   << "used without specifying LocalSize or LocalSizeId "
+                   << "for entry point <id> " << _.getIdName(entry_point_id);
+          }
+          const auto local_size = _.EntryPointLocalSizeOrId(entry_point_id);
+          const auto mode = local_size->GetOperandAs<spv::ExecutionMode>(1);
+          if (mode == spv::ExecutionMode::LocalSizeId) {
+            uint32_t local_size_ids[3] = {
+                local_size->GetOperandAs<uint32_t>(2),
+                local_size->GetOperandAs<uint32_t>(3),
+                local_size->GetOperandAs<uint32_t>(4),
+            };
+            for (auto id : local_size_ids) {
+              if (_.FindDef(id) > inst) {
+                return _.diag(SPV_ERROR_INVALID_ID, inst)
+                       << "OpTypeCooperativeMatrixKHR with ScopeWorkgroup "
+                       << "used before LocalSizeId constant value <id> "
+                       << _.getIdName(id) << " is defined.";
+              }
             }
           }
         }
@@ -880,6 +887,7 @@ spv_result_t TypePass(ValidationState_t& _, const Instruction* inst) {
       if (auto error = ValidateTypeForwardPointer(_, inst)) return error;
       break;
     case spv::Op::OpTypeCooperativeMatrixNV:
+    case spv::Op::OpTypeCooperativeMatrixAD:
     case spv::Op::OpTypeCooperativeMatrixKHR:
       if (auto error = ValidateTypeCooperativeMatrix(_, inst)) return error;
       break;

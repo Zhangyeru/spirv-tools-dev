@@ -128,7 +128,8 @@ spv_result_t GetExtractInsertValueType(ValidationState_t& _,
       case spv::Op::OpTypeCooperativeVectorNV:
       case spv::Op::OpTypeCooperativeVectorAD:
       case spv::Op::OpTypeCooperativeMatrixKHR:
-      case spv::Op::OpTypeCooperativeMatrixNV: {
+      case spv::Op::OpTypeCooperativeMatrixNV:
+      case spv::Op::OpTypeCooperativeMatrixAD: {
         *member_type = type_inst->word(2);
         break;
       }
@@ -376,7 +377,8 @@ spv_result_t ValidateCompositeConstruct(ValidationState_t& _,
       }
       break;
     }
-    case spv::Op::OpTypeCooperativeMatrixNV: {
+    case spv::Op::OpTypeCooperativeMatrixNV:
+    case spv::Op::OpTypeCooperativeMatrixAD: {
       const auto result_type_inst = _.FindDef(result_type);
       assert(result_type_inst);
       const auto component_type_id =

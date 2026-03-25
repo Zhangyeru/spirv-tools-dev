@@ -547,28 +547,34 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       break;
     }
 
-    case spv::Op::OpCooperativeMatrixMulAddNV: {
+    case spv::Op::OpCooperativeMatrixMulAddNV:
+    case spv::Op::OpCooperativeMatrixMulAddAD: {
+      const bool is_ad = opcode == spv::Op::OpCooperativeMatrixMulAddAD;
       const uint32_t D_type_id = _.GetOperandTypeId(inst, 1);
       const uint32_t A_type_id = _.GetOperandTypeId(inst, 2);
       const uint32_t B_type_id = _.GetOperandTypeId(inst, 3);
       const uint32_t C_type_id = _.GetOperandTypeId(inst, 4);
 
-      if (!_.IsCooperativeMatrixNVType(A_type_id)) {
+      if ((is_ad && !_.IsCooperativeMatrixADType(A_type_id)) ||
+          (!is_ad && !_.IsCooperativeMatrixNVType(A_type_id))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected cooperative matrix type as A Type: "
                << spvOpcodeString(opcode);
       }
-      if (!_.IsCooperativeMatrixNVType(B_type_id)) {
+      if ((is_ad && !_.IsCooperativeMatrixADType(B_type_id)) ||
+          (!is_ad && !_.IsCooperativeMatrixNVType(B_type_id))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected cooperative matrix type as B Type: "
                << spvOpcodeString(opcode);
       }
-      if (!_.IsCooperativeMatrixNVType(C_type_id)) {
+      if ((is_ad && !_.IsCooperativeMatrixADType(C_type_id)) ||
+          (!is_ad && !_.IsCooperativeMatrixNVType(C_type_id))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected cooperative matrix type as C Type: "
                << spvOpcodeString(opcode);
       }
-      if (!_.IsCooperativeMatrixNVType(D_type_id)) {
+      if ((is_ad && !_.IsCooperativeMatrixADType(D_type_id)) ||
+          (!is_ad && !_.IsCooperativeMatrixNVType(D_type_id))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected cooperative matrix type as Result Type: "
                << spvOpcodeString(opcode);
@@ -582,20 +588,25 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       std::tuple<bool, bool, uint32_t> A_scope, B_scope, C_scope, D_scope,
           A_rows, B_rows, C_rows, D_rows, A_cols, B_cols, C_cols, D_cols;
 
-      A_scope = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(2));
-      B_scope = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(2));
-      C_scope = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(2));
-      D_scope = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(2));
+      if (!is_ad) {
+        A_scope = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(2));
+        B_scope = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(2));
+        C_scope = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(2));
+        D_scope = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(2));
+      }
 
-      A_rows = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(3));
-      B_rows = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(3));
-      C_rows = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(3));
-      D_rows = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(3));
+      const uint32_t rows_index = is_ad ? 2u : 3u;
+      const uint32_t cols_index = is_ad ? 3u : 4u;
 
-      A_cols = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(4));
-      B_cols = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(4));
-      C_cols = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(4));
-      D_cols = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(4));
+      A_rows = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(rows_index));
+      B_rows = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(rows_index));
+      C_rows = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(rows_index));
+      D_rows = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(rows_index));
+
+      A_cols = _.EvalInt32IfConst(A->GetOperandAs<uint32_t>(cols_index));
+      B_cols = _.EvalInt32IfConst(B->GetOperandAs<uint32_t>(cols_index));
+      C_cols = _.EvalInt32IfConst(C->GetOperandAs<uint32_t>(cols_index));
+      D_cols = _.EvalInt32IfConst(D->GetOperandAs<uint32_t>(cols_index));
 
       const auto notEqual = [](std::tuple<bool, bool, uint32_t> X,
                                std::tuple<bool, bool, uint32_t> Y) {
@@ -603,9 +614,10 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
                 std::get<2>(X) != std::get<2>(Y));
       };
 
-      if (notEqual(A_scope, B_scope) || notEqual(A_scope, C_scope) ||
-          notEqual(A_scope, D_scope) || notEqual(B_scope, C_scope) ||
-          notEqual(B_scope, D_scope) || notEqual(C_scope, D_scope)) {
+      if (!is_ad &&
+          (notEqual(A_scope, B_scope) || notEqual(A_scope, C_scope) ||
+           notEqual(A_scope, D_scope) || notEqual(B_scope, C_scope) ||
+           notEqual(B_scope, D_scope) || notEqual(C_scope, D_scope))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Cooperative matrix scopes must match: "
                << spvOpcodeString(opcode);
