@@ -53,6 +53,41 @@ bool IsAllowedTypeOrArrayOfSame(ValidationState_t& _, const Instruction* type,
   return false;
 }
 
+bool IsCooperativeVectorTypeOp(spv::Op opcode) {
+  return opcode == spv::Op::OpTypeCooperativeVectorNV ||
+         opcode == spv::Op::OpTypeCooperativeVectorAD;
+}
+
+bool IsCooperativeVectorLoadOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorLoadNV ||
+         opcode == spv::Op::OpCooperativeVectorLoadAD;
+}
+
+bool IsCooperativeVectorStoreOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorStoreNV ||
+         opcode == spv::Op::OpCooperativeVectorStoreAD;
+}
+
+bool IsCooperativeVectorOuterProductOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorOuterProductAccumulateNV ||
+         opcode == spv::Op::OpCooperativeVectorOuterProductAccumulateAD;
+}
+
+bool IsCooperativeVectorReduceOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorReduceSumAccumulateNV ||
+         opcode == spv::Op::OpCooperativeVectorReduceSumAccumulateAD;
+}
+
+bool IsCooperativeVectorMatMulOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorMatrixMulNV ||
+         opcode == spv::Op::OpCooperativeVectorMatrixMulAD;
+}
+
+bool IsCooperativeVectorMatMulAddOp(spv::Op opcode) {
+  return opcode == spv::Op::OpCooperativeVectorMatrixMulAddNV ||
+         opcode == spv::Op::OpCooperativeVectorMatrixMulAddAD;
+}
+
 // Returns true if the two instructions represent structs that, as far as the
 // validator can tell, have the exact same data layout.
 bool AreLayoutCompatibleStructs(ValidationState_t& _, const Instruction* type1,
@@ -205,6 +240,7 @@ std::pair<spv::StorageClass, spv::StorageClass> GetStorageClass(
     case spv::Op::OpCooperativeMatrixLoadTensorNV:
     case spv::Op::OpCooperativeMatrixLoadKHR:
     case spv::Op::OpCooperativeVectorLoadNV:
+    case spv::Op::OpCooperativeVectorLoadAD:
     case spv::Op::OpLoad: {
       auto load_pointer = _.FindDef(inst->GetOperandAs<uint32_t>(2));
       auto load_pointer_type = _.FindDef(load_pointer->type_id());
@@ -215,6 +251,7 @@ std::pair<spv::StorageClass, spv::StorageClass> GetStorageClass(
     case spv::Op::OpCooperativeMatrixStoreTensorNV:
     case spv::Op::OpCooperativeMatrixStoreKHR:
     case spv::Op::OpCooperativeVectorStoreNV:
+    case spv::Op::OpCooperativeVectorStoreAD:
     case spv::Op::OpStore: {
       auto store_pointer = _.FindDef(inst->GetOperandAs<uint32_t>(0));
       auto store_pointer_type = _.FindDef(store_pointer->type_id());
@@ -307,7 +344,7 @@ spv_result_t CheckMemoryAccess(ValidationState_t& _, const Instruction* inst,
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadTensorNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadKHR ||
-        inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) {
+        IsCooperativeVectorLoadOp(inst->opcode())) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
              << "MakePointerAvailableKHR cannot be used with OpLoad.";
     }
@@ -329,7 +366,7 @@ spv_result_t CheckMemoryAccess(ValidationState_t& _, const Instruction* inst,
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreKHR ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreTensorNV ||
-        inst->opcode() == spv::Op::OpCooperativeVectorStoreNV) {
+        IsCooperativeVectorStoreOp(inst->opcode())) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
              << "MakePointerVisibleKHR cannot be used with OpStore.";
     }
@@ -787,7 +824,7 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
       pointee &&
       _.ContainsType(pointee->id(), [](const Instruction* type_inst) {
         auto opcode = type_inst->opcode();
-        return opcode == spv::Op::OpTypeCooperativeVectorNV;
+        return IsCooperativeVectorTypeOp(opcode);
       })) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << "Cooperative vector types (or types containing them) can only be "
@@ -1565,6 +1602,7 @@ spv_result_t ValidateAccessChain(ValidationState_t& _,
       case spv::Op::OpTypeMatrix:
       case spv::Op::OpTypeVector:
       case spv::Op::OpTypeCooperativeVectorNV:
+      case spv::Op::OpTypeCooperativeVectorAD:
       case spv::Op::OpTypeCooperativeMatrixNV:
       case spv::Op::OpTypeCooperativeMatrixKHR:
       case spv::Op::OpTypeArray:
@@ -2448,40 +2486,36 @@ spv_result_t ValidateCooperativeVectorPointer(ValidationState_t& _,
 spv_result_t ValidateCooperativeVectorLoadStoreNV(ValidationState_t& _,
                                                   const Instruction* inst) {
   uint32_t type_id;
-  const char* opname;
-  if (inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) {
+  const char* opname = spvOpcodeString(inst->opcode());
+  if (IsCooperativeVectorLoadOp(inst->opcode())) {
     type_id = inst->type_id();
-    opname = "spv::Op::OpCooperativeVectorLoadNV";
   } else {
     // get Object operand's type
     type_id = _.FindDef(inst->GetOperandAs<uint32_t>(2))->type_id();
-    opname = "spv::Op::OpCooperativeVectorStoreNV";
   }
 
   auto vector_type = _.FindDef(type_id);
 
-  if (vector_type->opcode() != spv::Op::OpTypeCooperativeVectorNV) {
-    if (inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) {
+  if (!IsCooperativeVectorTypeOp(vector_type->opcode())) {
+    if (IsCooperativeVectorLoadOp(inst->opcode())) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
-             << "spv::Op::OpCooperativeVectorLoadNV Result Type <id> "
+             << opname << " Result Type <id> "
              << _.getIdName(type_id) << " is not a cooperative vector type.";
     } else {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
-             << "spv::Op::OpCooperativeVectorStoreNV Object type <id> "
+             << opname << " Object type <id> "
              << _.getIdName(type_id) << " is not a cooperative vector type.";
     }
   }
 
-  const auto pointer_index =
-      (inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) ? 2u : 0u;
+  const auto pointer_index = IsCooperativeVectorLoadOp(inst->opcode()) ? 2u : 0u;
 
   if (auto error =
           ValidateCooperativeVectorPointer(_, inst, opname, pointer_index)) {
     return error;
   }
 
-  const auto memory_access_index =
-      (inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) ? 4u : 3u;
+  const auto memory_access_index = IsCooperativeVectorLoadOp(inst->opcode()) ? 4u : 3u;
   if (inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
       return error;
@@ -2493,8 +2527,7 @@ spv_result_t ValidateCooperativeVectorLoadStoreNV(ValidationState_t& _,
 spv_result_t ValidateCooperativeVectorOuterProductNV(ValidationState_t& _,
                                                      const Instruction* inst) {
   const auto pointer_index = 0u;
-  const auto opcode_name =
-      "spv::Op::OpCooperativeVectorOuterProductAccumulateNV";
+  const auto opcode_name = spvOpcodeString(inst->opcode());
 
   if (auto error = ValidateCooperativeVectorPointer(_, inst, opcode_name,
                                                     pointer_index)) {
@@ -2504,7 +2537,7 @@ spv_result_t ValidateCooperativeVectorOuterProductNV(ValidationState_t& _,
   auto type_id = _.FindDef(inst->GetOperandAs<uint32_t>(2))->type_id();
   auto a_type = _.FindDef(type_id);
 
-  if (a_type->opcode() != spv::Op::OpTypeCooperativeVectorNV) {
+  if (!IsCooperativeVectorTypeOp(a_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opcode_name << " A type <id> " << _.getIdName(type_id)
            << " is not a cooperative vector type.";
@@ -2513,7 +2546,7 @@ spv_result_t ValidateCooperativeVectorOuterProductNV(ValidationState_t& _,
   type_id = _.FindDef(inst->GetOperandAs<uint32_t>(3))->type_id();
   auto b_type = _.FindDef(type_id);
 
-  if (b_type->opcode() != spv::Op::OpTypeCooperativeVectorNV) {
+  if (!IsCooperativeVectorTypeOp(b_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opcode_name << " B type <id> " << _.getIdName(type_id)
            << " is not a cooperative vector type.";
@@ -2555,7 +2588,7 @@ spv_result_t ValidateCooperativeVectorOuterProductNV(ValidationState_t& _,
 
 spv_result_t ValidateCooperativeVectorReduceSumNV(ValidationState_t& _,
                                                   const Instruction* inst) {
-  const auto opcode_name = "spv::Op::OpCooperativeVectorReduceSumAccumulateNV";
+  const auto opcode_name = spvOpcodeString(inst->opcode());
   const auto pointer_index = 0u;
 
   if (auto error = ValidateCooperativeVectorPointer(_, inst, opcode_name,
@@ -2566,7 +2599,7 @@ spv_result_t ValidateCooperativeVectorReduceSumNV(ValidationState_t& _,
   auto type_id = _.FindDef(inst->GetOperandAs<uint32_t>(2))->type_id();
   auto v_type = _.FindDef(type_id);
 
-  if (v_type->opcode() != spv::Op::OpTypeCooperativeVectorNV) {
+  if (!IsCooperativeVectorTypeOp(v_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opcode_name << " V type <id> " << _.getIdName(type_id)
            << " is not a cooperative vector type.";
@@ -2593,11 +2626,8 @@ using std::get;
 
 spv_result_t ValidateCooperativeVectorMatrixMulNV(ValidationState_t& _,
                                                   const Instruction* inst) {
-  const bool has_bias =
-      inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddNV;
-  const auto opcode_name = has_bias
-                               ? "spv::Op::OpCooperativeVectorMatrixMulAddNV"
-                               : "spv::Op::OpCooperativeVectorMatrixMulNV";
+  const bool has_bias = IsCooperativeVectorMatMulAddOp(inst->opcode());
+  const auto opcode_name = spvOpcodeString(inst->opcode());
 
   const auto bias_offset = has_bias ? 3 : 0;
 
@@ -2632,7 +2662,7 @@ spv_result_t ValidateCooperativeVectorMatrixMulNV(ValidationState_t& _,
     return error;
   }
 
-  if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddNV) {
+  if (has_bias) {
     if (auto error = ValidateCooperativeVectorPointer(_, inst, opcode_name,
                                                       bias_index)) {
       return error;
@@ -2641,7 +2671,7 @@ spv_result_t ValidateCooperativeVectorMatrixMulNV(ValidationState_t& _,
 
   const auto result_type = _.FindDef(result_type_id);
 
-  if (result_type->opcode() != spv::Op::OpTypeCooperativeVectorNV) {
+  if (!IsCooperativeVectorTypeOp(result_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opcode_name << " result type <id> " << _.getIdName(result_type_id)
            << " is not a cooperative vector type.";
@@ -2896,20 +2926,26 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
         return error;
       break;
     case spv::Op::OpCooperativeVectorLoadNV:
+    case spv::Op::OpCooperativeVectorLoadAD:
     case spv::Op::OpCooperativeVectorStoreNV:
+    case spv::Op::OpCooperativeVectorStoreAD:
       if (auto error = ValidateCooperativeVectorLoadStoreNV(_, inst))
         return error;
       break;
     case spv::Op::OpCooperativeVectorOuterProductAccumulateNV:
+    case spv::Op::OpCooperativeVectorOuterProductAccumulateAD:
       if (auto error = ValidateCooperativeVectorOuterProductNV(_, inst))
         return error;
       break;
     case spv::Op::OpCooperativeVectorReduceSumAccumulateNV:
+    case spv::Op::OpCooperativeVectorReduceSumAccumulateAD:
       if (auto error = ValidateCooperativeVectorReduceSumNV(_, inst))
         return error;
       break;
     case spv::Op::OpCooperativeVectorMatrixMulNV:
+    case spv::Op::OpCooperativeVectorMatrixMulAD:
     case spv::Op::OpCooperativeVectorMatrixMulAddNV:
+    case spv::Op::OpCooperativeVectorMatrixMulAddAD:
       if (auto error = ValidateCooperativeVectorMatrixMulNV(_, inst))
         return error;
       break;
