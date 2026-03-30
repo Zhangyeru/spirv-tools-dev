@@ -914,32 +914,17 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       auto matrix_rows_value = _.EvalInt32IfConst(matrix_rows);
       auto matrix_cols_value = _.EvalInt32IfConst(matrix_cols);
 
-      if (reduce_value == 0) {
-        if (std::get<1>(result_rows_value) && std::get<1>(matrix_rows_value) &&
-            std::get<2>(result_rows_value) != std::get<2>(matrix_rows_value)) {
-          return _.diag(SPV_ERROR_INVALID_DATA, inst)
-                 << "For ReduceRowAD, result rows must match matrix rows: "
-                 << spvOpcodeString(opcode);
-        }
-        if (std::get<1>(result_cols_value) && std::get<1>(matrix_cols_value) &&
-            std::get<2>(result_cols_value) * 2 != std::get<2>(matrix_cols_value)) {
-          return _.diag(SPV_ERROR_INVALID_DATA, inst)
-                 << "For ReduceRowAD, result cols must be half matrix cols: "
-                 << spvOpcodeString(opcode);
-        }
-      } else {
-        if (std::get<1>(result_cols_value) && std::get<1>(matrix_cols_value) &&
-            std::get<2>(result_cols_value) != std::get<2>(matrix_cols_value)) {
-          return _.diag(SPV_ERROR_INVALID_DATA, inst)
-                 << "For ReduceColumnAD, result cols must match matrix cols: "
-                 << spvOpcodeString(opcode);
-        }
-        if (std::get<1>(result_rows_value) && std::get<1>(matrix_rows_value) &&
-            std::get<2>(result_rows_value) * 2 != std::get<2>(matrix_rows_value)) {
-          return _.diag(SPV_ERROR_INVALID_DATA, inst)
-                 << "For ReduceColumnAD, result rows must be half matrix rows: "
-                 << spvOpcodeString(opcode);
-        }
+      if (std::get<1>(result_rows_value) && std::get<1>(matrix_rows_value) &&
+          std::get<2>(result_rows_value) != std::get<2>(matrix_rows_value)) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Result rows must match matrix rows: "
+               << spvOpcodeString(opcode);
+      }
+      if (std::get<1>(result_cols_value) && std::get<1>(matrix_cols_value) &&
+          std::get<2>(result_cols_value) != std::get<2>(matrix_cols_value)) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Result cols must match matrix cols: "
+               << spvOpcodeString(opcode);
       }
 
       break;
