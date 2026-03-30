@@ -88,6 +88,31 @@ bool IsCooperativeVectorMatMulAddOp(spv::Op opcode) {
          opcode == spv::Op::OpCooperativeVectorMatrixMulAddAD;
 }
 
+bool IsScalarOrVectorNumericType(ValidationState_t& _, uint32_t type_id) {
+  return _.IsIntScalarOrVectorType(type_id) || _.IsFloatScalarOrVectorType(type_id);
+}
+
+bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
+  const auto* type = _.FindDef(type_id);
+  if (!type) {
+    return false;
+  }
+
+  if (type->opcode() != spv::Op::OpTypeArray &&
+      type->opcode() != spv::Op::OpTypeRuntimeArray) {
+    return false;
+  }
+
+  return IsScalarOrVectorNumericType(_, type->word(2));
+}
+
+bool IsFloat2Type(ValidationState_t& _, uint32_t type_id) {
+  const auto* type = _.FindDef(type_id);
+  return type && type->opcode() == spv::Op::OpTypeVector &&
+         type->word(3) == 2 && _.IsFloatScalarType(type->word(2)) &&
+         _.GetBitWidth(type->word(2)) == 32;
+}
+
 // Returns true if the two instructions represent structs that, as far as the
 // validator can tell, have the exact same data layout.
 bool AreLayoutCompatibleStructs(ValidationState_t& _, const Instruction* type1,
@@ -1981,6 +2006,8 @@ spv_result_t ValidateCooperativeMatrixLengthNV(ValidationState_t& state,
 spv_result_t ValidateCooperativeMatrixLoadStoreNV(ValidationState_t& _,
                                                   const Instruction* inst) {
   uint32_t type_id;
+  const bool isAd = inst->opcode() == spv::Op::OpCooperativeMatrixLoadAD ||
+                    inst->opcode() == spv::Op::OpCooperativeMatrixStoreAD;
   const bool isLoad = inst->opcode() == spv::Op::OpCooperativeMatrixLoadNV ||
                       inst->opcode() == spv::Op::OpCooperativeMatrixLoadAD;
   const char* opname = spvOpcodeString(inst->opcode());
@@ -2042,34 +2069,69 @@ spv_result_t ValidateCooperativeMatrixLoadStoreNV(ValidationState_t& _,
 
   const auto pointee_id = pointer_type->GetOperandAs<uint32_t>(2);
   const auto pointee_type = _.FindDef(pointee_id);
-  if (!pointee_type || !(_.IsIntScalarOrVectorType(pointee_id) ||
-                         _.IsFloatScalarOrVectorType(pointee_id))) {
+  const bool valid_pointee = isAd ? IsScalarOrVectorNumericArrayType(_, pointee_id)
+                                  : IsScalarOrVectorNumericType(_, pointee_id);
+  if (!pointee_type || !valid_pointee) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opname << " Pointer <id> " << _.getIdName(pointer->id())
-           << "s Type must be a scalar or vector type.";
+           << (isAd ? "s Type must be an array of scalar or vector type."
+                    : "s Type must be a scalar or vector type.");
   }
 
-  const auto stride_index = isLoad ? 3u : 2u;
-  const auto stride_id = inst->GetOperandAs<uint32_t>(stride_index);
-  const auto stride = _.FindDef(stride_id);
-  if (!stride || !_.IsIntScalarType(stride->type_id())) {
-    return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "Stride operand <id> " << _.getIdName(stride_id)
-           << " must be a scalar integer type.";
+  uint32_t memory_access_index = 0;
+  if (isAd) {
+    const auto matrix_shape_index = isLoad ? 3u : 2u;
+    const auto matrix_shape_id = inst->GetOperandAs<uint32_t>(matrix_shape_index);
+    const auto matrix_shape = _.FindDef(matrix_shape_id);
+    if (!matrix_shape || !IsFloat2Type(_, matrix_shape->type_id())) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << "Matrix Shape operand <id> " << _.getIdName(matrix_shape_id)
+             << " must be a vec2.";
+    }
+
+    const auto matrix_offset_index = isLoad ? 4u : 3u;
+    const auto matrix_offset_id = inst->GetOperandAs<uint32_t>(matrix_offset_index);
+    const auto matrix_offset = _.FindDef(matrix_offset_id);
+    if (!matrix_offset || !IsFloat2Type(_, matrix_offset->type_id())) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << "Matrix Offset operand <id> " << _.getIdName(matrix_offset_id)
+             << " must be a vec2.";
+    }
+
+    const auto matrix_layout_index = isLoad ? 5u : 4u;
+    const auto matrix_layout_id = inst->GetOperandAs<uint32_t>(matrix_layout_index);
+    const auto matrix_layout = _.FindDef(matrix_layout_id);
+    if (!matrix_layout || !_.IsIntScalarType(matrix_layout->type_id())) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << "Matrix Layout operand <id> " << _.getIdName(matrix_layout_id)
+             << " must be a scalar integer type.";
+    }
+
+    memory_access_index = isLoad ? 6u : 5u;
+  } else {
+    const auto stride_index = isLoad ? 3u : 2u;
+    const auto stride_id = inst->GetOperandAs<uint32_t>(stride_index);
+    const auto stride = _.FindDef(stride_id);
+    if (!stride || !_.IsIntScalarType(stride->type_id())) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << "Stride operand <id> " << _.getIdName(stride_id)
+             << " must be a scalar integer type.";
+    }
+
+    const auto colmajor_index = isLoad ? 4u : 3u;
+    const auto colmajor_id = inst->GetOperandAs<uint32_t>(colmajor_index);
+    const auto colmajor = _.FindDef(colmajor_id);
+    if (!colmajor || !_.IsBoolScalarType(colmajor->type_id()) ||
+        !(spvOpcodeIsConstant(colmajor->opcode()) ||
+          spvOpcodeIsSpecConstant(colmajor->opcode()))) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << "Column Major operand <id> " << _.getIdName(colmajor_id)
+             << " must be a boolean constant instruction.";
+    }
+
+    memory_access_index = isLoad ? 5u : 4u;
   }
 
-  const auto colmajor_index = isLoad ? 4u : 3u;
-  const auto colmajor_id = inst->GetOperandAs<uint32_t>(colmajor_index);
-  const auto colmajor = _.FindDef(colmajor_id);
-  if (!colmajor || !_.IsBoolScalarType(colmajor->type_id()) ||
-      !(spvOpcodeIsConstant(colmajor->opcode()) ||
-        spvOpcodeIsSpecConstant(colmajor->opcode()))) {
-    return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "Column Major operand <id> " << _.getIdName(colmajor_id)
-           << " must be a boolean constant instruction.";
-  }
-
-  const auto memory_access_index = isLoad ? 5u : 4u;
   if (inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
       return error;
