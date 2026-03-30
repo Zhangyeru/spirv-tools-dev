@@ -853,6 +853,98 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       break;
     }
 
+    case spv::Op::OpCooperativeMatrixReduceAD: {
+      if (!_.IsCooperativeMatrixADType(result_type)) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Result Type must be a cooperative matrix AD type: "
+               << spvOpcodeString(opcode);
+      }
+
+      const auto result_type_inst = _.FindDef(result_type);
+      const auto result_comp_type_id = result_type_inst->GetOperandAs<uint32_t>(1);
+
+      const auto matrix_id = inst->GetOperandAs<uint32_t>(2);
+      const auto matrix = _.FindDef(matrix_id);
+      const auto matrix_type_id = matrix->type_id();
+      if (!_.IsCooperativeMatrixADType(matrix_type_id)) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Matrix must have a cooperative matrix AD type: "
+               << spvOpcodeString(opcode);
+      }
+
+      const auto matrix_type = _.FindDef(matrix_type_id);
+      const auto matrix_comp_type_id = matrix_type->GetOperandAs<uint32_t>(1);
+      if (matrix_comp_type_id != result_comp_type_id) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Result Type and Matrix type must have the same component type: "
+               << spvOpcodeString(opcode);
+      }
+
+      const auto reduce_mask_id = inst->GetOperandAs<uint32_t>(3);
+      const auto reduce_mask = _.FindDef(reduce_mask_id);
+      uint64_t reduce_value = 0;
+      if (!reduce_mask || !_.IsIntScalarType(reduce_mask->type_id()) ||
+          !spvOpcodeIsConstant(reduce_mask->opcode()) ||
+          !_.EvalConstantValUint64(reduce_mask_id, &reduce_value) ||
+          reduce_value > 1) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "ReduceMask must be a constant integer in range [0, 1]: "
+               << spvOpcodeString(opcode);
+      }
+
+      const auto combine_op_id = inst->GetOperandAs<uint32_t>(4);
+      const auto combine_op = _.FindDef(combine_op_id);
+      uint64_t combine_value = 0;
+      if (!combine_op || !_.IsIntScalarType(combine_op->type_id()) ||
+          !spvOpcodeIsConstant(combine_op->opcode()) ||
+          !_.EvalConstantValUint64(combine_op_id, &combine_value) ||
+          combine_value > 2) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "CombineOp must be a constant integer in range [0, 2]: "
+               << spvOpcodeString(opcode);
+      }
+
+      const auto result_rows = _.FindDef(result_type)->GetOperandAs<uint32_t>(2);
+      const auto result_cols = _.FindDef(result_type)->GetOperandAs<uint32_t>(3);
+      const auto matrix_rows = matrix_type->GetOperandAs<uint32_t>(2);
+      const auto matrix_cols = matrix_type->GetOperandAs<uint32_t>(3);
+
+      auto result_rows_value = _.EvalInt32IfConst(result_rows);
+      auto result_cols_value = _.EvalInt32IfConst(result_cols);
+      auto matrix_rows_value = _.EvalInt32IfConst(matrix_rows);
+      auto matrix_cols_value = _.EvalInt32IfConst(matrix_cols);
+
+      if (reduce_value == 0) {
+        if (std::get<1>(result_rows_value) && std::get<1>(matrix_rows_value) &&
+            std::get<2>(result_rows_value) != std::get<2>(matrix_rows_value)) {
+          return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                 << "For ReduceRowAD, result rows must match matrix rows: "
+                 << spvOpcodeString(opcode);
+        }
+        if (std::get<1>(result_cols_value) && std::get<1>(matrix_cols_value) &&
+            std::get<2>(result_cols_value) * 2 != std::get<2>(matrix_cols_value)) {
+          return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                 << "For ReduceRowAD, result cols must be half matrix cols: "
+                 << spvOpcodeString(opcode);
+        }
+      } else {
+        if (std::get<1>(result_cols_value) && std::get<1>(matrix_cols_value) &&
+            std::get<2>(result_cols_value) != std::get<2>(matrix_cols_value)) {
+          return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                 << "For ReduceColumnAD, result cols must match matrix cols: "
+                 << spvOpcodeString(opcode);
+        }
+        if (std::get<1>(result_rows_value) && std::get<1>(matrix_rows_value) &&
+            std::get<2>(result_rows_value) * 2 != std::get<2>(matrix_rows_value)) {
+          return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                 << "For ReduceColumnAD, result rows must be half matrix rows: "
+                 << spvOpcodeString(opcode);
+        }
+      }
+
+      break;
+    }
+
     default:
       break;
   }
