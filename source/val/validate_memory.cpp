@@ -2107,7 +2107,7 @@ spv_result_t ValidateCooperativeMatrixLoadStoreNV(ValidationState_t& _,
              << " must be a scalar integer type.";
     }
 
-    memory_access_index = isLoad ? 6u : 5u;
+    memory_access_index = ~0u;
   } else {
     const auto stride_index = isLoad ? 3u : 2u;
     const auto stride_id = inst->GetOperandAs<uint32_t>(stride_index);
@@ -2132,7 +2132,7 @@ spv_result_t ValidateCooperativeMatrixLoadStoreNV(ValidationState_t& _,
     memory_access_index = isLoad ? 5u : 4u;
   }
 
-  if (inst->operands().size() > memory_access_index) {
+  if (memory_access_index != ~0u && inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
       return error;
   }
