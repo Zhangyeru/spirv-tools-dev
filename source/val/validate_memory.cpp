@@ -2587,8 +2587,10 @@ spv_result_t ValidateCooperativeVectorLoadStoreNV(ValidationState_t& _,
     return error;
   }
 
-  const auto memory_access_index = IsCooperativeVectorLoadOp(inst->opcode()) ? 4u : 3u;
-  if (inst->operands().size() > memory_access_index) {
+  const auto memory_access_index =
+      inst->opcode() == spv::Op::OpCooperativeVectorLoadAD ? ~0u :
+      IsCooperativeVectorLoadOp(inst->opcode()) ? 4u : 3u;
+  if (memory_access_index != ~0u && inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
       return error;
   }
