@@ -1350,13 +1350,22 @@ spv_result_t ValidationState_t::CooperativeMatrixShapesMatch(
            << "Expected cooperative matrix types";
   }
 
-  uint32_t m1_scope_id = m1_type->GetOperandAs<uint32_t>(2);
-  uint32_t m1_rows_id = m1_type->GetOperandAs<uint32_t>(3);
-  uint32_t m1_cols_id = m1_type->GetOperandAs<uint32_t>(4);
+  uint32_t m1_scope_id = 0, m1_rows_id = 0, m1_cols_id = 0;
+  uint32_t m2_scope_id = 0, m2_rows_id = 0, m2_cols_id = 0;
 
-  uint32_t m2_scope_id = m2_type->GetOperandAs<uint32_t>(2);
-  uint32_t m2_rows_id = m2_type->GetOperandAs<uint32_t>(3);
-  uint32_t m2_cols_id = m2_type->GetOperandAs<uint32_t>(4);
+  if (m1_type->opcode() == spv::Op::OpTypeCooperativeMatrixAD) {
+    m1_rows_id = m1_type->GetOperandAs<uint32_t>(2);
+    m1_cols_id = m1_type->GetOperandAs<uint32_t>(3);
+    m2_rows_id = m2_type->GetOperandAs<uint32_t>(2);
+    m2_cols_id = m2_type->GetOperandAs<uint32_t>(3);
+  } else {
+    m1_scope_id = m1_type->GetOperandAs<uint32_t>(2);
+    m1_rows_id = m1_type->GetOperandAs<uint32_t>(3);
+    m1_cols_id = m1_type->GetOperandAs<uint32_t>(4);
+    m2_scope_id = m2_type->GetOperandAs<uint32_t>(2);
+    m2_rows_id = m2_type->GetOperandAs<uint32_t>(3);
+    m2_cols_id = m2_type->GetOperandAs<uint32_t>(4);
+  }
 
   if (swap_row_col) {
     std::swap(m1_rows_id, m1_cols_id);
@@ -1366,15 +1375,17 @@ spv_result_t ValidationState_t::CooperativeMatrixShapesMatch(
        m2_is_const_int32 = false;
   uint32_t m1_value = 0, m2_value = 0;
 
-  std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
-      EvalInt32IfConst(m1_scope_id);
-  std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
-      EvalInt32IfConst(m2_scope_id);
+  if (m1_type->opcode() != spv::Op::OpTypeCooperativeMatrixAD) {
+    std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
+        EvalInt32IfConst(m1_scope_id);
+    std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
+        EvalInt32IfConst(m2_scope_id);
 
-  if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
-    return diag(SPV_ERROR_INVALID_DATA, inst)
-           << "Expected scopes of Matrix and Result Type to be "
-           << "identical";
+    if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
+      return diag(SPV_ERROR_INVALID_DATA, inst)
+             << "Expected scopes of Matrix and Result Type to be "
+             << "identical";
+    }
   }
 
   std::tie(m1_is_int32, m1_is_const_int32, m1_value) =

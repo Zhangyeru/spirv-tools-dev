@@ -48,6 +48,9 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           !(opcode == spv::Op::OpFMul &&
             _.IsCooperativeMatrixKHRType(result_type) &&
             _.IsFloatCooperativeMatrixType(result_type)) &&
+          !(opcode == spv::Op::OpFMul &&
+            _.IsCooperativeMatrixADType(result_type) &&
+            _.IsFloatCooperativeMatrixType(result_type)) &&
           !(supportsCoopVec && _.IsFloatCooperativeVectorNVType(result_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected floating scalar or vector type as Result Type: "
@@ -154,6 +157,9 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           !(opcode == spv::Op::OpIMul &&
             _.IsCooperativeMatrixKHRType(result_type) &&
             _.IsIntCooperativeMatrixType(result_type)) &&
+          !(opcode == spv::Op::OpIMul &&
+            _.IsCooperativeMatrixADType(result_type) &&
+            _.IsIntCooperativeMatrixType(result_type)) &&
           !(supportsCoopVec && _.IsIntCooperativeVectorNVType(result_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected int scalar or vector type as Result Type: "
@@ -189,6 +195,18 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
           if (ret != SPV_SUCCESS) return ret;
+        } else if (opcode == spv::Op::OpIMul &&
+                   _.IsCooperativeMatrixADType(result_type)) {
+          if (!_.IsCooperativeMatrixADType(type_id) ||
+              !_.IsIntCooperativeMatrixType(type_id)) {
+            return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                   << "Expected arithmetic operands to be of Result Type: "
+                   << spvOpcodeString(opcode) << " operand index "
+                   << operand_index;
+          }
+          spv_result_t ret =
+              _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
+          if (ret != SPV_SUCCESS) return ret;
         }
 
         if (!type_id ||
@@ -196,6 +214,9 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
              !(supportsCoopMat && _.IsIntCooperativeMatrixType(result_type)) &&
              !(opcode == spv::Op::OpIMul &&
                _.IsCooperativeMatrixKHRType(result_type) &&
+               _.IsIntCooperativeMatrixType(result_type)) &&
+             !(opcode == spv::Op::OpIMul &&
+               _.IsCooperativeMatrixADType(result_type) &&
                _.IsIntCooperativeMatrixType(result_type)) &&
              !(supportsCoopVec && _.IsIntCooperativeVectorNVType(result_type))))
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
