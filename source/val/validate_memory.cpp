@@ -2702,6 +2702,112 @@ using std::get;
 
 spv_result_t ValidateCooperativeVectorMatrixMulNV(ValidationState_t& _,
                                                   const Instruction* inst) {
+  if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAD ||
+      inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddAD) {
+    const auto opcode_name = spvOpcodeString(inst->opcode());
+    const bool has_bias =
+        inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddAD;
+    const auto result_type_id = inst->GetOperandAs<uint32_t>(0u);
+    const auto input_id = inst->GetOperandAs<uint32_t>(2u);
+    const auto matrix_id = inst->GetOperandAs<uint32_t>(3u);
+    const auto bias_id = has_bias ? inst->GetOperandAs<uint32_t>(4u) : 0u;
+
+    const auto result_type = _.FindDef(result_type_id);
+    if (result_type->opcode() != spv::Op::OpTypeCooperativeVectorAD) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " result type <id> " << _.getIdName(result_type_id)
+             << " is not OpTypeCooperativeVectorAD.";
+    }
+
+    const auto input = _.FindDef(input_id);
+    const auto input_type = _.FindDef(input->type_id());
+    if (input_type->opcode() != spv::Op::OpTypeCooperativeVectorAD) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " Input <id> " << _.getIdName(input_id)
+             << " is not a cooperative vector AD object.";
+    }
+
+    const auto matrix = _.FindDef(matrix_id);
+    const auto matrix_type = _.FindDef(matrix->type_id());
+    if (matrix_type->opcode() != spv::Op::OpTypeCooperativeMatrixAD) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " Matrix <id> " << _.getIdName(matrix_id)
+             << " is not a cooperative matrix AD object.";
+    }
+
+    const auto result_component_type_id = result_type->GetOperandAs<uint32_t>(1u);
+    const auto input_component_type_id = input_type->GetOperandAs<uint32_t>(1u);
+    const auto matrix_component_type_id = matrix_type->GetOperandAs<uint32_t>(1u);
+
+    const auto check_equal = [&](uint32_t lhs_id, uint32_t rhs_id,
+                                 const char* lhs_name,
+                                 const char* rhs_name) -> spv_result_t {
+      const auto lhs_eval = _.EvalInt32IfConst(lhs_id);
+      const auto rhs_eval = _.EvalInt32IfConst(rhs_id);
+      if (get<1>(lhs_eval) && get<1>(rhs_eval) && get<2>(lhs_eval) != get<2>(rhs_eval)) {
+        return _.diag(SPV_ERROR_INVALID_ID, inst)
+               << opcode_name << " " << lhs_name << " " << get<2>(lhs_eval)
+               << " does not match " << rhs_name << " " << get<2>(rhs_eval);
+      }
+      return SPV_SUCCESS;
+    };
+
+    if (has_bias) {
+      const auto bias = _.FindDef(bias_id);
+      const auto bias_type = _.FindDef(bias->type_id());
+      if (bias_type->opcode() != spv::Op::OpTypeCooperativeVectorAD) {
+        return _.diag(SPV_ERROR_INVALID_ID, inst)
+               << opcode_name << " Bias <id> " << _.getIdName(bias_id)
+               << " is not a cooperative vector AD object.";
+      }
+
+      const auto bias_component_type_id = bias_type->GetOperandAs<uint32_t>(1u);
+      if (result_component_type_id != bias_component_type_id) {
+        return _.diag(SPV_ERROR_INVALID_ID, inst)
+               << opcode_name << " result and bias component types must match.";
+      }
+
+      if (auto error = check_equal(result_type->GetOperandAs<uint32_t>(2u),
+                                   bias_type->GetOperandAs<uint32_t>(2u),
+                                   "result number of components",
+                                   "bias number of components")) {
+        return error;
+      }
+    }
+
+    if (input_component_type_id != matrix_component_type_id) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " input vector and matrix component types must match.";
+    }
+
+    if (!(_.IsIntScalarType(result_component_type_id) &&
+          _.GetBitWidth(result_component_type_id) == 32) &&
+        !(_.IsFloatScalarType(result_component_type_id) &&
+          (_.GetBitWidth(result_component_type_id) == 32 ||
+           _.GetBitWidth(result_component_type_id) == 16))) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " result component type <id> "
+             << _.getIdName(result_component_type_id)
+             << " is not a 32 bit int or 16/32 bit float.";
+    }
+
+    if (auto error = check_equal(result_type->GetOperandAs<uint32_t>(2u),
+                                 matrix_type->GetOperandAs<uint32_t>(2u),
+                                 "result number of components",
+                                 "matrix row count")) {
+      return error;
+    }
+
+    if (auto error = check_equal(input_type->GetOperandAs<uint32_t>(2u),
+                                 matrix_type->GetOperandAs<uint32_t>(3u),
+                                 "input number of components",
+                                 "matrix column count")) {
+      return error;
+    }
+
+    return SPV_SUCCESS;
+  }
+
   const bool has_bias = IsCooperativeVectorMatMulAddOp(inst->opcode());
   const auto opcode_name = spvOpcodeString(inst->opcode());
 
