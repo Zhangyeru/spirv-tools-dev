@@ -2563,7 +2563,8 @@ spv_result_t ValidateCooperativeVectorLoadStoreNV(ValidationState_t& _,
     type_id = inst->type_id();
   } else {
     // get Object operand's type
-    type_id = _.FindDef(inst->GetOperandAs<uint32_t>(2))->type_id();
+    type_id = _.FindDef(inst->GetOperandAs<uint32_t>(
+        inst->opcode() == spv::Op::OpCooperativeVectorStoreAD ? 1u : 2u))->type_id();
   }
 
   auto vector_type = _.FindDef(type_id);
@@ -2589,6 +2590,7 @@ spv_result_t ValidateCooperativeVectorLoadStoreNV(ValidationState_t& _,
 
   const auto memory_access_index =
       inst->opcode() == spv::Op::OpCooperativeVectorLoadAD ? ~0u :
+      inst->opcode() == spv::Op::OpCooperativeVectorStoreAD ? ~0u :
       IsCooperativeVectorLoadOp(inst->opcode()) ? 4u : 3u;
   if (memory_access_index != ~0u && inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
