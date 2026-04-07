@@ -69,13 +69,11 @@ bool IsCooperativeVectorStoreOp(spv::Op opcode) {
 }
 
 bool IsCooperativeVectorOuterProductOp(spv::Op opcode) {
-  return opcode == spv::Op::OpCooperativeVectorOuterProductAccumulateNV ||
-         opcode == spv::Op::OpCooperativeVectorOuterProductAccumulateAD;
+  return opcode == spv::Op::OpCooperativeVectorOuterProductAccumulateNV;
 }
 
 bool IsCooperativeVectorReduceOp(spv::Op opcode) {
-  return opcode == spv::Op::OpCooperativeVectorReduceSumAccumulateNV ||
-         opcode == spv::Op::OpCooperativeVectorReduceSumAccumulateAD;
+  return opcode == spv::Op::OpCooperativeVectorReduceSumAccumulateNV;
 }
 
 bool IsCooperativeVectorMatMulOp(spv::Op opcode) {
@@ -3118,12 +3116,10 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
         return error;
       break;
     case spv::Op::OpCooperativeVectorOuterProductAccumulateNV:
-    case spv::Op::OpCooperativeVectorOuterProductAccumulateAD:
       if (auto error = ValidateCooperativeVectorOuterProductNV(_, inst))
         return error;
       break;
     case spv::Op::OpCooperativeVectorReduceSumAccumulateNV:
-    case spv::Op::OpCooperativeVectorReduceSumAccumulateAD:
       if (auto error = ValidateCooperativeVectorReduceSumNV(_, inst))
         return error;
       break;
