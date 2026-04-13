@@ -53,11 +53,6 @@ bool IsAllowedTypeOrArrayOfSame(ValidationState_t& _, const Instruction* type,
   return false;
 }
 
-bool IsCooperativeVectorTypeOp(spv::Op opcode) {
-  return opcode == spv::Op::OpTypeCooperativeVectorNV ||
-         opcode == spv::Op::OpTypeCooperativeVectorAD;
-}
-
 bool IsScalarOrVectorNumericType(ValidationState_t& _, uint32_t type_id) {
   return _.IsIntScalarOrVectorType(type_id) || _.IsFloatScalarOrVectorType(type_id);
 }
@@ -818,7 +813,8 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
       pointee &&
       _.ContainsType(pointee->id(), [](const Instruction* type_inst) {
         auto opcode = type_inst->opcode();
-        return IsCooperativeVectorTypeOp(opcode);
+        return opcode == spv::Op::OpTypeCooperativeVectorNV ||
+               opcode == spv::Op::OpTypeCooperativeVectorAD;
       })) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << "Cooperative vector types (or types containing them) can only be "

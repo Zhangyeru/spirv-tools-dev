@@ -28,43 +28,15 @@ namespace val {
 spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
   const spv::Op opcode = inst->opcode();
   const uint32_t result_type = inst->type_id();
-  const auto is_coopmat = [&](uint32_t id) {
-    return _.IsCooperativeMatrixType(id) || _.IsCooperativeMatrixADType(id);
-  };
-  const auto is_float_coopmat = [&](uint32_t id) {
-    return _.IsFloatCooperativeMatrixType(id) ||
-           _.IsFloatCooperativeMatrixADType(id);
-  };
-  const auto is_int_coopmat = [&](uint32_t id) {
-    return _.IsIntCooperativeMatrixType(id) ||
-           _.IsIntCooperativeMatrixADType(id);
-  };
-  const auto is_unsigned_int_coopmat = [&](uint32_t id) {
-    return _.IsUnsignedIntCooperativeMatrixType(id) ||
-           _.IsUnsignedIntCooperativeMatrixADType(id);
-  };
-  const auto is_coopvec = [&](uint32_t id) {
-    return _.IsCooperativeVectorNVType(id) || _.IsCooperativeVectorADType(id);
-  };
-  const auto is_float_coopvec = [&](uint32_t id) {
-    return _.IsFloatCooperativeVectorNVType(id) ||
-           _.IsFloatCooperativeVectorADType(id);
-  };
-  const auto is_int_coopvec = [&](uint32_t id) {
-    return _.IsIntCooperativeVectorNVType(id) ||
-           _.IsIntCooperativeVectorADType(id);
-  };
-  const auto is_unsigned_int_coopvec = [&](uint32_t id) {
-    return _.IsUnsignedIntCooperativeVectorNVType(id) ||
-           _.IsUnsignedIntCooperativeVectorADType(id);
-  };
 
   switch (opcode) {
     case spv::Op::OpConvertFToU: {
       if (!_.IsUnsignedIntScalarType(result_type) &&
           !_.IsUnsignedIntVectorType(result_type) &&
-          !is_unsigned_int_coopmat(result_type) &&
-          !is_unsigned_int_coopvec(result_type))
+          !_.IsUnsignedIntCooperativeMatrixType(result_type) &&
+          !_.IsUnsignedIntCooperativeMatrixADType(result_type) &&
+          !_.IsUnsignedIntCooperativeVectorNVType(result_type) &&
+          !_.IsUnsignedIntCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected unsigned int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -72,17 +44,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type || (!_.IsFloatScalarType(input_type) &&
                           !_.IsFloatVectorType(input_type) &&
-                          !is_float_coopmat(input_type) &&
-                          !is_float_coopvec(input_type)))
+                          !_.IsFloatCooperativeMatrixType(input_type) &&
+                          !_.IsFloatCooperativeMatrixADType(input_type) &&
+                          !_.IsFloatCooperativeVectorNVType(input_type) &&
+                          !_.IsFloatCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be float scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -98,7 +78,10 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
 
     case spv::Op::OpConvertFToS: {
       if (!_.IsIntScalarType(result_type) && !_.IsIntVectorType(result_type) &&
-          !is_int_coopmat(result_type) && !is_int_coopvec(result_type))
+          !_.IsIntCooperativeMatrixType(result_type) &&
+          !_.IsIntCooperativeMatrixADType(result_type) &&
+          !_.IsIntCooperativeVectorNVType(result_type) &&
+          !_.IsIntCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -106,17 +89,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type || (!_.IsFloatScalarType(input_type) &&
                           !_.IsFloatVectorType(input_type) &&
-                          !is_float_coopmat(input_type) &&
-                          !is_float_coopvec(input_type)))
+                          !_.IsFloatCooperativeMatrixType(input_type) &&
+                          !_.IsFloatCooperativeMatrixADType(input_type) &&
+                          !_.IsFloatCooperativeVectorNVType(input_type) &&
+                          !_.IsFloatCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be float scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -134,8 +125,10 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpConvertUToF: {
       if (!_.IsFloatScalarType(result_type) &&
           !_.IsFloatVectorType(result_type) &&
-          !is_float_coopmat(result_type) &&
-          !is_float_coopvec(result_type))
+          !_.IsFloatCooperativeMatrixType(result_type) &&
+          !_.IsFloatCooperativeMatrixADType(result_type) &&
+          !_.IsFloatCooperativeVectorNVType(result_type) &&
+          !_.IsFloatCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected float scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -143,16 +136,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type ||
           (!_.IsIntScalarType(input_type) && !_.IsIntVectorType(input_type) &&
-           !is_int_coopmat(input_type) && !is_int_coopvec(input_type)))
+           !_.IsIntCooperativeMatrixType(input_type) &&
+           !_.IsIntCooperativeMatrixADType(input_type) &&
+           !_.IsIntCooperativeVectorNVType(input_type) &&
+           !_.IsIntCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be int scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -169,8 +171,10 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpUConvert: {
       if (!_.IsUnsignedIntScalarType(result_type) &&
           !_.IsUnsignedIntVectorType(result_type) &&
-          !is_unsigned_int_coopmat(result_type) &&
-          !is_unsigned_int_coopvec(result_type))
+          !_.IsUnsignedIntCooperativeMatrixType(result_type) &&
+          !_.IsUnsignedIntCooperativeMatrixADType(result_type) &&
+          !_.IsUnsignedIntCooperativeVectorNVType(result_type) &&
+          !_.IsUnsignedIntCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected unsigned int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -178,16 +182,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type ||
           (!_.IsIntScalarType(input_type) && !_.IsIntVectorType(input_type) &&
-           !is_int_coopmat(input_type) && !is_int_coopvec(input_type)))
+           !_.IsIntCooperativeMatrixType(input_type) &&
+           !_.IsIntCooperativeMatrixADType(input_type) &&
+           !_.IsIntCooperativeVectorNVType(input_type) &&
+           !_.IsIntCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be int scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -208,7 +221,10 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
 
     case spv::Op::OpSConvert: {
       if (!_.IsIntScalarType(result_type) && !_.IsIntVectorType(result_type) &&
-          !is_int_coopmat(result_type) && !is_int_coopvec(result_type))
+          !_.IsIntCooperativeMatrixType(result_type) &&
+          !_.IsIntCooperativeMatrixADType(result_type) &&
+          !_.IsIntCooperativeVectorNVType(result_type) &&
+          !_.IsIntCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -216,16 +232,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type ||
           (!_.IsIntScalarType(input_type) && !_.IsIntVectorType(input_type) &&
-           !is_int_coopmat(input_type) && !is_int_coopvec(input_type)))
+           !_.IsIntCooperativeMatrixType(input_type) &&
+           !_.IsIntCooperativeMatrixADType(input_type) &&
+           !_.IsIntCooperativeVectorNVType(input_type) &&
+           !_.IsIntCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be int scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -247,8 +272,10 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpFConvert: {
       if (!_.IsFloatScalarType(result_type) &&
           !_.IsFloatVectorType(result_type) &&
-          !is_float_coopmat(result_type) &&
-          !is_float_coopvec(result_type))
+          !_.IsFloatCooperativeMatrixType(result_type) &&
+          !_.IsFloatCooperativeMatrixADType(result_type) &&
+          !_.IsFloatCooperativeVectorNVType(result_type) &&
+          !_.IsFloatCooperativeVectorADType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected float scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -256,17 +283,25 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const uint32_t input_type = _.GetOperandTypeId(inst, 2);
       if (!input_type || (!_.IsFloatScalarType(input_type) &&
                           !_.IsFloatVectorType(input_type) &&
-                          !is_float_coopmat(input_type) &&
-                          !is_float_coopvec(input_type)))
+                          !_.IsFloatCooperativeMatrixType(input_type) &&
+                          !_.IsFloatCooperativeMatrixADType(input_type) &&
+                          !_.IsFloatCooperativeVectorNVType(input_type) &&
+                          !_.IsFloatCooperativeVectorADType(input_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected input to be float scalar or vector: "
                << spvOpcodeString(opcode);
 
-      if (is_coopvec(result_type) || is_coopvec(input_type)) {
+      if (_.IsCooperativeVectorNVType(result_type) ||
+          _.IsCooperativeVectorNVType(input_type) ||
+          _.IsCooperativeVectorADType(result_type) ||
+          _.IsCooperativeVectorADType(input_type)) {
         spv_result_t ret =
             _.CooperativeVectorDimensionsMatch(inst, result_type, input_type);
         if (ret != SPV_SUCCESS) return ret;
-      } else if (is_coopmat(result_type) || is_coopmat(input_type)) {
+      } else if (_.IsCooperativeMatrixType(result_type) ||
+                 _.IsCooperativeMatrixType(input_type) ||
+                 _.IsCooperativeMatrixADType(result_type) ||
+                 _.IsCooperativeMatrixADType(input_type)) {
         spv_result_t ret =
             _.CooperativeMatrixShapesMatch(inst, result_type, input_type, true);
         if (ret != SPV_SUCCESS) return ret;
@@ -528,10 +563,14 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
       const bool input_is_pointer = _.IsPointerType(input_type);
       const bool input_is_int_scalar = _.IsIntScalarType(input_type);
 
-      const bool result_is_coopmat = is_coopmat(result_type);
-      const bool input_is_coopmat = is_coopmat(input_type);
-      const bool result_is_coopvec = is_coopvec(result_type);
-      const bool input_is_coopvec = is_coopvec(input_type);
+      const bool result_is_coopmat = _.IsCooperativeMatrixType(result_type) ||
+                                     _.IsCooperativeMatrixADType(result_type);
+      const bool input_is_coopmat = _.IsCooperativeMatrixType(input_type) ||
+                                    _.IsCooperativeMatrixADType(input_type);
+      const bool result_is_coopvec = _.IsCooperativeVectorNVType(result_type) ||
+                                     _.IsCooperativeVectorADType(result_type);
+      const bool input_is_coopvec = _.IsCooperativeVectorNVType(input_type) ||
+                                    _.IsCooperativeVectorADType(input_type);
 
       if (!result_is_pointer && !result_is_int_scalar && !result_is_coopmat &&
           !result_is_coopvec && !_.IsIntVectorType(result_type) &&

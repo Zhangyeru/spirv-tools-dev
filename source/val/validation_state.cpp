@@ -1292,7 +1292,8 @@ bool ValidationState_t::IsCooperativeMatrixAccType(uint32_t id) const {
 }
 
 bool ValidationState_t::IsFloatCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id)) return false;
+  if (!IsCooperativeMatrixNVType(id) && !IsCooperativeMatrixKHRType(id))
+    return false;
   return IsFloatScalarType(FindDef(id)->word(2));
 }
 
@@ -1302,7 +1303,8 @@ bool ValidationState_t::IsFloatCooperativeMatrixADType(uint32_t id) const {
 }
 
 bool ValidationState_t::IsIntCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id)) return false;
+  if (!IsCooperativeMatrixNVType(id) && !IsCooperativeMatrixKHRType(id))
+    return false;
   return IsIntScalarType(FindDef(id)->word(2));
 }
 
@@ -1312,7 +1314,8 @@ bool ValidationState_t::IsIntCooperativeMatrixADType(uint32_t id) const {
 }
 
 bool ValidationState_t::IsUnsignedIntCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id)) return false;
+  if (!IsCooperativeMatrixNVType(id) && !IsCooperativeMatrixKHRType(id))
+    return false;
   return IsUnsignedIntScalarType(FindDef(id)->word(2));
 }
 
@@ -1375,27 +1378,63 @@ spv_result_t ValidationState_t::CooperativeMatrixShapesMatch(
   const auto m1_type = FindDef(result_type_id);
   const auto m2_type = FindDef(m2);
 
+  if (m1_type->opcode() == spv::Op::OpTypeCooperativeMatrixAD ||
+      m2_type->opcode() == spv::Op::OpTypeCooperativeMatrixAD) {
+    if (m1_type->opcode() != m2_type->opcode()) {
+      return diag(SPV_ERROR_INVALID_DATA, inst)
+             << "Expected cooperative matrix types";
+    }
+
+    uint32_t m1_rows_id = m1_type->GetOperandAs<uint32_t>(2);
+    uint32_t m1_cols_id = m1_type->GetOperandAs<uint32_t>(3);
+    uint32_t m2_rows_id = m2_type->GetOperandAs<uint32_t>(2);
+    uint32_t m2_cols_id = m2_type->GetOperandAs<uint32_t>(3);
+
+    if (swap_row_col) {
+      std::swap(m1_rows_id, m1_cols_id);
+    }
+
+    bool m1_is_int32 = false, m1_is_const_int32 = false,
+         m2_is_int32 = false, m2_is_const_int32 = false;
+    uint32_t m1_value = 0, m2_value = 0;
+
+    std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
+        EvalInt32IfConst(m1_rows_id);
+    std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
+        EvalInt32IfConst(m2_rows_id);
+
+    if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
+      return diag(SPV_ERROR_INVALID_DATA, inst)
+             << "Expected rows of Matrix type and Result Type to be "
+             << (swap_row_col ? "swapped with columns" : "identical");
+    }
+
+    std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
+        EvalInt32IfConst(m1_cols_id);
+    std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
+        EvalInt32IfConst(m2_cols_id);
+
+    if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
+      return diag(SPV_ERROR_INVALID_DATA, inst)
+             << "Expected columns of Matrix type and Result Type to be "
+             << (swap_row_col ? "swapped with rows" : "identical");
+    }
+
+    return SPV_SUCCESS;
+  }
+
   if (m1_type->opcode() != m2_type->opcode()) {
     return diag(SPV_ERROR_INVALID_DATA, inst)
            << "Expected cooperative matrix types";
   }
 
-  uint32_t m1_scope_id = 0, m1_rows_id = 0, m1_cols_id = 0;
-  uint32_t m2_scope_id = 0, m2_rows_id = 0, m2_cols_id = 0;
+  uint32_t m1_scope_id = m1_type->GetOperandAs<uint32_t>(2);
+  uint32_t m1_rows_id = m1_type->GetOperandAs<uint32_t>(3);
+  uint32_t m1_cols_id = m1_type->GetOperandAs<uint32_t>(4);
 
-  if (m1_type->opcode() == spv::Op::OpTypeCooperativeMatrixAD) {
-    m1_rows_id = m1_type->GetOperandAs<uint32_t>(2);
-    m1_cols_id = m1_type->GetOperandAs<uint32_t>(3);
-    m2_rows_id = m2_type->GetOperandAs<uint32_t>(2);
-    m2_cols_id = m2_type->GetOperandAs<uint32_t>(3);
-  } else {
-    m1_scope_id = m1_type->GetOperandAs<uint32_t>(2);
-    m1_rows_id = m1_type->GetOperandAs<uint32_t>(3);
-    m1_cols_id = m1_type->GetOperandAs<uint32_t>(4);
-    m2_scope_id = m2_type->GetOperandAs<uint32_t>(2);
-    m2_rows_id = m2_type->GetOperandAs<uint32_t>(3);
-    m2_cols_id = m2_type->GetOperandAs<uint32_t>(4);
-  }
+  uint32_t m2_scope_id = m2_type->GetOperandAs<uint32_t>(2);
+  uint32_t m2_rows_id = m2_type->GetOperandAs<uint32_t>(3);
+  uint32_t m2_cols_id = m2_type->GetOperandAs<uint32_t>(4);
 
   if (swap_row_col) {
     std::swap(m1_rows_id, m1_cols_id);
@@ -1405,17 +1444,15 @@ spv_result_t ValidationState_t::CooperativeMatrixShapesMatch(
        m2_is_const_int32 = false;
   uint32_t m1_value = 0, m2_value = 0;
 
-  if (m1_type->opcode() != spv::Op::OpTypeCooperativeMatrixAD) {
-    std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
-        EvalInt32IfConst(m1_scope_id);
-    std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
-        EvalInt32IfConst(m2_scope_id);
+  std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
+      EvalInt32IfConst(m1_scope_id);
+  std::tie(m2_is_int32, m2_is_const_int32, m2_value) =
+      EvalInt32IfConst(m2_scope_id);
 
-    if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
-      return diag(SPV_ERROR_INVALID_DATA, inst)
-             << "Expected scopes of Matrix and Result Type to be "
-             << "identical";
-    }
+  if (m1_is_const_int32 && m2_is_const_int32 && m1_value != m2_value) {
+    return diag(SPV_ERROR_INVALID_DATA, inst)
+           << "Expected scopes of Matrix and Result Type to be "
+           << "identical";
   }
 
   std::tie(m1_is_int32, m1_is_const_int32, m1_value) =
