@@ -1112,6 +1112,14 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
 
     return ss.str();
   };
+  auto is_float_coopvec = [&](uint32_t id) {
+    return _.IsFloatCooperativeVectorNVType(id) ||
+           _.IsFloatCooperativeVectorADType(id);
+  };
+  auto is_int_coopvec = [&](uint32_t id) {
+    return _.IsIntCooperativeVectorNVType(id) ||
+           _.IsIntCooperativeVectorADType(id);
+  };
 
   if (ext_inst_type == SPV_EXT_INST_TYPE_GLSL_STD_450) {
     const GLSLstd450 ext_inst_key = GLSLstd450(ext_inst_index);
@@ -1147,8 +1155,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
              ext_inst_key == GLSLstd450Step || ext_inst_key == GLSLstd450Fma);
 
         if (!_.IsFloatScalarOrVectorType(result_type) &&
-            !(supportsCoopVec &&
-              _.IsFloatCooperativeVectorNVType(result_type))) {
+            !(supportsCoopVec && is_float_coopvec(result_type))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be a float scalar or vector type";
@@ -1185,7 +1192,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
              ext_inst_key == GLSLstd450SClamp);
 
         if (!_.IsIntScalarOrVectorType(result_type) &&
-            !(supportsCoopVec && _.IsIntCooperativeVectorNVType(result_type))) {
+            !(supportsCoopVec && is_int_coopvec(result_type))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be an int scalar or vector type";
@@ -1199,8 +1206,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
           const uint32_t operand_type = _.GetOperandTypeId(inst, operand_index);
           if (!operand_type ||
               (!_.IsIntScalarOrVectorType(operand_type) &&
-               !(supportsCoopVec &&
-                 _.IsIntCooperativeVectorNVType(operand_type)))) {
+               !(supportsCoopVec && is_int_coopvec(operand_type)))) {
             return _.diag(SPV_ERROR_INVALID_DATA, inst)
                    << ext_inst_name() << ": "
                    << "expected all operands to be int scalars or vectors";
@@ -1258,8 +1264,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
              ext_inst_key == GLSLstd450Exp || ext_inst_key == GLSLstd450Log);
 
         if (!_.IsFloatScalarOrVectorType(result_type) &&
-            !(supportsCoopVec &&
-              _.IsFloatCooperativeVectorNVType(result_type))) {
+            !(supportsCoopVec && is_float_coopvec(result_type))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be a 16 or 32-bit scalar or "

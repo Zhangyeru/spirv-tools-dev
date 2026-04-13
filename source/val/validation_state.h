@@ -661,12 +661,19 @@ class ValidationState_t {
   bool IsCooperativeMatrixBType(uint32_t id) const;
   bool IsCooperativeMatrixAccType(uint32_t id) const;
   bool IsFloatCooperativeMatrixType(uint32_t id) const;
+  bool IsFloatCooperativeMatrixADType(uint32_t id) const;
   bool IsIntCooperativeMatrixType(uint32_t id) const;
+  bool IsIntCooperativeMatrixADType(uint32_t id) const;
   bool IsUnsignedIntCooperativeMatrixType(uint32_t id) const;
+  bool IsUnsignedIntCooperativeMatrixADType(uint32_t id) const;
   bool IsUnsigned64BitHandle(uint32_t id) const;
+  bool IsCooperativeVectorADType(uint32_t id) const;
   bool IsCooperativeVectorNVType(uint32_t id) const;
+  bool IsFloatCooperativeVectorADType(uint32_t id) const;
   bool IsFloatCooperativeVectorNVType(uint32_t id) const;
+  bool IsIntCooperativeVectorADType(uint32_t id) const;
   bool IsIntCooperativeVectorNVType(uint32_t id) const;
+  bool IsUnsignedIntCooperativeVectorADType(uint32_t id) const;
   bool IsUnsignedIntCooperativeVectorNVType(uint32_t id) const;
 
   // Returns true if |id| is a type id that contains |type| (or integer or

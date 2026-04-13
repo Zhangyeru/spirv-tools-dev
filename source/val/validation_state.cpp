@@ -1241,7 +1241,6 @@ bool ValidationState_t::IsAccelerationStructureType(uint32_t id) const {
 bool ValidationState_t::IsCooperativeMatrixType(uint32_t id) const {
   const Instruction* inst = FindDef(id);
   return inst && (inst->opcode() == spv::Op::OpTypeCooperativeMatrixNV ||
-                  inst->opcode() == spv::Op::OpTypeCooperativeMatrixAD ||
                   inst->opcode() == spv::Op::OpTypeCooperativeMatrixKHR);
 }
 
@@ -1293,20 +1292,32 @@ bool ValidationState_t::IsCooperativeMatrixAccType(uint32_t id) const {
 }
 
 bool ValidationState_t::IsFloatCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id))
-    return false;
+  if (!IsCooperativeMatrixType(id)) return false;
+  return IsFloatScalarType(FindDef(id)->word(2));
+}
+
+bool ValidationState_t::IsFloatCooperativeMatrixADType(uint32_t id) const {
+  if (!IsCooperativeMatrixADType(id)) return false;
   return IsFloatScalarType(FindDef(id)->word(2));
 }
 
 bool ValidationState_t::IsIntCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id))
-    return false;
+  if (!IsCooperativeMatrixType(id)) return false;
+  return IsIntScalarType(FindDef(id)->word(2));
+}
+
+bool ValidationState_t::IsIntCooperativeMatrixADType(uint32_t id) const {
+  if (!IsCooperativeMatrixADType(id)) return false;
   return IsIntScalarType(FindDef(id)->word(2));
 }
 
 bool ValidationState_t::IsUnsignedIntCooperativeMatrixType(uint32_t id) const {
-  if (!IsCooperativeMatrixType(id))
-    return false;
+  if (!IsCooperativeMatrixType(id)) return false;
+  return IsUnsignedIntScalarType(FindDef(id)->word(2));
+}
+
+bool ValidationState_t::IsUnsignedIntCooperativeMatrixADType(uint32_t id) const {
+  if (!IsCooperativeMatrixADType(id)) return false;
   return IsUnsignedIntScalarType(FindDef(id)->word(2));
 }
 
@@ -1317,10 +1328,19 @@ bool ValidationState_t::IsUnsigned64BitHandle(uint32_t id) const {
            GetBitWidth(id) == 32));
 }
 
+bool ValidationState_t::IsCooperativeVectorADType(uint32_t id) const {
+  const Instruction* inst = FindDef(id);
+  return inst && inst->opcode() == spv::Op::OpTypeCooperativeVectorAD;
+}
+
 bool ValidationState_t::IsCooperativeVectorNVType(uint32_t id) const {
   const Instruction* inst = FindDef(id);
-  return inst && (inst->opcode() == spv::Op::OpTypeCooperativeVectorNV ||
-                  inst->opcode() == spv::Op::OpTypeCooperativeVectorAD);
+  return inst && inst->opcode() == spv::Op::OpTypeCooperativeVectorNV;
+}
+
+bool ValidationState_t::IsFloatCooperativeVectorADType(uint32_t id) const {
+  if (!IsCooperativeVectorADType(id)) return false;
+  return IsFloatScalarType(FindDef(id)->word(2));
 }
 
 bool ValidationState_t::IsFloatCooperativeVectorNVType(uint32_t id) const {
@@ -1328,9 +1348,19 @@ bool ValidationState_t::IsFloatCooperativeVectorNVType(uint32_t id) const {
   return IsFloatScalarType(FindDef(id)->word(2));
 }
 
+bool ValidationState_t::IsIntCooperativeVectorADType(uint32_t id) const {
+  if (!IsCooperativeVectorADType(id)) return false;
+  return IsIntScalarType(FindDef(id)->word(2));
+}
+
 bool ValidationState_t::IsIntCooperativeVectorNVType(uint32_t id) const {
   if (!IsCooperativeVectorNVType(id)) return false;
   return IsIntScalarType(FindDef(id)->word(2));
+}
+
+bool ValidationState_t::IsUnsignedIntCooperativeVectorADType(uint32_t id) const {
+  if (!IsCooperativeVectorADType(id)) return false;
+  return IsUnsignedIntScalarType(FindDef(id)->word(2));
 }
 
 bool ValidationState_t::IsUnsignedIntCooperativeVectorNVType(
