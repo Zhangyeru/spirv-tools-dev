@@ -220,7 +220,7 @@ spv_result_t ValidateTypeCooperativeVectorNV(ValidationState_t& _,
   return SPV_SUCCESS;
 }
 
-spv_result_t ValidateTypeCooperativeVectorAD(ValidationState_t& _,
+spv_result_t ValidateTypeCooperativeVectorAZD(ValidationState_t& _,
                                              const Instruction* inst) {
   const auto component_index = 1;
   const auto component_type_id = inst->GetOperandAs<uint32_t>(component_index);
@@ -228,7 +228,7 @@ spv_result_t ValidateTypeCooperativeVectorAD(ValidationState_t& _,
   if (!component_type || (spv::Op::OpTypeFloat != component_type->opcode() &&
                           spv::Op::OpTypeInt != component_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeVectorAD Component Type <id> "
+           << "OpTypeCooperativeVectorAZD Component Type <id> "
            << _.getIdName(component_type_id)
            << " is not a scalar numerical type.";
   }
@@ -239,7 +239,7 @@ spv_result_t ValidateTypeCooperativeVectorAD(ValidationState_t& _,
   const auto num_components = _.FindDef(num_components_id);
   if (!num_components || !spvOpcodeIsConstant(num_components->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeVectorAD component count <id> "
+           << "OpTypeCooperativeVectorAZD component count <id> "
            << _.getIdName(num_components_id)
            << " is not a scalar constant type.";
   }
@@ -249,7 +249,7 @@ spv_result_t ValidateTypeCooperativeVectorAD(ValidationState_t& _,
   const auto const_result_type = _.FindDef(const_inst[const_result_type_index]);
   if (!const_result_type || spv::Op::OpTypeInt != const_result_type->opcode()) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeVectorAD component count <id> "
+           << "OpTypeCooperativeVectorAZD component count <id> "
            << _.getIdName(num_components_id)
            << " is not a constant integer type.";
   }
@@ -260,7 +260,7 @@ spv_result_t ValidateTypeCooperativeVectorAD(ValidationState_t& _,
     const bool is_signed = type_words[3] > 0;
     if (num_components_value == 0 || (num_components_value < 0 && is_signed)) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
-             << "OpTypeCooperativeVectorAD component count <id> "
+             << "OpTypeCooperativeVectorAZD component count <id> "
              << _.getIdName(num_components_id)
              << " default value must be at least 1: found "
              << num_components_value;
@@ -752,7 +752,7 @@ spv_result_t ValidateTypeCooperativeMatrix(ValidationState_t& _,
   return SPV_SUCCESS;
 }
 
-spv_result_t ValidateTypeCooperativeMatrixAD(ValidationState_t& _,
+spv_result_t ValidateTypeCooperativeMatrixAZD(ValidationState_t& _,
                                              const Instruction* inst) {
   const auto component_type_index = 1;
   const auto component_type_id =
@@ -761,7 +761,7 @@ spv_result_t ValidateTypeCooperativeMatrixAD(ValidationState_t& _,
   if (!component_type || (spv::Op::OpTypeFloat != component_type->opcode() &&
                           spv::Op::OpTypeInt != component_type->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrixAD Component Type <id> "
+           << "OpTypeCooperativeMatrixAZD Component Type <id> "
            << _.getIdName(component_type_id)
            << " is not a scalar numerical type.";
   }
@@ -772,7 +772,7 @@ spv_result_t ValidateTypeCooperativeMatrixAD(ValidationState_t& _,
   if (!rows || !_.IsIntScalarType(rows->type_id()) ||
       !spvOpcodeIsConstant(rows->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrixAD Rows <id> " << _.getIdName(rows_id)
+           << "OpTypeCooperativeMatrixAZD Rows <id> " << _.getIdName(rows_id)
            << " is not a constant instruction with scalar integer type.";
   }
 
@@ -782,7 +782,7 @@ spv_result_t ValidateTypeCooperativeMatrixAD(ValidationState_t& _,
   if (!cols || !_.IsIntScalarType(cols->type_id()) ||
       !spvOpcodeIsConstant(cols->opcode())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "OpTypeCooperativeMatrixAD Cols <id> " << _.getIdName(cols_id)
+           << "OpTypeCooperativeMatrixAZD Cols <id> " << _.getIdName(cols_id)
            << " is not a constant instruction with scalar integer type.";
   }
 
@@ -969,14 +969,14 @@ spv_result_t TypePass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpTypeCooperativeMatrixKHR:
       if (auto error = ValidateTypeCooperativeMatrix(_, inst)) return error;
       break;
-    case spv::Op::OpTypeCooperativeMatrixAD:
-      if (auto error = ValidateTypeCooperativeMatrixAD(_, inst)) return error;
+    case spv::Op::OpTypeCooperativeMatrixAZD:
+      if (auto error = ValidateTypeCooperativeMatrixAZD(_, inst)) return error;
       break;
     case spv::Op::OpTypeCooperativeVectorNV:
       if (auto error = ValidateTypeCooperativeVectorNV(_, inst)) return error;
       break;
-    case spv::Op::OpTypeCooperativeVectorAD:
-      if (auto error = ValidateTypeCooperativeVectorAD(_, inst)) return error;
+    case spv::Op::OpTypeCooperativeVectorAZD:
+      if (auto error = ValidateTypeCooperativeVectorAZD(_, inst)) return error;
       break;
     case spv::Op::OpTypeUntypedPointerKHR:
       if (auto error = ValidateTypeUntypedPointerKHR(_, inst)) return error;

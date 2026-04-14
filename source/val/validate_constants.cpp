@@ -48,12 +48,12 @@ spv_result_t ValidateConstantComposite(ValidationState_t& _,
   switch (result_type->opcode()) {
     case spv::Op::OpTypeVector:
     case spv::Op::OpTypeCooperativeVectorNV:
-    case spv::Op::OpTypeCooperativeVectorAD: {
+    case spv::Op::OpTypeCooperativeVectorAZD: {
       uint32_t num_result_components = _.GetDimension(result_type->id());
       bool comp_is_int32 = true, comp_is_const_int32 = true;
 
       if (result_type->opcode() == spv::Op::OpTypeCooperativeVectorNV ||
-          result_type->opcode() == spv::Op::OpTypeCooperativeVectorAD) {
+          result_type->opcode() == spv::Op::OpTypeCooperativeVectorAZD) {
         uint32_t comp_count_id = result_type->GetOperandAs<uint32_t>(2);
         std::tie(comp_is_int32, comp_is_const_int32, num_result_components) =
             _.EvalInt32IfConst(comp_count_id);
@@ -256,7 +256,7 @@ spv_result_t ValidateConstantComposite(ValidationState_t& _,
     } break;
     case spv::Op::OpTypeCooperativeMatrixKHR:
     case spv::Op::OpTypeCooperativeMatrixNV:
-    case spv::Op::OpTypeCooperativeMatrixAD: {
+    case spv::Op::OpTypeCooperativeMatrixAZD: {
       if (1 != constituent_count) {
         return _.diag(SPV_ERROR_INVALID_ID, inst)
                << opcode_name << " Constituent <id> "
@@ -322,11 +322,11 @@ bool IsTypeNullable(const std::vector<uint32_t>& instruction,
       return true;
     case spv::Op::OpTypeArray:
     case spv::Op::OpTypeMatrix:
-    case spv::Op::OpTypeCooperativeMatrixAD:
+    case spv::Op::OpTypeCooperativeMatrixAZD:
     case spv::Op::OpTypeCooperativeMatrixNV:
     case spv::Op::OpTypeCooperativeMatrixKHR:
     case spv::Op::OpTypeCooperativeVectorNV:
-    case spv::Op::OpTypeCooperativeVectorAD:
+    case spv::Op::OpTypeCooperativeVectorAZD:
     case spv::Op::OpTypeVector: {
       auto base_type = _.FindDef(instruction[2]);
       return base_type && IsTypeNullable(base_type->words(), _);

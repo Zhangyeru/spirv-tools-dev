@@ -654,26 +654,26 @@ class ValidationState_t {
   bool IsPointerType(uint32_t id) const;
   bool IsAccelerationStructureType(uint32_t id) const;
   bool IsCooperativeMatrixType(uint32_t id) const;
-  bool IsCooperativeMatrixADType(uint32_t id) const;
+  bool IsCooperativeMatrixAZDType(uint32_t id) const;
   bool IsCooperativeMatrixNVType(uint32_t id) const;
   bool IsCooperativeMatrixKHRType(uint32_t id) const;
   bool IsCooperativeMatrixAType(uint32_t id) const;
   bool IsCooperativeMatrixBType(uint32_t id) const;
   bool IsCooperativeMatrixAccType(uint32_t id) const;
   bool IsFloatCooperativeMatrixType(uint32_t id) const;
-  bool IsFloatCooperativeMatrixADType(uint32_t id) const;
+  bool IsFloatCooperativeMatrixAZDType(uint32_t id) const;
   bool IsIntCooperativeMatrixType(uint32_t id) const;
-  bool IsIntCooperativeMatrixADType(uint32_t id) const;
+  bool IsIntCooperativeMatrixAZDType(uint32_t id) const;
   bool IsUnsignedIntCooperativeMatrixType(uint32_t id) const;
-  bool IsUnsignedIntCooperativeMatrixADType(uint32_t id) const;
+  bool IsUnsignedIntCooperativeMatrixAZDType(uint32_t id) const;
   bool IsUnsigned64BitHandle(uint32_t id) const;
-  bool IsCooperativeVectorADType(uint32_t id) const;
+  bool IsCooperativeVectorAZDType(uint32_t id) const;
   bool IsCooperativeVectorNVType(uint32_t id) const;
-  bool IsFloatCooperativeVectorADType(uint32_t id) const;
+  bool IsFloatCooperativeVectorAZDType(uint32_t id) const;
   bool IsFloatCooperativeVectorNVType(uint32_t id) const;
-  bool IsIntCooperativeVectorADType(uint32_t id) const;
+  bool IsIntCooperativeVectorAZDType(uint32_t id) const;
   bool IsIntCooperativeVectorNVType(uint32_t id) const;
-  bool IsUnsignedIntCooperativeVectorADType(uint32_t id) const;
+  bool IsUnsignedIntCooperativeVectorAZDType(uint32_t id) const;
   bool IsUnsignedIntCooperativeVectorNVType(uint32_t id) const;
 
   // Returns true if |id| is a type id that contains |type| (or integer or

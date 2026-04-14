@@ -126,10 +126,10 @@ spv_result_t GetExtractInsertValueType(ValidationState_t& _,
         break;
       }
       case spv::Op::OpTypeCooperativeVectorNV:
-      case spv::Op::OpTypeCooperativeVectorAD:
+      case spv::Op::OpTypeCooperativeVectorAZD:
       case spv::Op::OpTypeCooperativeMatrixKHR:
       case spv::Op::OpTypeCooperativeMatrixNV:
-      case spv::Op::OpTypeCooperativeMatrixAD: {
+      case spv::Op::OpTypeCooperativeMatrixAZD: {
         *member_type = type_inst->word(2);
         break;
       }
@@ -156,7 +156,7 @@ spv_result_t ValidateVectorExtractDynamic(ValidationState_t& _,
   const spv::Op vector_opcode = _.GetIdOpcode(vector_type);
   if (vector_opcode != spv::Op::OpTypeVector &&
       vector_opcode != spv::Op::OpTypeCooperativeVectorNV &&
-      vector_opcode != spv::Op::OpTypeCooperativeVectorAD) {
+      vector_opcode != spv::Op::OpTypeCooperativeVectorAZD) {
     return _.diag(SPV_ERROR_INVALID_DATA, inst)
            << "Expected Vector type to be OpTypeVector";
   }
@@ -186,7 +186,7 @@ spv_result_t ValidateVectorInsertDyanmic(ValidationState_t& _,
   const spv::Op result_opcode = _.GetIdOpcode(result_type);
   if (result_opcode != spv::Op::OpTypeVector &&
       result_opcode != spv::Op::OpTypeCooperativeVectorNV &&
-      result_opcode != spv::Op::OpTypeCooperativeVectorAD) {
+      result_opcode != spv::Op::OpTypeCooperativeVectorAZD) {
     return _.diag(SPV_ERROR_INVALID_DATA, inst)
            << "Expected Result Type to be OpTypeVector";
   }
@@ -226,7 +226,7 @@ spv_result_t ValidateCompositeConstruct(ValidationState_t& _,
   switch (result_opcode) {
     case spv::Op::OpTypeVector:
     case spv::Op::OpTypeCooperativeVectorNV:
-    case spv::Op::OpTypeCooperativeVectorAD: {
+    case spv::Op::OpTypeCooperativeVectorAZD: {
       uint32_t num_result_components = _.GetDimension(result_type);
       const uint32_t result_component_type = _.GetComponentType(result_type);
       uint32_t given_component_count = 0;
@@ -378,7 +378,7 @@ spv_result_t ValidateCompositeConstruct(ValidationState_t& _,
       break;
     }
     case spv::Op::OpTypeCooperativeMatrixNV:
-    case spv::Op::OpTypeCooperativeMatrixAD: {
+    case spv::Op::OpTypeCooperativeMatrixAZD: {
       const auto result_type_inst = _.FindDef(result_type);
       assert(result_type_inst);
       const auto component_type_id =

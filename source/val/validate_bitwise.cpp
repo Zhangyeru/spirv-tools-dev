@@ -66,7 +66,7 @@ spv_result_t BitwisePass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpShiftLeftLogical: {
       if (!_.IsIntScalarType(result_type) && !_.IsIntVectorType(result_type) &&
           !_.IsIntCooperativeVectorNVType(result_type) &&
-          !_.IsIntCooperativeVectorADType(result_type))
+          !_.IsIntCooperativeVectorAZDType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -78,7 +78,7 @@ spv_result_t BitwisePass(ValidationState_t& _, const Instruction* inst) {
       if (!base_type ||
           (!_.IsIntScalarType(base_type) && !_.IsIntVectorType(base_type) &&
            !_.IsIntCooperativeVectorNVType(base_type) &&
-           !_.IsIntCooperativeVectorADType(base_type)))
+           !_.IsIntCooperativeVectorAZDType(base_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected Base to be int scalar or vector: "
                << spvOpcodeString(opcode);
@@ -96,7 +96,7 @@ spv_result_t BitwisePass(ValidationState_t& _, const Instruction* inst) {
       if (!shift_type ||
           (!_.IsIntScalarType(shift_type) && !_.IsIntVectorType(shift_type) &&
            !_.IsIntCooperativeVectorNVType(shift_type) &&
-           !_.IsIntCooperativeVectorADType(shift_type)))
+           !_.IsIntCooperativeVectorAZDType(shift_type)))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected Shift to be int scalar or vector: "
                << spvOpcodeString(opcode);
@@ -114,7 +114,7 @@ spv_result_t BitwisePass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpNot: {
       if (!_.IsIntScalarType(result_type) && !_.IsIntVectorType(result_type) &&
           !_.IsIntCooperativeVectorNVType(result_type) &&
-          !_.IsIntCooperativeVectorADType(result_type))
+          !_.IsIntCooperativeVectorAZDType(result_type))
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "Expected int scalar or vector type as Result Type: "
                << spvOpcodeString(opcode);
@@ -128,7 +128,7 @@ spv_result_t BitwisePass(ValidationState_t& _, const Instruction* inst) {
         if (!type_id ||
             (!_.IsIntScalarType(type_id) && !_.IsIntVectorType(type_id) &&
              !_.IsIntCooperativeVectorNVType(type_id) &&
-             !_.IsIntCooperativeVectorADType(type_id)))
+             !_.IsIntCooperativeVectorAZDType(type_id)))
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << "Expected int scalar or vector as operand: "
                  << spvOpcodeString(opcode) << " operand index "
