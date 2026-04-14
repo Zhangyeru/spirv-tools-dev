@@ -68,7 +68,12 @@ bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
     return false;
   }
 
-  return IsScalarOrVectorNumericType(_, type->word(2));
+  const auto element_type_id = type->word(2);
+  if (IsScalarOrVectorNumericType(_, element_type_id)) {
+    return true;
+  }
+
+  return IsScalarOrVectorNumericArrayType(_, element_type_id);
 }
 
 bool IsFloat2Type(ValidationState_t& _, uint32_t type_id) {
