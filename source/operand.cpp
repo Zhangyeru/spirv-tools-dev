@@ -235,6 +235,8 @@ const char* spvOperandTypeStr(spv_operand_type_t type) {
       return "tensor clamp mode";
     case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE:
       return "cooperative matrix reduce";
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_AZD:
+      return "cooperative matrix reduce shift AZD";
     case SPV_OPERAND_TYPE_TENSOR_ADDRESSING_OPERANDS:
       return "tensor addressing operands";
     case SPV_OPERAND_TYPE_MATRIX_MULTIPLY_ACCUMULATE_OPERANDS:
@@ -405,6 +407,7 @@ bool spvOperandIsConcrete(spv_operand_type_t type) {
     case SPV_OPERAND_TYPE_NAMED_MAXIMUM_NUMBER_OF_REGISTERS:
     case SPV_OPERAND_TYPE_FPENCODING:
     case SPV_OPERAND_TYPE_TENSOR_CLAMP_MODE:
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_AZD:
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT:
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_AZD:
     case SPV_OPERAND_TYPE_COMPONENT_TYPE:
