@@ -302,6 +302,8 @@ const char* spvOperandTypeStr(spv_operand_type_t type) {
       return "overflow mode";
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT:
       return "cooperative vector matrix layout";
+    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_AZD:
+      return "cooperative vector matrix layout AZD";
     case SPV_OPERAND_TYPE_COMPONENT_TYPE:
       return "component type";
 
@@ -404,6 +406,7 @@ bool spvOperandIsConcrete(spv_operand_type_t type) {
     case SPV_OPERAND_TYPE_FPENCODING:
     case SPV_OPERAND_TYPE_TENSOR_CLAMP_MODE:
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT:
+    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_AZD:
     case SPV_OPERAND_TYPE_COMPONENT_TYPE:
       return true;
     default:
