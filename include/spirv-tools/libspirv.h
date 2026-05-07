@@ -319,6 +319,7 @@ typedef enum spv_operand_type_t {
   // Enum type from SPV_NV_cooperative_matrix2
   SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE,
   SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_AZD,
+  SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_OP_AZD,
   // Enum type from SPV_NV_cooperative_matrix2
   SPV_OPERAND_TYPE_TENSOR_ADDRESSING_OPERANDS,
   // Optional types from SPV_INTEL_subgroup_matrix_multiply_accumulate
