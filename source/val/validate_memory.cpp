@@ -3056,6 +3056,91 @@ spv_result_t ValidateCooperativeVectorMatrixMulAZD(ValidationState_t& _,
   return SPV_SUCCESS;
 }
 
+spv_result_t ValidateCpAsyncTensorGlobalShared(ValidationState_t& _,
+                                               const Instruction* inst) {
+  const auto opcode_name = spvOpcodeString(inst->opcode());
+  const auto dim = inst->GetOperandAs<uint32_t>(0u);
+  const auto dst_id = inst->GetOperandAs<uint32_t>(1u);
+  const auto tensor_map_id = inst->GetOperandAs<uint32_t>(2u);
+  const auto coord_id = inst->GetOperandAs<uint32_t>(3u);
+
+  if (dim < 1 || dim > 4) {
+    return _.diag(SPV_ERROR_INVALID_VALUE, inst)
+           << opcode_name << " Dim must be between 1 and 4.";
+  }
+
+  const auto dst = _.FindDef(dst_id);
+  if (!dst) return SPV_SUCCESS;
+
+  uint32_t dst_data_type = 0;
+  spv::StorageClass dst_storage_class = spv::StorageClass::Max;
+  if (!_.GetPointerTypeInfo(dst->type_id(), &dst_data_type, &dst_storage_class)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " DstMem <id> " << _.getIdName(dst_id)
+           << " must be a pointer.";
+  }
+
+  if (dst_storage_class != spv::StorageClass::Workgroup) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " DstMem <id> " << _.getIdName(dst_id)
+           << " must point to Workgroup storage.";
+  }
+
+  const auto dst_data = _.FindDef(dst_data_type);
+  if (!dst_data || (dst_data->opcode() != spv::Op::OpTypeArray &&
+                    dst_data->opcode() != spv::Op::OpTypeRuntimeArray)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " DstMem <id> " << _.getIdName(dst_id)
+           << " must point to an array.";
+  }
+
+  const auto dst_element_type = dst_data->GetOperandAs<uint32_t>(1u);
+  if (!_.IsSignedIntScalarType(dst_element_type) ||
+      _.GetBitWidth(dst_element_type) != 32) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " DstMem <id> " << _.getIdName(dst_id)
+           << " must point to an array of 32-bit signed integers.";
+  }
+
+  const auto tensor_map = _.FindDef(tensor_map_id);
+  if (!tensor_map) return SPV_SUCCESS;
+
+  const auto tensor_map_type = _.FindDef(tensor_map->type_id());
+  if (!tensor_map_type ||
+      tensor_map_type->opcode() != spv::Op::OpTypeTensorMap) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " TensorMap <id> "
+           << _.getIdName(tensor_map_id) << " must be OpTypeTensorMap.";
+  }
+
+  const auto coord = _.FindDef(coord_id);
+  if (!coord) return SPV_SUCCESS;
+
+  const auto coord_type_id = coord->type_id();
+  if (!_.IsIntScalarOrVectorType(coord_type_id) ||
+      _.GetBitWidth(coord_type_id) != 32) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " Coord <id> " << _.getIdName(coord_id)
+           << " must be a 32-bit integer scalar or vector.";
+  }
+
+  const auto tensor_map_dim = tensor_map_type->GetOperandAs<uint32_t>(1u);
+  if (dim != tensor_map_dim) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " Dim " << dim
+           << " must match TensorMap dimension " << tensor_map_dim << ".";
+  }
+
+  const auto coord_dim = _.GetDimension(coord_type_id);
+  if (tensor_map_dim != coord_dim) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " TensorMap dimension " << tensor_map_dim
+           << " must match Coord dimension " << coord_dim << ".";
+  }
+
+  return SPV_SUCCESS;
+}
+
 spv_result_t ValidatePtrComparison(ValidationState_t& _,
                                    const Instruction* inst) {
   if (_.addressing_model() == spv::AddressingModel::Logical &&
@@ -3229,6 +3314,9 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpCooperativeVectorMatrixMulAddAZD:
       if (auto error = ValidateCooperativeVectorMatrixMulAZD(_, inst))
         return error;
+      break;
+    case spv::Op::OpCpAsyncTensorGlobalShared:
+      if (auto error = ValidateCpAsyncTensorGlobalShared(_, inst)) return error;
       break;
     case spv::Op::OpPtrEqual:
     case spv::Op::OpPtrNotEqual:

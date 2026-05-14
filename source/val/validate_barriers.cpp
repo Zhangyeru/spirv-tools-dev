@@ -27,6 +27,30 @@
 namespace spvtools {
 namespace val {
 
+spv_result_t ValidateBarrierIdOrCount(ValidationState_t& _,
+                                      const Instruction* inst,
+                                      uint32_t operand_index,
+                                      const char* operand_name) {
+  const auto operand_id = inst->GetOperandAs<uint32_t>(operand_index);
+  const auto type_id = _.GetOperandTypeId(inst, operand_index);
+  const auto opcode_name = spvOpcodeString(inst->opcode());
+
+  if (!_.IsIntScalarType(type_id) || _.GetBitWidth(type_id) != 32) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " " << operand_name << " <id> "
+           << _.getIdName(operand_id)
+           << " must be a 32-bit integer scalar.";
+  }
+
+  int64_t value = 0;
+  if (_.EvalConstantValInt64(operand_id, &value) && value < 0) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " " << operand_name << " must be non-negative.";
+  }
+
+  return SPV_SUCCESS;
+}
+
 // Validates correctness of barrier instructions.
 spv_result_t BarriersPass(ValidationState_t& _, const Instruction* inst) {
   const spv::Op opcode = inst->opcode();
@@ -118,6 +142,17 @@ spv_result_t BarriersPass(ValidationState_t& _, const Instruction* inst) {
       }
 
       if (auto error = ValidateMemorySemantics(_, inst, 2, memory_scope)) {
+        return error;
+      }
+      break;
+    }
+
+    case spv::Op::OpBarrierArrive:
+    case spv::Op::OpBarrierWait: {
+      if (auto error = ValidateBarrierIdOrCount(_, inst, 0, "Id")) {
+        return error;
+      }
+      if (auto error = ValidateBarrierIdOrCount(_, inst, 1, "N")) {
         return error;
       }
       break;
