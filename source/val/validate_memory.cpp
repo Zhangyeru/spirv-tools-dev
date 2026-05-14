@@ -611,7 +611,8 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
                          _, pointee,
                          {spv::Op::OpTypeImage, spv::Op::OpTypeSampler,
                           spv::Op::OpTypeSampledImage,
-                          spv::Op::OpTypeAccelerationStructureKHR})) {
+                          spv::Op::OpTypeAccelerationStructureKHR,
+                          spv::Op::OpTypeTensorMap})) {
         return _.diag(SPV_ERROR_INVALID_ID, inst)
                << _.VkErrorID(4655) << "UniformConstant OpVariable <id> "
                << _.getIdName(inst->id()) << " has illegal type.\n"
@@ -619,7 +620,7 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
                << "are used only as handles to refer to opaque resources. Such "
                << "variables must be typed as OpTypeImage, OpTypeSampler, "
                << "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-               << "or an array of one of these types.";
+               << "OpTypeTensorMap, or an array of one of these types.";
       }
     }
 
