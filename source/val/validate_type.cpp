@@ -786,6 +786,22 @@ spv_result_t ValidateTypeCooperativeMatrixAZD(ValidationState_t& _,
            << " is not a constant instruction with scalar integer type.";
   }
 
+  if (inst->operands().size() > 4) {
+    const auto use_index = 4;
+    const auto use =
+        inst->GetOperandAs<spv::CooperativeMatrixUseAZD>(use_index);
+    switch (use) {
+      case spv::CooperativeMatrixUseAZD::MatrixUseAAZD:
+      case spv::CooperativeMatrixUseAZD::MatrixUseBAZD:
+      case spv::CooperativeMatrixUseAZD::MatrixAccumulatorAZD:
+        break;
+      default:
+        return _.diag(SPV_ERROR_INVALID_VALUE, inst)
+               << "OpTypeCooperativeMatrixAZD Use " << uint32_t(use)
+               << " is invalid.";
+    }
+  }
+
   return SPV_SUCCESS;
 }
 
