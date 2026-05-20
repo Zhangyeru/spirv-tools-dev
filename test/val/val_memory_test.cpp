@@ -73,7 +73,7 @@ OpFunctionEnd
                 "are used only as handles to refer to opaque resources. Such "
                 "variables must be typed as OpTypeImage, OpTypeSampler, "
                 "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-                "or an array of one of these types."));
+                "OpTypeTensorMap, or an array of one of these types."));
 }
 
 TEST_F(ValidateMemory, VulkanUniformConstantOnOpaqueResourceGood) {
@@ -127,7 +127,7 @@ OpFunctionEnd
                 "are used only as handles to refer to opaque resources. Such "
                 "variables must be typed as OpTypeImage, OpTypeSampler, "
                 "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-                "or an array of one of these types."));
+                "OpTypeTensorMap, or an array of one of these types."));
 }
 
 TEST_F(ValidateMemory, VulkanUniformConstantOnOpaqueResourceArrayGood) {
