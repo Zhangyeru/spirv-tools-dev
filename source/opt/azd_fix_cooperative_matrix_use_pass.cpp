@@ -14,11 +14,13 @@
 
 #include "source/opt/azd_fix_cooperative_matrix_use_pass.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "source/opt/basic_block.h"
+#include "source/opt/function.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_context.h"
 #include "source/opt/reflect.h"
@@ -144,8 +146,10 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
     modified |= RewriteValueType(value_id, rewrite_type_id);
   }
 
+  modified |= FixMulAddOperandTypes();
   modified |= FixCopyObjectTypeMismatches();
   modified |= FixStoreTypeMismatches();
+  modified |= FixReturnValueTypeMismatches();
 
   return modified ? Status::SuccessWithChange
                   : Status::SuccessWithoutChange;
@@ -304,6 +308,55 @@ uint32_t AzdFixCooperativeMatrixUsePass::GetStorePointerPointeeType(
                                                        : preferred->second;
 }
 
+bool AzdFixCooperativeMatrixUsePass::CanRewriteValueType(
+    const Instruction* inst) const {
+  if (!inst) return false;
+
+  if (inst->opcode() == spv::Op::OpFunctionParameter ||
+      inst->opcode() == spv::Op::OpFunctionCall) {
+    return false;
+  }
+
+  if (inst->opcode() == spv::Op::OpLoad && inst->NumInOperands() > 0) {
+    Instruction* pointer_inst =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    return CanRewritePointerPointeeType(pointer_inst);
+  }
+
+  return true;
+}
+
+bool AzdFixCooperativeMatrixUsePass::CanRewritePointerPointeeType(
+    const Instruction* inst) const {
+  if (!inst) return false;
+
+  return inst->opcode() == spv::Op::OpVariable;
+}
+
+uint32_t AzdFixCooperativeMatrixUsePass::GetDesiredValueType(
+    uint32_t value_id, uint32_t fallback_type_id) {
+  auto stat_iter = value_use_stats_.find(value_id);
+  if (stat_iter == value_use_stats_.end()) return fallback_type_id;
+
+  Instruction* value_inst = get_def_use_mgr()->GetDef(value_id);
+  if (!value_inst || !IsAzdCooperativeMatrixType(value_inst->type_id())) {
+    return fallback_type_id;
+  }
+
+  if (value_inst->opcode() == spv::Op::OpLoad &&
+      value_inst->NumInOperands() > 0) {
+    const uint32_t pointer_id = value_inst->GetSingleWordInOperand(0);
+    auto preferred = pointer_preferred_pointees_.find(pointer_id);
+    if (preferred != pointer_preferred_pointees_.end()) {
+      return preferred->second;
+    }
+  }
+
+  const uint32_t new_type_id = GetOrCreateAzdCooperativeMatrixTypeWithUse(
+      value_inst->type_id(), InferUse(stat_iter->second));
+  return new_type_id == 0 ? fallback_type_id : new_type_id;
+}
+
 bool AzdFixCooperativeMatrixUsePass::ChangeResultType(Instruction* inst,
                                                       uint32_t new_type_id) {
   if (!inst || inst->type_id() == 0 || inst->type_id() == new_type_id) {
@@ -332,6 +385,7 @@ bool AzdFixCooperativeMatrixUsePass::RewriteValueType(uint32_t value_id,
       !IsAzdCooperativeMatrixType(value_inst->type_id())) {
     return false;
   }
+  if (!CanRewriteValueType(value_inst)) return false;
 
   bool modified = ChangeResultType(value_inst, new_type_id);
 
@@ -390,6 +444,7 @@ bool AzdFixCooperativeMatrixUsePass::RewritePointerPointeeType(
 
   Instruction* pointer_inst = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer_inst || pointer_inst->type_id() == 0) return false;
+  if (!CanRewritePointerPointeeType(pointer_inst)) return false;
 
   Instruction* old_pointer_type =
       get_def_use_mgr()->GetDef(pointer_inst->type_id());
@@ -478,6 +533,52 @@ bool AzdFixCooperativeMatrixUsePass::RewritePointerPointeeType(
   return modified;
 }
 
+bool AzdFixCooperativeMatrixUsePass::FixMulAddOperandTypes() {
+  std::vector<Instruction*> muladds;
+  get_module()->ForEachInst([&muladds](Instruction* inst) {
+    if (IsAzdMatrixMulAdd(inst)) {
+      muladds.push_back(inst);
+    }
+  });
+
+  bool modified = false;
+  for (Instruction* muladd : muladds) {
+    bool operands_modified = false;
+    const uint32_t operand_count =
+        std::min<uint32_t>(muladd->NumInOperands(), 3);
+    for (uint32_t i = 0; i < operand_count; ++i) {
+      const uint32_t operand_id = muladd->GetSingleWordInOperand(i);
+      Instruction* operand_inst = get_def_use_mgr()->GetDef(operand_id);
+      if (!operand_inst ||
+          !IsAzdCooperativeMatrixType(operand_inst->type_id())) {
+        continue;
+      }
+
+      const uint32_t target_type_id =
+          GetDesiredValueType(operand_id, operand_inst->type_id());
+      const uint32_t converted_id =
+          EnsureValueTypeBefore(muladd, operand_id, target_type_id);
+      if (converted_id != 0 && converted_id != operand_id) {
+        muladd->SetInOperand(i, {converted_id});
+        operands_modified = true;
+      }
+    }
+
+    if (operands_modified) {
+      context()->UpdateDefUse(muladd);
+      modified = true;
+    }
+
+    if (IsAzdCooperativeMatrixType(muladd->type_id())) {
+      const uint32_t target_type_id =
+          GetDesiredValueType(muladd->result_id(), muladd->type_id());
+      modified |= ChangeResultType(muladd, target_type_id);
+    }
+  }
+
+  return modified;
+}
+
 bool AzdFixCooperativeMatrixUsePass::FixCopyObjectTypeMismatches() {
   bool modified = false;
   get_module()->ForEachInst([this, &modified](Instruction* inst) {
@@ -528,6 +629,38 @@ bool AzdFixCooperativeMatrixUsePass::FixStoreTypeMismatches() {
     store->SetInOperand(1, {converted_id});
     context()->AnalyzeUses(store);
     modified = true;
+  }
+
+  return modified;
+}
+
+bool AzdFixCooperativeMatrixUsePass::FixReturnValueTypeMismatches() {
+  bool modified = false;
+  for (Function& function : *get_module()) {
+    const uint32_t return_type_id = function.DefInst().type_id();
+    if (!IsAzdCooperativeMatrixType(return_type_id)) continue;
+
+    function.ForEachInst([this, return_type_id, &modified](Instruction* inst) {
+      if (inst->opcode() != spv::Op::OpReturnValue ||
+          inst->NumInOperands() == 0) {
+        return;
+      }
+
+      const uint32_t value_id = inst->GetSingleWordInOperand(0);
+      Instruction* value_inst = get_def_use_mgr()->GetDef(value_id);
+      if (!value_inst || !IsAzdCooperativeMatrixType(value_inst->type_id()) ||
+          value_inst->type_id() == return_type_id) {
+        return;
+      }
+
+      const uint32_t converted_id =
+          InsertBitcastBefore(inst, return_type_id, value_id);
+      if (converted_id == 0) return;
+
+      inst->SetInOperand(0, {converted_id});
+      context()->UpdateDefUse(inst);
+      modified = true;
+    });
   }
 
   return modified;

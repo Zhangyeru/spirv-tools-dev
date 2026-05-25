@@ -54,13 +54,18 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
   uint32_t GetPointerPointeeType(uint32_t pointer_id) const;
   uint32_t GetStorePointerPointeeType(uint32_t pointer_id,
                                       uint32_t fallback_type_id) const;
+  bool CanRewriteValueType(const Instruction* inst) const;
+  bool CanRewritePointerPointeeType(const Instruction* inst) const;
+  uint32_t GetDesiredValueType(uint32_t value_id, uint32_t fallback_type_id);
 
   bool ChangeResultType(Instruction* inst, uint32_t new_type_id);
   bool RewriteValueType(uint32_t value_id, uint32_t new_type_id);
   bool RewritePointerPointeeType(uint32_t pointer_id,
                                  uint32_t pointee_type_id);
+  bool FixMulAddOperandTypes();
   bool FixCopyObjectTypeMismatches();
   bool FixStoreTypeMismatches();
+  bool FixReturnValueTypeMismatches();
   uint32_t InsertBitcastBefore(Instruction* insert_before,
                                uint32_t result_type_id, uint32_t object_id);
   uint32_t EnsureValueTypeBefore(Instruction* insert_before,
