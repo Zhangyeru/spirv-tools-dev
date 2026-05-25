@@ -550,6 +550,58 @@ TEST_F(AzdFixCooperativeMatrixUseTest,
   SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
 }
 
+TEST_F(AzdFixCooperativeMatrixUseTest, KeepsFunctionCallArgumentPointerTypes) {
+  const std::string text = R"(
+; CHECK-DAG: [[old_type:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+; CHECK-DAG: [[type_a:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseAAZD
+; CHECK-DAG: [[type_b:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseBAZD
+; CHECK-DAG: [[type_acc:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixAccumulatorAZD
+; CHECK-DAG: [[ptr_old:%\w+]] = OpTypePointer Function [[old_type]]
+; CHECK-DAG: [[ptr_a:%\w+]] = OpTypePointer Function [[type_a]]
+; CHECK: [[px:%\w+]] = OpVariable [[ptr_a]] Function
+; CHECK-NEXT: [[param:%\w+]] = OpVariable [[ptr_old]] Function
+; CHECK: {{%\w+}} = OpCooperativeMatrixMulAddAZD [[type_acc]] {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: [[x_arg:%\w+]] = OpLoad [[type_a]] [[px]]
+; CHECK-NEXT: [[x_arg_old:%\w+]] = OpBitcast [[old_type]] [[x_arg]]
+; CHECK-NEXT: OpStore [[param]] [[x_arg_old]]
+; CHECK-NEXT: {{%\w+}} = OpFunctionCall %void {{%\w+}} [[param]]
+               OpCapability Shader
+               OpCapability CooperativeMatrixAZD
+               OpExtension "SPV_AZD_neural_matrix"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %uint = OpTypeInt 32 0
+   %uint_16 = OpConstant %uint 16
+      %float = OpTypeFloat 32
+   %old_type = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+    %ptr_old = OpTypePointer Function %old_type
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+     %fn_use = OpTypeFunction %void %ptr_old
+ %usePointer = OpFunction %void None %fn_use
+          %p = OpFunctionParameter %ptr_old
+  %use_entry = OpLabel
+               OpReturn
+               OpFunctionEnd
+          %b = OpUndef %old_type
+          %c = OpUndef %old_type
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+         %px = OpVariable %ptr_old Function
+      %param = OpVariable %ptr_old Function
+         %x0 = OpLoad %old_type %px
+         %d0 = OpCooperativeMatrixMulAddAZD %old_type %x0 %b %c
+      %x_arg = OpLoad %old_type %px
+               OpStore %param %x_arg
+       %call = OpFunctionCall %void %usePointer %param
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
+}
+
 TEST_F(AzdFixCooperativeMatrixUseTest, InsertsAccessChainLoadUseBitcast) {
   const std::string text = R"(
 ; CHECK-DAG: [[old_type:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
@@ -590,6 +642,134 @@ TEST_F(AzdFixCooperativeMatrixUseTest, InsertsAccessChainLoadUseBitcast) {
         %arr = OpVariable %ptr_arr Function
           %p = OpAccessChain %ptr_old %arr %uint_0
           %x = OpLoad %old_type %p
+          %d = OpCooperativeMatrixMulAddAZD %old_type %x %b %c
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
+}
+
+TEST_F(AzdFixCooperativeMatrixUseTest, RewritesCooperativeMatrixLoadAZDType) {
+  const std::string text = R"(
+; CHECK-DAG: [[type_a:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseAAZD
+; CHECK-DAG: [[type_b:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseBAZD
+; CHECK-DAG: [[type_acc:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixAccumulatorAZD
+; CHECK-DAG: [[ptr_a:%\w+]] = OpTypePointer Function [[type_a]]
+; CHECK: [[temp:%\w+]] = OpVariable [[ptr_a]] Function
+; CHECK-NEXT: [[x:%\w+]] = OpVariable [[ptr_a]] Function
+; CHECK: [[load:%\w+]] = OpCooperativeMatrixLoadAZD [[type_a]] {{%\w+}} {{%\w+}} {{%\w+}} %int_0
+; CHECK-NEXT: OpStore [[temp]] [[load]]
+; CHECK-NEXT: [[tmp:%\w+]] = OpLoad [[type_a]] [[temp]]
+; CHECK-NEXT: OpStore [[x]] [[tmp]]
+; CHECK: [[x_value:%\w+]] = OpLoad [[type_a]] [[x]]
+; CHECK: {{%\w+}} = OpCooperativeMatrixMulAddAZD [[type_acc]] [[x_value]] {{%\w+}} {{%\w+}}
+               OpCapability Shader
+               OpCapability CooperativeMatrixAZD
+               OpExtension "SPV_AZD_neural_matrix"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+   %uint_16 = OpConstant %uint 16
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+      %float = OpTypeFloat 32
+   %old_type = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+    %ptr_old = OpTypePointer Function %old_type
+%runtimearr_float = OpTypeRuntimeArray %float
+        %Buf = OpTypeStruct %runtimearr_float
+    %ptr_buf = OpTypePointer StorageBuffer %Buf
+        %buf = OpVariable %ptr_buf StorageBuffer
+  %ptr_array = OpTypePointer StorageBuffer %runtimearr_float
+    %v2float = OpTypeVector %float 2
+   %float_16 = OpConstant %float 16
+     %stride = OpConstantComposite %v2float %float_16 %float_16
+    %float_0 = OpConstant %float 0
+     %offset = OpConstantComposite %v2float %float_0 %float_0
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+          %b = OpUndef %old_type
+          %c = OpUndef %old_type
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+       %temp = OpVariable %ptr_old Function
+          %x = OpVariable %ptr_old Function
+       %base = OpAccessChain %ptr_array %buf %uint_0
+       %load = OpCooperativeMatrixLoadAZD %old_type %base %stride %offset %int_0
+               OpStore %temp %load
+        %tmp = OpLoad %old_type %temp
+               OpStore %x %tmp
+    %x_value = OpLoad %old_type %x
+          %d = OpCooperativeMatrixMulAddAZD %old_type %x_value %b %c
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
+}
+
+TEST_F(AzdFixCooperativeMatrixUseTest,
+       RewritesCooperativeMatrixLoadAZDStoredThroughAccessChain) {
+  const std::string text = R"(
+; CHECK-DAG: [[old_type:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+; CHECK-DAG: [[type_a:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseAAZD
+; CHECK-DAG: [[type_b:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseBAZD
+; CHECK-DAG: [[type_acc:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixAccumulatorAZD
+; CHECK-DAG: [[ptr_old:%\w+]] = OpTypePointer Function [[old_type]]
+; CHECK-DAG: [[arr_type:%\w+]] = OpTypeArray [[old_type]] %uint_1
+; CHECK-DAG: [[ptr_arr:%\w+]] = OpTypePointer Function [[arr_type]]
+; CHECK-DAG: [[b:%\w+]] = OpUndef [[type_b]]
+; CHECK-DAG: [[c:%\w+]] = OpUndef [[type_acc]]
+; CHECK: [[arr:%\w+]] = OpVariable [[ptr_arr]] Function
+; CHECK: [[ptr0:%\w+]] = OpAccessChain [[ptr_old]] [[arr]] %uint_0
+; CHECK-NEXT: [[load:%\w+]] = OpCooperativeMatrixLoadAZD [[type_a]] {{%\w+}} {{%\w+}} {{%\w+}} %int_0
+; CHECK-NEXT: [[load_old:%\w+]] = OpBitcast [[old_type]] [[load]]
+; CHECK-NEXT: OpStore [[ptr0]] [[load_old]]
+; CHECK: [[x:%\w+]] = OpLoad [[old_type]] {{%\w+}}
+; CHECK-NEXT: [[x_a:%\w+]] = OpBitcast [[type_a]] [[x]]
+; CHECK-NEXT: {{%\w+}} = OpCooperativeMatrixMulAddAZD [[type_acc]] [[x_a]] [[b]] [[c]]
+               OpCapability Shader
+               OpCapability CooperativeMatrixAZD
+               OpExtension "SPV_AZD_neural_matrix"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+   %uint_16 = OpConstant %uint 16
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+      %float = OpTypeFloat 32
+   %old_type = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+    %arr_old = OpTypeArray %old_type %uint_1
+    %ptr_arr = OpTypePointer Function %arr_old
+    %ptr_old = OpTypePointer Function %old_type
+%runtimearr_float = OpTypeRuntimeArray %float
+        %Buf = OpTypeStruct %runtimearr_float
+    %ptr_buf = OpTypePointer StorageBuffer %Buf
+        %buf = OpVariable %ptr_buf StorageBuffer
+  %ptr_data = OpTypePointer StorageBuffer %runtimearr_float
+    %v2float = OpTypeVector %float 2
+   %float_16 = OpConstant %float 16
+     %stride = OpConstantComposite %v2float %float_16 %float_16
+    %float_0 = OpConstant %float 0
+     %offset = OpConstantComposite %v2float %float_0 %float_0
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+          %b = OpUndef %old_type
+          %c = OpUndef %old_type
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+        %arr = OpVariable %ptr_arr Function
+       %base = OpAccessChain %ptr_data %buf %uint_0
+         %p0 = OpAccessChain %ptr_old %arr %uint_0
+       %load = OpCooperativeMatrixLoadAZD %old_type %base %stride %offset %int_0
+               OpStore %p0 %load
+         %p1 = OpAccessChain %ptr_old %arr %uint_0
+          %x = OpLoad %old_type %p1
           %d = OpCooperativeMatrixMulAddAZD %old_type %x %b %c
                OpReturn
                OpFunctionEnd

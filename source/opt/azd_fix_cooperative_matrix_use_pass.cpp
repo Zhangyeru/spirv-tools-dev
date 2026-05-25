@@ -34,17 +34,9 @@ bool IsAzdMatrixMulAdd(const Instruction* inst) {
   return inst->opcode() == spv::Op::OpCooperativeMatrixMulAddAZD;
 }
 
-Instruction* AddTypeOrConstantBeforeGlobalValues(
-    IRContext* context, std::unique_ptr<Instruction>&& inst) {
-  auto insert_pos = context->types_values_begin();
-  for (; insert_pos != context->types_values_end(); ++insert_pos) {
-    if (!IsTypeInst(insert_pos->opcode()) &&
-        !IsConstantInst(insert_pos->opcode())) {
-      break;
-    }
-  }
-
-  if (insert_pos == context->types_values_end()) {
+Instruction* AddTypeOrGlobalAfter(IRContext* context, Instruction* insert_after,
+                                  std::unique_ptr<Instruction>&& inst) {
+  if (!insert_after || insert_after->NextNode() == nullptr) {
     const bool is_type = IsTypeInst(inst->opcode());
     if (is_type) {
       context->AddType(std::move(inst));
@@ -54,7 +46,7 @@ Instruction* AddTypeOrConstantBeforeGlobalValues(
     return &*(--context->types_values_end());
   }
 
-  Instruction* added = &*insert_pos.InsertBefore(std::move(inst));
+  Instruction* added = insert_after->NextNode()->InsertBefore(std::move(inst));
   if (context->AreAnalysesValid(IRContext::Analysis::kAnalysisDefUse)) {
     context->get_def_use_mgr()->AnalyzeInstDefUse(added);
   }
@@ -66,7 +58,10 @@ Instruction* AddTypeOrConstantBeforeGlobalValues(
 Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
   value_use_stats_.clear();
   pointer_use_stats_.clear();
+  pointer_key_use_stats_.clear();
   pointer_preferred_pointees_.clear();
+  pointer_key_preferred_pointees_.clear();
+  pointer_required_pointees_.clear();
   processed_value_types_.clear();
   processed_pointer_pointees_.clear();
 
@@ -109,6 +104,10 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
     const uint32_t pointer_id = id_and_stat.first;
     const uint32_t pointee_type_id = GetPointerPointeeType(pointer_id);
     if (!IsAzdCooperativeMatrixType(pointee_type_id)) continue;
+    const std::string key = GetPointerAccessKey(pointer_id);
+    if (!key.empty()) {
+      AddUseStats(&pointer_key_use_stats_[key], id_and_stat.second);
+    }
     if (HasRoleConflict(id_and_stat.second)) {
       ReportRoleConflict(pointer_id);
       return Status::Failure;
@@ -120,6 +119,31 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
 
     pointer_preferred_pointees_[pointer_id] = new_type_id;
   }
+
+  for (const auto& key_and_stat : pointer_key_use_stats_) {
+    if (HasRoleConflict(key_and_stat.second)) {
+      ReportRoleConflict(0);
+      return Status::Failure;
+    }
+
+    uint32_t pointee_type_id = 0;
+    for (const auto& id_and_stat : pointer_use_stats_) {
+      const uint32_t pointer_id = id_and_stat.first;
+      if (GetPointerAccessKey(pointer_id) == key_and_stat.first) {
+        pointee_type_id = GetPointerPointeeType(pointer_id);
+        break;
+      }
+    }
+    if (!IsAzdCooperativeMatrixType(pointee_type_id)) continue;
+
+    const uint32_t new_type_id = GetOrCreateAzdCooperativeMatrixTypeWithUse(
+        pointee_type_id, InferUse(key_and_stat.second));
+    if (new_type_id == 0) return Status::Failure;
+
+    pointer_key_preferred_pointees_[key_and_stat.first] = new_type_id;
+  }
+
+  CollectFunctionCallPointerRequirements();
 
   bool modified = false;
   for (const auto& id_and_stat : value_use_stats_) {
@@ -148,7 +172,9 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
 
   modified |= FixMulAddOperandTypes();
   modified |= FixCopyObjectTypeMismatches();
-  modified |= FixStoreTypeMismatches();
+  while (FixStoreTypeMismatches()) {
+    modified = true;
+  }
   modified |= FixReturnValueTypeMismatches();
 
   return modified ? Status::SuccessWithChange
@@ -252,7 +278,7 @@ AzdFixCooperativeMatrixUsePass::GetOrCreateAzdCooperativeMatrixTypeWithUse(
                                  : SPV_OPERAND_TYPE_ID;
     in_operands.push_back({operand_type, {operands[i]}});
   }
-  AddTypeOrConstantBeforeGlobalValues(context(), MakeUnique<Instruction>(
+  AddTypeOrGlobalAfter(context(), old_type_inst, MakeUnique<Instruction>(
       context(), spv::Op::OpTypeCooperativeMatrixAZD, 0, result_id,
       in_operands));
   return result_id;
@@ -278,7 +304,7 @@ uint32_t AzdFixCooperativeMatrixUsePass::GetOrCreatePointerType(
   const uint32_t result_id = TakeNextId();
   if (result_id == 0) return 0;
 
-  AddTypeOrConstantBeforeGlobalValues(context(), MakeUnique<Instruction>(
+  AddTypeOrGlobalAfter(context(), old_pointer_type, MakeUnique<Instruction>(
       context(), spv::Op::OpTypePointer, 0, result_id,
       Instruction::OperandList{
           {SPV_OPERAND_TYPE_STORAGE_CLASS, {storage_class}},
@@ -292,7 +318,12 @@ uint32_t AzdFixCooperativeMatrixUsePass::GetPointerPointeeType(
   Instruction* pointer_inst = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer_inst || pointer_inst->type_id() == 0) return 0;
 
-  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_inst->type_id());
+  return GetPointerTypePointeeType(pointer_inst->type_id());
+}
+
+uint32_t AzdFixCooperativeMatrixUsePass::GetPointerTypePointeeType(
+    uint32_t pointer_type_id) const {
+  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
   if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
       pointer_type->NumInOperands() < 2) {
     return 0;
@@ -301,11 +332,94 @@ uint32_t AzdFixCooperativeMatrixUsePass::GetPointerPointeeType(
   return pointer_type->GetSingleWordInOperand(1);
 }
 
+uint32_t AzdFixCooperativeMatrixUsePass::GetPreferredPointerPointeeType(
+    uint32_t pointer_id, uint32_t fallback_type_id) const {
+  auto preferred = pointer_preferred_pointees_.find(pointer_id);
+  if (preferred != pointer_preferred_pointees_.end()) return preferred->second;
+
+  const std::string key = GetPointerAccessKey(pointer_id);
+  auto key_preferred = pointer_key_preferred_pointees_.find(key);
+  return key_preferred == pointer_key_preferred_pointees_.end()
+             ? fallback_type_id
+             : key_preferred->second;
+}
+
+std::string AzdFixCooperativeMatrixUsePass::GetPointerAccessKey(
+    uint32_t pointer_id) const {
+  Instruction* pointer_inst = get_def_use_mgr()->GetDef(pointer_id);
+  if (!pointer_inst) return std::string();
+
+  if (pointer_inst->opcode() != spv::Op::OpAccessChain &&
+      pointer_inst->opcode() != spv::Op::OpInBoundsAccessChain) {
+    return std::to_string(pointer_id);
+  }
+  if (pointer_inst->NumInOperands() == 0) return std::string();
+
+  std::string key =
+      GetPointerAccessKey(pointer_inst->GetSingleWordInOperand(0));
+  if (key.empty()) return key;
+
+  for (uint32_t i = 1; i < pointer_inst->NumInOperands(); ++i) {
+    key += "." + std::to_string(pointer_inst->GetSingleWordInOperand(i));
+  }
+  return key;
+}
+
+uint32_t AzdFixCooperativeMatrixUsePass::GetPreferredStoreObjectType(
+    uint32_t pointer_id, uint32_t fallback_type_id) const {
+  auto required = pointer_required_pointees_.find(pointer_id);
+  if (required != pointer_required_pointees_.end()) return required->second;
+
+  return GetPreferredPointerPointeeType(pointer_id, fallback_type_id);
+}
+
 uint32_t AzdFixCooperativeMatrixUsePass::GetStorePointerPointeeType(
     uint32_t pointer_id, uint32_t fallback_type_id) const {
+  auto required = pointer_required_pointees_.find(pointer_id);
+  if (required != pointer_required_pointees_.end()) return required->second;
+
   auto preferred = pointer_preferred_pointees_.find(pointer_id);
   return preferred == pointer_preferred_pointees_.end() ? fallback_type_id
                                                        : preferred->second;
+}
+
+void AzdFixCooperativeMatrixUsePass::CollectFunctionCallPointerRequirements() {
+  get_module()->ForEachInst([this](Instruction* inst) {
+    if (inst->opcode() != spv::Op::OpFunctionCall ||
+        inst->NumInOperands() == 0) {
+      return;
+    }
+
+    Instruction* function =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    if (!function || function->opcode() != spv::Op::OpFunction ||
+        function->NumInOperands() < 2) {
+      return;
+    }
+
+    Instruction* function_type =
+        get_def_use_mgr()->GetDef(function->GetSingleWordInOperand(1));
+    if (!function_type ||
+        function_type->opcode() != spv::Op::OpTypeFunction) {
+      return;
+    }
+
+    for (uint32_t i = 1; i < inst->NumInOperands(); ++i) {
+      if (i >= function_type->NumInOperands()) return;
+
+      const uint32_t argument_id = inst->GetSingleWordInOperand(i);
+      const uint32_t expected_pointer_type_id =
+          function_type->GetSingleWordInOperand(i);
+      const uint32_t expected_pointee_type_id =
+          GetPointerTypePointeeType(expected_pointer_type_id);
+      if (!IsAzdCooperativeMatrixType(expected_pointee_type_id)) continue;
+
+      auto existing = pointer_required_pointees_.find(argument_id);
+      if (existing == pointer_required_pointees_.end()) {
+        pointer_required_pointees_[argument_id] = expected_pointee_type_id;
+      }
+    }
+  });
 }
 
 bool AzdFixCooperativeMatrixUsePass::CanRewriteValueType(
@@ -393,8 +507,8 @@ bool AzdFixCooperativeMatrixUsePass::RewriteValueType(uint32_t value_id,
     case spv::Op::OpLoad:
       modified |= RewritePointerPointeeType(
           value_inst->GetSingleWordInOperand(0),
-          GetStorePointerPointeeType(value_inst->GetSingleWordInOperand(0),
-                                     new_type_id));
+          GetPreferredPointerPointeeType(value_inst->GetSingleWordInOperand(0),
+                                         new_type_id));
       break;
     case spv::Op::OpPhi:
       modified |= FixPhiIncomingTypes(value_inst, new_type_id);
@@ -613,13 +727,22 @@ bool AzdFixCooperativeMatrixUsePass::FixStoreTypeMismatches() {
     const uint32_t pointer_id = store->GetSingleWordInOperand(0);
     const uint32_t object_id = store->GetSingleWordInOperand(1);
     const uint32_t pointee_type_id = GetPointerPointeeType(pointer_id);
+    const uint32_t preferred_object_type_id =
+        GetPreferredStoreObjectType(pointer_id, pointee_type_id);
 
     Instruction* object_inst = get_def_use_mgr()->GetDef(object_id);
     if (!object_inst || !IsAzdCooperativeMatrixType(pointee_type_id) ||
-        !IsAzdCooperativeMatrixType(object_inst->type_id()) ||
-        pointee_type_id == object_inst->type_id()) {
+        !IsAzdCooperativeMatrixType(object_inst->type_id())) {
       continue;
     }
+
+    if (object_inst->type_id() != preferred_object_type_id &&
+        TryRewriteStoreObjectType(object_id, preferred_object_type_id)) {
+      modified = true;
+      object_inst = get_def_use_mgr()->GetDef(object_id);
+    }
+
+    if (!object_inst || object_inst->type_id() == pointee_type_id) continue;
 
     const uint32_t converted_id =
         InsertBitcastBefore(store, pointee_type_id, object_id);
@@ -632,6 +755,39 @@ bool AzdFixCooperativeMatrixUsePass::FixStoreTypeMismatches() {
   }
 
   return modified;
+}
+
+bool AzdFixCooperativeMatrixUsePass::TryRewriteStoreObjectType(
+    uint32_t object_id, uint32_t target_type_id) {
+  if (object_id == 0 || target_type_id == 0) return false;
+
+  Instruction* object_inst = get_def_use_mgr()->GetDef(object_id);
+  if (!object_inst || !IsAzdCooperativeMatrixType(object_inst->type_id())) {
+    return false;
+  }
+  if (object_inst->type_id() == target_type_id) return true;
+
+  switch (object_inst->opcode()) {
+    case spv::Op::OpCooperativeMatrixLoadAZD:
+      break;
+    case spv::Op::OpLoad: {
+      if (object_inst->NumInOperands() == 0) return false;
+
+      const uint32_t pointer_id = object_inst->GetSingleWordInOperand(0);
+      auto preferred = pointer_preferred_pointees_.find(pointer_id);
+      if (preferred != pointer_preferred_pointees_.end() &&
+          preferred->second != target_type_id) {
+        return false;
+      }
+      break;
+    }
+    default:
+      return false;
+  }
+
+  RewriteValueType(object_id, target_type_id);
+  object_inst = get_def_use_mgr()->GetDef(object_id);
+  return object_inst && object_inst->type_id() == target_type_id;
 }
 
 bool AzdFixCooperativeMatrixUsePass::FixReturnValueTypeMismatches() {

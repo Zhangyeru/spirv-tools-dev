@@ -15,6 +15,7 @@
 #ifndef SOURCE_OPT_AZD_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
 #define SOURCE_OPT_AZD_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
 
+#include <string>
 #include <unordered_map>
 
 #include "source/opt/pass.h"
@@ -51,9 +52,16 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
       uint32_t old_type_id, spv::CooperativeMatrixUseAZD use);
   uint32_t GetOrCreatePointerType(uint32_t old_pointer_type_id,
                                   uint32_t pointee_type_id);
+  uint32_t GetPointerTypePointeeType(uint32_t pointer_type_id) const;
   uint32_t GetPointerPointeeType(uint32_t pointer_id) const;
+  uint32_t GetPreferredPointerPointeeType(uint32_t pointer_id,
+                                          uint32_t fallback_type_id) const;
+  std::string GetPointerAccessKey(uint32_t pointer_id) const;
+  uint32_t GetPreferredStoreObjectType(uint32_t pointer_id,
+                                       uint32_t fallback_type_id) const;
   uint32_t GetStorePointerPointeeType(uint32_t pointer_id,
                                       uint32_t fallback_type_id) const;
+  void CollectFunctionCallPointerRequirements();
   bool CanRewriteValueType(const Instruction* inst) const;
   bool CanRewritePointerPointeeType(const Instruction* inst) const;
   uint32_t GetDesiredValueType(uint32_t value_id, uint32_t fallback_type_id);
@@ -66,6 +74,7 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
   bool FixCopyObjectTypeMismatches();
   bool FixStoreTypeMismatches();
   bool FixReturnValueTypeMismatches();
+  bool TryRewriteStoreObjectType(uint32_t object_id, uint32_t target_type_id);
   uint32_t InsertBitcastBefore(Instruction* insert_before,
                                uint32_t result_type_id, uint32_t object_id);
   uint32_t EnsureValueTypeBefore(Instruction* insert_before,
@@ -78,7 +87,10 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
 
   std::unordered_map<uint32_t, MatrixUseStat> value_use_stats_;
   std::unordered_map<uint32_t, MatrixUseStat> pointer_use_stats_;
+  std::unordered_map<std::string, MatrixUseStat> pointer_key_use_stats_;
   std::unordered_map<uint32_t, uint32_t> pointer_preferred_pointees_;
+  std::unordered_map<std::string, uint32_t> pointer_key_preferred_pointees_;
+  std::unordered_map<uint32_t, uint32_t> pointer_required_pointees_;
   std::unordered_map<uint32_t, uint32_t> processed_value_types_;
   std::unordered_map<uint32_t, uint32_t> processed_pointer_pointees_;
 };
