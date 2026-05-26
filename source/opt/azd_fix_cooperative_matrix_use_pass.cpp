@@ -100,6 +100,9 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
     AddUseStats(&pointer_use_stats_[pointer_id], id_and_stat.second);
   }
 
+  CollectFunctionCallPointerRequirements();
+  AddDefaultUseAStatsForUnclassifiedMatrices();
+
   for (const auto& id_and_stat : pointer_use_stats_) {
     const uint32_t pointer_id = id_and_stat.first;
     const uint32_t pointee_type_id = GetPointerPointeeType(pointer_id);
@@ -143,9 +146,12 @@ Pass::Status AzdFixCooperativeMatrixUsePass::Process() {
     pointer_key_preferred_pointees_[key_and_stat.first] = new_type_id;
   }
 
-  CollectFunctionCallPointerRequirements();
-
   bool modified = false;
+  for (const auto& id_and_type : pointer_preferred_pointees_) {
+    modified |= RewritePointerPointeeType(id_and_type.first,
+                                          id_and_type.second);
+  }
+
   for (const auto& id_and_stat : value_use_stats_) {
     const uint32_t value_id = id_and_stat.first;
     Instruction* value_inst = get_def_use_mgr()->GetDef(value_id);
@@ -188,6 +194,14 @@ bool AzdFixCooperativeMatrixUsePass::IsAzdCooperativeMatrixType(
          type_inst->opcode() == spv::Op::OpTypeCooperativeMatrixAZD;
 }
 
+bool AzdFixCooperativeMatrixUsePass::IsAzdCooperativeMatrixTypeWithoutUse(
+    uint32_t type_id) const {
+  Instruction* type_inst = get_def_use_mgr()->GetDef(type_id);
+  return type_inst &&
+         type_inst->opcode() == spv::Op::OpTypeCooperativeMatrixAZD &&
+         type_inst->NumInOperands() == 3;
+}
+
 bool AzdFixCooperativeMatrixUsePass::HasRoleConflict(
     const MatrixUseStat& stat) const {
   return stat.accumulator_count > 0 &&
@@ -220,6 +234,38 @@ void AzdFixCooperativeMatrixUsePass::AddUseStats(
   target->left_count += source.left_count;
   target->right_count += source.right_count;
   target->accumulator_count += source.accumulator_count;
+}
+
+void AzdFixCooperativeMatrixUsePass::
+    AddDefaultUseAStatsForUnclassifiedMatrices() {
+  get_module()->ForEachInst([this](Instruction* inst) {
+    const uint32_t result_id = inst->result_id();
+    if (result_id == 0) return;
+
+    if (inst->opcode() == spv::Op::OpVariable &&
+        pointer_use_stats_.find(result_id) == pointer_use_stats_.end() &&
+        pointer_required_pointees_.find(result_id) ==
+            pointer_required_pointees_.end() &&
+        IsAzdCooperativeMatrixTypeWithoutUse(
+            GetPointerPointeeType(result_id))) {
+      pointer_use_stats_[result_id].left_count = 1;
+    }
+
+    if (inst->opcode() == spv::Op::OpFunction ||
+        value_use_stats_.find(result_id) != value_use_stats_.end() ||
+        !IsAzdCooperativeMatrixTypeWithoutUse(inst->type_id()) ||
+        !CanRewriteValueType(inst)) {
+      return;
+    }
+
+    if (inst->opcode() == spv::Op::OpLoad && inst->NumInOperands() > 0 &&
+        pointer_required_pointees_.find(inst->GetSingleWordInOperand(0)) !=
+            pointer_required_pointees_.end()) {
+      return;
+    }
+
+    value_use_stats_[result_id].left_count = 1;
+  });
 }
 
 spv::CooperativeMatrixUseAZD AzdFixCooperativeMatrixUsePass::InferUse(

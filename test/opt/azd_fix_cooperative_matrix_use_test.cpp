@@ -710,6 +710,58 @@ TEST_F(AzdFixCooperativeMatrixUseTest, RewritesCooperativeMatrixLoadAZDType) {
   SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
 }
 
+TEST_F(AzdFixCooperativeMatrixUseTest, DefaultsUnclassifiedMatricesToUseA) {
+  const std::string text = R"(
+; CHECK-DAG: [[type_a:%\w+]] = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16 MatrixUseAAZD
+; CHECK-DAG: [[ptr_a:%\w+]] = OpTypePointer Function [[type_a]]
+; CHECK: [[unused:%\w+]] = OpVariable [[ptr_a]] Function
+; CHECK-NEXT: [[x:%\w+]] = OpVariable [[ptr_a]] Function
+; CHECK: [[load:%\w+]] = OpCooperativeMatrixLoadAZD [[type_a]] {{%\w+}} {{%\w+}} {{%\w+}} %int_0
+; CHECK-NEXT: OpStore [[x]] [[load]]
+; CHECK-NEXT: [[value:%\w+]] = OpLoad [[type_a]] [[x]]
+; CHECK-NEXT: OpCooperativeMatrixStoreAZD {{%\w+}} [[value]] {{%\w+}} {{%\w+}} %int_0
+               OpCapability Shader
+               OpCapability CooperativeMatrixAZD
+               OpExtension "SPV_AZD_neural_matrix"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %uint = OpTypeInt 32 0
+     %uint_0 = OpConstant %uint 0
+   %uint_16 = OpConstant %uint 16
+        %int = OpTypeInt 32 1
+      %int_0 = OpConstant %int 0
+      %float = OpTypeFloat 32
+   %old_type = OpTypeCooperativeMatrixAZD %float %uint_16 %uint_16
+    %ptr_old = OpTypePointer Function %old_type
+%runtimearr_float = OpTypeRuntimeArray %float
+        %Buf = OpTypeStruct %runtimearr_float
+    %ptr_buf = OpTypePointer StorageBuffer %Buf
+        %buf = OpVariable %ptr_buf StorageBuffer
+  %ptr_data = OpTypePointer StorageBuffer %runtimearr_float
+    %v2float = OpTypeVector %float 2
+   %float_16 = OpConstant %float 16
+     %stride = OpConstantComposite %v2float %float_16 %float_16
+    %float_0 = OpConstant %float 0
+     %offset = OpConstantComposite %v2float %float_0 %float_0
+       %void = OpTypeVoid
+    %fn_void = OpTypeFunction %void
+       %main = OpFunction %void None %fn_void
+      %entry = OpLabel
+     %unused = OpVariable %ptr_old Function
+          %x = OpVariable %ptr_old Function
+       %base = OpAccessChain %ptr_data %buf %uint_0
+       %load = OpCooperativeMatrixLoadAZD %old_type %base %stride %offset %int_0
+               OpStore %x %load
+      %value = OpLoad %old_type %x
+               OpCooperativeMatrixStoreAZD %base %value %stride %offset %int_0
+               OpReturn
+               OpFunctionEnd
+)";
+
+  SinglePassRunAndMatch<AzdFixCooperativeMatrixUsePass>(text, true);
+}
+
 TEST_F(AzdFixCooperativeMatrixUseTest,
        RewritesCooperativeMatrixLoadAZDStoredThroughAccessChain) {
   const std::string text = R"(

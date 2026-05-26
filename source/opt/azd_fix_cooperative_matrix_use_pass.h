@@ -42,10 +42,12 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
   };
 
   bool IsAzdCooperativeMatrixType(uint32_t type_id) const;
+  bool IsAzdCooperativeMatrixTypeWithoutUse(uint32_t type_id) const;
   bool HasRoleConflict(const MatrixUseStat& stat) const;
   void ReportRoleConflict(uint32_t id) const;
   void AddValueUseStat(uint32_t value_id, uint32_t MatrixUseStat::*field);
   void AddUseStats(MatrixUseStat* target, const MatrixUseStat& source) const;
+  void AddDefaultUseAStatsForUnclassifiedMatrices();
   spv::CooperativeMatrixUseAZD InferUse(const MatrixUseStat& stat) const;
 
   uint32_t GetOrCreateAzdCooperativeMatrixTypeWithUse(
