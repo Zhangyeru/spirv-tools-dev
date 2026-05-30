@@ -17,6 +17,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   amd_ext_to_khr.h
   analyze_live_input_pass.h
   azd_fix_cooperative_matrix_use_pass.h
+  azd_lower_to_standard_pass.h
   basic_block.h
   block_merge_pass.h
   block_merge_util.h
@@ -138,6 +139,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   amd_ext_to_khr.cpp
   analyze_live_input_pass.cpp
   azd_fix_cooperative_matrix_use_pass.cpp
+  azd_lower_to_standard_pass.cpp
   basic_block.cpp
   block_merge_pass.cpp
   block_merge_util.cpp

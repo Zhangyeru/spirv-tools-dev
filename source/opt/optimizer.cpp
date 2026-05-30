@@ -321,6 +321,8 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   // can be invoked without creating a pass instance.
   if (pass_name == "azd-fix-cooperative-matrix-use") {
     RegisterPass(CreateAzdFixCooperativeMatrixUsePass());
+  } else if (pass_name == "azd-lower-to-standard") {
+    RegisterPass(CreateAzdLowerToStandardPass());
   } else if (pass_name == "strip-debug") {
     RegisterPass(CreateStripDebugInfoPass());
   } else if (pass_name == "strip-reflect") {
@@ -1101,6 +1103,11 @@ Optimizer::PassToken CreateAmdExtToKhrPass() {
 Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass() {
   return MakeUnique<Optimizer::PassToken::Impl>(
       MakeUnique<opt::AzdFixCooperativeMatrixUsePass>());
+}
+
+Optimizer::PassToken CreateAzdLowerToStandardPass() {
+  return MakeUnique<Optimizer::PassToken::Impl>(
+      MakeUnique<opt::AzdLowerToStandardPass>());
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

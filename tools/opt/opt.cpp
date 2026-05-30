@@ -106,6 +106,10 @@ Options (in lexicographical order):)",
                Fixes OpTypeCooperativeMatrixAZD use operands based on AZD
                cooperative matrix multiply operand roles.)");
   printf(R"(
+  --azd-lower-to-standard
+               Lowers supported AZD cooperative matrix/vector ops and types to
+               ordinary scalar-array SPIR-V and removes AZD declarations.)");
+  printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help
                for details.)");
