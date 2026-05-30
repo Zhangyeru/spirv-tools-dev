@@ -85,14 +85,15 @@ class AzdLowerToStandardPass : public Pass {
                                    Instruction* user,
                                    const MatrixTypeInfo& info,
                                    uint32_t shape_id, uint32_t offset_id,
-                                   uint32_t layout, uint32_t row,
-                                   uint32_t col);
+                                   uint32_t layout, uint32_t row, uint32_t col);
   uint32_t BuildElementAccess(InstructionBuilder* builder, Instruction* user,
                               uint32_t pointer_id, uint32_t component_type_id,
                               uint32_t element_index_id);
   uint32_t ExtractCompositeElement(InstructionBuilder* builder,
                                    uint32_t component_type_id,
                                    uint32_t composite_id, uint32_t index);
+  uint32_t MatrixFlatIndex(const MatrixTypeInfo& info, uint32_t row,
+                           uint32_t col) const;
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
@@ -105,6 +106,7 @@ class AzdLowerToStandardPass : public Pass {
   bool IsAzdOpcode(spv::Op opcode) const;
   bool IsAzdCapabilityOrExtension(const Instruction* inst) const;
   bool RemoveExtensionByName(const char* extension_name);
+  bool RemoveSourceExtensionByName(const char* extension_name);
   void RebuildAsCompositeConstruct(Instruction* inst, uint32_t type_id,
                                    const std::vector<uint32_t>& element_ids);
   void ReportError(const Instruction* inst, const std::string& message) const;
