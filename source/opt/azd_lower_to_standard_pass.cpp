@@ -52,6 +52,9 @@ constexpr uint32_t kAzdVectorMatrixMulMatrixInIdx = 1;
 constexpr uint32_t kAzdVectorMatrixMulAddBiasInIdx = 2;
 
 constexpr uint32_t kDefaultMaxLoweredElements = 4096;
+constexpr uint32_t kDefaultMatrixTileM = 2;
+constexpr uint32_t kDefaultMatrixTileN = 4;
+constexpr uint32_t kDefaultVectorMatmulTileN = 4;
 
 Operand IdOperand(uint32_t id) { return {SPV_OPERAND_TYPE_ID, {id}}; }
 
@@ -137,9 +140,8 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
         ReportError(inst, "AZD cooperative matrix shape is unsupported");
         return false;
       }
-      info.lowered_type_id =
-          GetOrCreateArrayType(info.component_type_id,
-                               static_cast<uint32_t>(element_count), inst);
+      info.lowered_type_id = GetOrCreateArrayType(
+          info.component_type_id, static_cast<uint32_t>(element_count), inst);
       if (info.lowered_type_id == 0) return false;
       matrix_types_[info.type_id] = info;
       lowered_types_[info.type_id] = info.lowered_type_id;
@@ -221,8 +223,7 @@ bool AzdLowerToStandardPass::LegalizeModule() {
       return;
     }
 
-    if (inst->opcode() == spv::Op::OpReturnValue &&
-        inst->NumInOperands() > 0) {
+    if (inst->opcode() == spv::Op::OpReturnValue && inst->NumInOperands() > 0) {
       Instruction* object =
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
       if (object && TypeContainsAzd(object->type_id())) {
@@ -263,7 +264,8 @@ bool AzdLowerToStandardPass::LegalizeModule() {
       if (!result || !a || !b || !c || a->cols != b->rows ||
           result->rows != a->rows || result->cols != b->cols ||
           c->rows != result->rows || c->cols != result->cols) {
-        ReportError(inst, "AZD cooperative matrix multiply shapes do not match");
+        ReportError(inst,
+                    "AZD cooperative matrix multiply shapes do not match");
         ok = false;
         return;
       }
@@ -274,8 +276,8 @@ bool AzdLowerToStandardPass::LegalizeModule() {
       const VectorTypeInfo* result = GetVectorType(inst->type_id());
       Instruction* input_inst =
           inst->NumInOperands() > kAzdVectorMatrixMulInputInIdx
-              ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(
-                    kAzdVectorMatrixMulInputInIdx))
+              ? get_def_use_mgr()->GetDef(
+                    inst->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx))
               : nullptr;
       Instruction* matrix_inst =
           inst->NumInOperands() > kAzdVectorMatrixMulMatrixInIdx
@@ -294,11 +296,12 @@ bool AzdLowerToStandardPass::LegalizeModule() {
             inst->GetSingleWordInOperand(kAzdVectorMatrixMulAddBiasInIdx));
         bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
       }
-      if (!result || !input || !matrix || input->length != matrix->rows ||
-          result->length != matrix->cols ||
+      if (!result || !input || !matrix || input->length != matrix->cols ||
+          result->length != matrix->rows ||
           (has_bias && (!bias || bias->length != result->length))) {
-        ReportError(inst, "AZD cooperative vector matrix multiply shapes do "
-                          "not match");
+        ReportError(inst,
+                    "AZD cooperative vector matrix multiply shapes do "
+                    "not match");
         ok = false;
         return;
       }
@@ -315,7 +318,8 @@ bool AzdLowerToStandardPass::LegalizeModule() {
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
       if (!object || GetLoweredType(inst->type_id()) == 0 ||
           GetLoweredType(object->type_id()) == 0 ||
-          GetLoweredType(inst->type_id()) != GetLoweredType(object->type_id())) {
+          GetLoweredType(inst->type_id()) !=
+              GetLoweredType(object->type_id())) {
         ReportError(inst, "unsupported AZD OpBitcast");
         ok = false;
         return;
@@ -422,10 +426,14 @@ bool AzdLowerToStandardPass::CleanupAzdDeclarations(
     }
   }
 
-  modified |= context()->RemoveCapability(spv::Capability::CooperativeMatrixAZD);
-  modified |= context()->RemoveCapability(spv::Capability::CooperativeVectorAZD);
+  modified |=
+      context()->RemoveCapability(spv::Capability::CooperativeMatrixAZD);
+  modified |=
+      context()->RemoveCapability(spv::Capability::CooperativeVectorAZD);
   modified |= RemoveExtensionByName("SPV_AZD_neural_matrix");
   modified |= RemoveExtensionByName("SPV_AZD_cooperative_vector");
+  modified |= RemoveSourceExtensionByName("GL_AZD_neural_matrix");
+  modified |= RemoveSourceExtensionByName("GL_AZD_cooperative_vector");
   (void)modified;
   return true;
 }
@@ -495,11 +503,10 @@ bool AzdLowerToStandardPass::LowerMatrixStore(
     return false;
   }
 
-  Instruction* object =
-      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(
-          kAzdMatrixStoreObjectInIdx));
-  const MatrixTypeInfo* info = object ? GetMatrixType(object->type_id())
-                                      : nullptr;
+  Instruction* object = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kAzdMatrixStoreObjectInIdx));
+  const MatrixTypeInfo* info =
+      object ? GetMatrixType(object->type_id()) : nullptr;
   if (!info) {
     ReportError(inst, "invalid AZD matrix store object");
     return false;
@@ -546,12 +553,12 @@ bool AzdLowerToStandardPass::LowerMatrixStore(
 
 bool AzdLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
-  Instruction* a_inst =
-      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
-  Instruction* b_inst =
-      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
-  Instruction* c_inst =
-      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
+  Instruction* a_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
+  Instruction* b_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
+  Instruction* c_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
   const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
   const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
   const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
@@ -563,39 +570,76 @@ bool AzdLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   InstructionBuilder builder(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  std::vector<uint32_t> element_ids;
-  element_ids.reserve(result->rows * result->cols);
+  std::vector<uint32_t> element_ids(result->rows * result->cols, 0);
 
   const uint32_t a_id = a_inst->result_id();
   const uint32_t b_id = b_inst->result_id();
   const uint32_t c_id = c_inst->result_id();
   const uint32_t float_type_id = result->component_type_id;
 
-  for (uint32_t row = 0; row < result->rows; ++row) {
-    for (uint32_t col = 0; col < result->cols; ++col) {
-      uint32_t acc_id = ExtractCompositeElement(
-          &builder, float_type_id, c_id, row * c->cols + col);
-      if (acc_id == 0) return false;
-      for (uint32_t k = 0; k < a->cols; ++k) {
-        const uint32_t a_elem = ExtractCompositeElement(
-            &builder, float_type_id, a_id, row * a->cols + k);
-        const uint32_t b_elem = ExtractCompositeElement(
-            &builder, float_type_id, b_id, k * b->cols + col);
-        if (a_elem == 0 || b_elem == 0) return false;
-        Instruction* mul =
-            builder.AddBinaryOp(float_type_id, spv::Op::OpFMul, a_elem,
-                                b_elem);
-        if (!mul) return false;
-        Instruction* add =
-            builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd, acc_id,
-                                mul->result_id());
-        if (!add) return false;
-        acc_id = add->result_id();
+  for (uint32_t row0 = 0; row0 < result->rows; row0 += kDefaultMatrixTileM) {
+    const uint32_t tile_m = std::min(kDefaultMatrixTileM, result->rows - row0);
+
+    for (uint32_t col0 = 0; col0 < result->cols; col0 += kDefaultMatrixTileN) {
+      const uint32_t tile_n =
+          std::min(kDefaultMatrixTileN, result->cols - col0);
+      std::vector<uint32_t> acc(tile_m * tile_n, 0);
+
+      for (uint32_t i = 0; i < tile_m; ++i) {
+        for (uint32_t j = 0; j < tile_n; ++j) {
+          const uint32_t row = row0 + i;
+          const uint32_t col = col0 + j;
+          acc[i * tile_n + j] = ExtractCompositeElement(
+              &builder, float_type_id, c_id, MatrixFlatIndex(*c, row, col));
+          if (acc[i * tile_n + j] == 0) return false;
+        }
       }
-      element_ids.push_back(acc_id);
+
+      for (uint32_t k = 0; k < a->cols; ++k) {
+        std::vector<uint32_t> a_elems(tile_m, 0);
+        std::vector<uint32_t> b_elems(tile_n, 0);
+
+        for (uint32_t i = 0; i < tile_m; ++i) {
+          const uint32_t row = row0 + i;
+          a_elems[i] = ExtractCompositeElement(&builder, float_type_id, a_id,
+                                               MatrixFlatIndex(*a, row, k));
+          if (a_elems[i] == 0) return false;
+        }
+
+        for (uint32_t j = 0; j < tile_n; ++j) {
+          const uint32_t col = col0 + j;
+          b_elems[j] = ExtractCompositeElement(&builder, float_type_id, b_id,
+                                               MatrixFlatIndex(*b, k, col));
+          if (b_elems[j] == 0) return false;
+        }
+
+        for (uint32_t i = 0; i < tile_m; ++i) {
+          for (uint32_t j = 0; j < tile_n; ++j) {
+            Instruction* mul = builder.AddBinaryOp(
+                float_type_id, spv::Op::OpFMul, a_elems[i], b_elems[j]);
+            if (!mul) return false;
+            Instruction* add =
+                builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd,
+                                    acc[i * tile_n + j], mul->result_id());
+            if (!add) return false;
+            acc[i * tile_n + j] = add->result_id();
+          }
+        }
+      }
+
+      for (uint32_t i = 0; i < tile_m; ++i) {
+        for (uint32_t j = 0; j < tile_n; ++j) {
+          const uint32_t row = row0 + i;
+          const uint32_t col = col0 + j;
+          element_ids[MatrixFlatIndex(*result, row, col)] = acc[i * tile_n + j];
+        }
+      }
     }
   }
 
+  for (uint32_t id : element_ids) {
+    if (id == 0) return false;
+  }
   RebuildAsCompositeConstruct(inst, result->lowered_type_id, element_ids);
   return true;
 }
@@ -659,8 +703,8 @@ bool AzdLowerToStandardPass::LowerVectorStore(
 
   Instruction* object =
       get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
-  const VectorTypeInfo* info = object ? GetVectorType(object->type_id())
-                                      : nullptr;
+  const VectorTypeInfo* info =
+      object ? GetVectorType(object->type_id()) : nullptr;
   if (!info) {
     ReportError(inst, "invalid AZD vector store object");
     return false;
@@ -672,8 +716,8 @@ bool AzdLowerToStandardPass::LowerVectorStore(
   const uint32_t pointer_id = inst->GetSingleWordInOperand(0);
   const uint32_t object_id = inst->GetSingleWordInOperand(1);
   for (uint32_t i = 0; i < info->length; ++i) {
-    const uint32_t value_id =
-        ExtractCompositeElement(&builder, info->component_type_id, object_id, i);
+    const uint32_t value_id = ExtractCompositeElement(
+        &builder, info->component_type_id, object_id, i);
     const uint32_t index_id = GetOrCreateUIntConstant(i);
     const uint32_t elem_ptr_id = BuildElementAccess(
         &builder, inst, pointer_id, info->component_type_id, index_id);
@@ -711,34 +755,52 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   InstructionBuilder builder(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  std::vector<uint32_t> element_ids;
-  element_ids.reserve(result->length);
+  std::vector<uint32_t> element_ids(result->length, 0);
   const uint32_t float_type_id = result->component_type_id;
-  const uint32_t zero_id = GetOrCreateZero(float_type_id);
+  const uint32_t zero_id = has_bias ? 0 : GetOrCreateZero(float_type_id);
+  if (!has_bias && zero_id == 0) return false;
 
-  for (uint32_t col = 0; col < result->length; ++col) {
-    uint32_t acc_id =
-        has_bias ? ExtractCompositeElement(&builder, float_type_id,
-                                           bias_inst->result_id(), col)
-                 : zero_id;
-    if (acc_id == 0) return false;
-    for (uint32_t k = 0; k < input->length; ++k) {
-      const uint32_t x_id = ExtractCompositeElement(
-          &builder, float_type_id, input_inst->result_id(), k);
-      const uint32_t w_id = ExtractCompositeElement(
-          &builder, float_type_id, matrix_inst->result_id(),
-          k * matrix->cols + col);
-      if (x_id == 0 || w_id == 0) return false;
-      Instruction* mul =
-          builder.AddBinaryOp(float_type_id, spv::Op::OpFMul, x_id, w_id);
-      if (!mul) return false;
-      Instruction* add =
-          builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd, acc_id,
-                              mul->result_id());
-      if (!add) return false;
-      acc_id = add->result_id();
+  for (uint32_t col0 = 0; col0 < result->length;
+       col0 += kDefaultVectorMatmulTileN) {
+    const uint32_t tile_n =
+        std::min(kDefaultVectorMatmulTileN, result->length - col0);
+    std::vector<uint32_t> acc(tile_n, 0);
+
+    for (uint32_t j = 0; j < tile_n; ++j) {
+      const uint32_t col = col0 + j;
+      acc[j] = has_bias ? ExtractCompositeElement(&builder, float_type_id,
+                                                  bias_inst->result_id(), col)
+                        : zero_id;
+      if (acc[j] == 0) return false;
     }
-    element_ids.push_back(acc_id);
+
+    for (uint32_t k = 0; k < input->length; ++k) {
+      const uint32_t x_id = ExtractCompositeElement(&builder, float_type_id,
+                                                    input_inst->result_id(), k);
+      if (x_id == 0) return false;
+      for (uint32_t j = 0; j < tile_n; ++j) {
+        const uint32_t col = col0 + j;
+        const uint32_t w_id = ExtractCompositeElement(
+            &builder, float_type_id, matrix_inst->result_id(),
+            MatrixFlatIndex(*matrix, col, k));
+        if (w_id == 0) return false;
+        Instruction* mul =
+            builder.AddBinaryOp(float_type_id, spv::Op::OpFMul, x_id, w_id);
+        if (!mul) return false;
+        Instruction* add = builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd,
+                                               acc[j], mul->result_id());
+        if (!add) return false;
+        acc[j] = add->result_id();
+      }
+    }
+
+    for (uint32_t j = 0; j < tile_n; ++j) {
+      element_ids[col0 + j] = acc[j];
+    }
+  }
+
+  for (uint32_t id : element_ids) {
+    if (id == 0) return false;
   }
 
   RebuildAsCompositeConstruct(inst, result->lowered_type_id, element_ids);
@@ -755,8 +817,7 @@ bool AzdLowerToStandardPass::LowerAzdBitcast(Instruction* inst) {
 uint32_t AzdLowerToStandardPass::GetOrCreateArrayType(
     uint32_t component_type_id, uint32_t length, Instruction* insert_after) {
   Instruction* insertion_point = insert_after;
-  uint32_t length_id =
-      GetOrCreateUIntConstantAfter(length, &insertion_point);
+  uint32_t length_id = GetOrCreateUIntConstantAfter(length, &insertion_point);
   if (length_id == 0) return 0;
 
   for (Instruction& inst : get_module()->types_values()) {
@@ -785,7 +846,8 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePointerType(
     uint32_t pointee_type_id, spv::StorageClass storage_class) {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypePointer &&
-        inst.GetSingleWordInOperand(0) == static_cast<uint32_t>(storage_class) &&
+        inst.GetSingleWordInOperand(0) ==
+            static_cast<uint32_t>(storage_class) &&
         inst.GetSingleWordInOperand(1) == pointee_type_id) {
       return inst.result_id();
     }
@@ -795,10 +857,9 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePointerType(
   if (result_id == 0) return 0;
   context()->AddType(MakeUnique<Instruction>(
       context(), spv::Op::OpTypePointer, 0, result_id,
-      std::initializer_list<Operand>{
-          {SPV_OPERAND_TYPE_STORAGE_CLASS,
-           {static_cast<uint32_t>(storage_class)}},
-          IdOperand(pointee_type_id)}));
+      std::initializer_list<Operand>{{SPV_OPERAND_TYPE_STORAGE_CLASS,
+                                      {static_cast<uint32_t>(storage_class)}},
+                                     IdOperand(pointee_type_id)}));
   return result_id;
 }
 
@@ -815,9 +876,8 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntType() {
   if (result_id == 0) return 0;
   context()->AddType(MakeUnique<Instruction>(
       context(), spv::Op::OpTypeInt, 0, result_id,
-      std::initializer_list<Operand>{
-          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {32}},
-          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {0}}}));
+      std::initializer_list<Operand>{{SPV_OPERAND_TYPE_LITERAL_INTEGER, {32}},
+                                     {SPV_OPERAND_TYPE_LITERAL_INTEGER, {0}}}));
   return result_id;
 }
 
@@ -835,7 +895,8 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntConstantAfter(
   for (Instruction& inst : get_module()->types_values()) {
     if ((inst.opcode() == spv::Op::OpConstant ||
          inst.opcode() == spv::Op::OpSpecConstant) &&
-        inst.type_id() == uint_type_id && inst.GetSingleWordInOperand(0) == value) {
+        inst.type_id() == uint_type_id &&
+        inst.GetSingleWordInOperand(0) == value) {
       return inst.result_id();
     }
   }
@@ -866,9 +927,8 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntTypeAfter(
   if (result_id == 0) return 0;
   std::unique_ptr<Instruction> uint_type = MakeUnique<Instruction>(
       context(), spv::Op::OpTypeInt, 0, result_id,
-      std::initializer_list<Operand>{
-          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {32}},
-          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {0}}});
+      std::initializer_list<Operand>{{SPV_OPERAND_TYPE_LITERAL_INTEGER, {32}},
+                                     {SPV_OPERAND_TYPE_LITERAL_INTEGER, {0}}});
   Instruction* added =
       AddTypeOrGlobalAfter(context(), *insert_after, std::move(uint_type));
   *insert_after = added;
@@ -916,9 +976,9 @@ uint32_t AzdLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
 
   const uint32_t result_id = TakeNextId();
   if (result_id == 0) return 0;
-  context()->AddGlobalValue(MakeUnique<Instruction>(
-      context(), spv::Op::OpConstantNull, type_id, result_id,
-      std::initializer_list<Operand>{}));
+  context()->AddGlobalValue(
+      MakeUnique<Instruction>(context(), spv::Op::OpConstantNull, type_id,
+                              result_id, std::initializer_list<Operand>{}));
   return result_id;
 }
 
@@ -939,8 +999,8 @@ uint32_t AzdLowerToStandardPass::BuildPairComponentAsUInt(
   }
 
   const uint32_t component_type_id = pair_type->GetSingleWordInOperand(0);
-  Instruction* extract =
-      builder->AddCompositeExtract(component_type_id, pair_id, {component_index});
+  Instruction* extract = builder->AddCompositeExtract(
+      component_type_id, pair_id, {component_index});
   if (!extract) return 0;
 
   const uint32_t uint_type_id = GetOrCreateUIntType();
@@ -956,9 +1016,8 @@ uint32_t AzdLowerToStandardPass::BuildPairComponentAsUInt(
   }
   if (component_type->opcode() == spv::Op::OpTypeInt &&
       component_type->GetSingleWordInOperand(0) == 32) {
-    Instruction* converted =
-        builder->AddUnaryOp(uint_type_id, spv::Op::OpBitcast,
-                            extract->result_id());
+    Instruction* converted = builder->AddUnaryOp(
+        uint_type_id, spv::Op::OpBitcast, extract->result_id());
     return converted ? converted->result_id() : 0;
   }
 
@@ -986,22 +1045,21 @@ uint32_t AzdLowerToStandardPass::BuildMatrixElementIndex(
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t row_const_id = GetOrCreateUIntConstant(row);
   const uint32_t col_const_id = GetOrCreateUIntConstant(col);
-  Instruction* global_row =
-      builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd, offset_row,
-                           row_const_id);
-  Instruction* global_col =
-      builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd, offset_col,
-                           col_const_id);
+  Instruction* global_row = builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                 offset_row, row_const_id);
+  Instruction* global_col = builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                 offset_col, col_const_id);
   if (!global_row || !global_col) return 0;
 
   Instruction* major_mul = nullptr;
-  if (layout == static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
+  if (layout ==
+      static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
     major_mul = builder->AddBinaryOp(uint_type_id, spv::Op::OpIMul,
                                      global_row->result_id(), shape_cols);
     if (!major_mul) return 0;
-    Instruction* index = builder->AddBinaryOp(
-        uint_type_id, spv::Op::OpIAdd, major_mul->result_id(),
-        global_col->result_id());
+    Instruction* index =
+        builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                             major_mul->result_id(), global_col->result_id());
     return index ? index->result_id() : 0;
   }
 
@@ -1009,15 +1067,17 @@ uint32_t AzdLowerToStandardPass::BuildMatrixElementIndex(
   major_mul = builder->AddBinaryOp(uint_type_id, spv::Op::OpIMul,
                                    global_col->result_id(), shape_rows);
   if (!major_mul) return 0;
-  Instruction* index = builder->AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, major_mul->result_id(),
-      global_row->result_id());
+  Instruction* index =
+      builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                           major_mul->result_id(), global_row->result_id());
   return index ? index->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildElementAccess(
-    InstructionBuilder* builder, Instruction* user, uint32_t pointer_id,
-    uint32_t component_type_id, uint32_t element_index_id) {
+uint32_t AzdLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
+                                                    Instruction* user,
+                                                    uint32_t pointer_id,
+                                                    uint32_t component_type_id,
+                                                    uint32_t element_index_id) {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer || pointer->type_id() == 0) {
     ReportError(user, "AZD load/store pointer is invalid");
@@ -1049,9 +1109,8 @@ uint32_t AzdLowerToStandardPass::BuildElementAccess(
     const uint32_t storage_class = pointer_type->GetSingleWordInOperand(0);
     const uint32_t component_pointer_type_id = GetOrCreatePointerType(
         component_type_id, static_cast<spv::StorageClass>(storage_class));
-    Instruction* access = builder->AddAccessChain(component_pointer_type_id,
-                                                  pointer_id,
-                                                  {element_index_id});
+    Instruction* access = builder->AddAccessChain(
+        component_pointer_type_id, pointer_id, {element_index_id});
     return access ? access->result_id() : 0;
   }
 
@@ -1069,12 +1128,19 @@ uint32_t AzdLowerToStandardPass::ExtractCompositeElement(
   return extract ? extract->result_id() : 0;
 }
 
+uint32_t AzdLowerToStandardPass::MatrixFlatIndex(const MatrixTypeInfo& info,
+                                                 uint32_t row,
+                                                 uint32_t col) const {
+  return row * info.cols + col;
+}
+
 const AzdLowerToStandardPass::MatrixTypeInfo*
 AzdLowerToStandardPass::GetMatrixType(uint32_t type_id) const {
   auto it = matrix_types_.find(type_id);
   if (it != matrix_types_.end()) return &it->second;
   for (const auto& id_and_info : matrix_types_) {
-    if (id_and_info.second.lowered_type_id == type_id) return &id_and_info.second;
+    if (id_and_info.second.lowered_type_id == type_id)
+      return &id_and_info.second;
   }
   return nullptr;
 }
@@ -1084,7 +1150,8 @@ AzdLowerToStandardPass::GetVectorType(uint32_t type_id) const {
   auto it = vector_types_.find(type_id);
   if (it != vector_types_.end()) return &it->second;
   for (const auto& id_and_info : vector_types_) {
-    if (id_and_info.second.lowered_type_id == type_id) return &id_and_info.second;
+    if (id_and_info.second.lowered_type_id == type_id)
+      return &id_and_info.second;
   }
   return nullptr;
 }
@@ -1192,11 +1259,15 @@ bool AzdLowerToStandardPass::IsAzdCapabilityOrExtension(
     return extension == "SPV_AZD_neural_matrix" ||
            extension == "SPV_AZD_cooperative_vector";
   }
+  if (inst->opcode() == spv::Op::OpSourceExtension) {
+    const std::string extension = inst->GetInOperand(0).AsString();
+    return extension == "GL_AZD_neural_matrix" ||
+           extension == "GL_AZD_cooperative_vector";
+  }
   return false;
 }
 
-bool AzdLowerToStandardPass::RemoveExtensionByName(
-    const char* extension_name) {
+bool AzdLowerToStandardPass::RemoveExtensionByName(const char* extension_name) {
   return context()->KillInstructionIf(
       get_module()->extension_begin(), get_module()->extension_end(),
       [extension_name](Instruction* inst) {
@@ -1205,8 +1276,19 @@ bool AzdLowerToStandardPass::RemoveExtensionByName(
       });
 }
 
+bool AzdLowerToStandardPass::RemoveSourceExtensionByName(
+    const char* extension_name) {
+  return context()->KillInstructionIf(
+      get_module()->debug1_begin(), get_module()->debug1_end(),
+      [extension_name](Instruction* inst) {
+        return inst->opcode() == spv::Op::OpSourceExtension &&
+               inst->GetInOperand(0).AsString() == extension_name;
+      });
+}
+
 void AzdLowerToStandardPass::RebuildAsCompositeConstruct(
-    Instruction* inst, uint32_t type_id, const std::vector<uint32_t>& element_ids) {
+    Instruction* inst, uint32_t type_id,
+    const std::vector<uint32_t>& element_ids) {
   std::vector<Operand> operands;
   operands.reserve(element_ids.size());
   for (uint32_t id : element_ids) operands.push_back(IdOperand(id));
@@ -1216,8 +1298,8 @@ void AzdLowerToStandardPass::RebuildAsCompositeConstruct(
   context()->UpdateDefUse(inst);
 }
 
-void AzdLowerToStandardPass::ReportError(
-    const Instruction*, const std::string& message) const {
+void AzdLowerToStandardPass::ReportError(const Instruction*,
+                                         const std::string& message) const {
   if (!consumer()) return;
   consumer()(SPV_MSG_ERROR, "", {0, 0, 0}, message.c_str());
 }
