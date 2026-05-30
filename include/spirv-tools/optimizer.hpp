@@ -840,6 +840,16 @@ Optimizer::PassToken CreateWrapOpKillPass();
 // capabilities.
 Optimizer::PassToken CreateAmdExtToKhrPass();
 
+// Creates an AZD cooperative matrix use fix pass.
+// This pass updates OpTypeCooperativeMatrixAZD use operands based on matrix
+// roles in OpCooperativeMatrixMulAddAZD instructions.
+Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass();
+
+// Creates an AZD cooperative matrix/vector lowering pass.
+// This pass lowers supported AZD cooperative types and operations to ordinary
+// scalar-array SPIR-V and removes AZD capabilities/extensions.
+Optimizer::PassToken CreateAzdLowerToStandardPass();
+
 // Replaces the internal version of GLSLstd450 InterpolateAt* extended
 // instructions with the externally valid version. The internal version allows
 // an OpLoad of the interpolant for the first argument. This pass removes the

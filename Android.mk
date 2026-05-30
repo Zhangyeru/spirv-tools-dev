@@ -82,6 +82,8 @@ SPVTOOLS_OPT_SRC_FILES := \
 		source/opt/aggressive_dead_code_elim_pass.cpp \
 		source/opt/amd_ext_to_khr.cpp \
 		source/opt/analyze_live_input_pass.cpp \
+		source/opt/azd_fix_cooperative_matrix_use_pass.cpp \
+		source/opt/azd_lower_to_standard_pass.cpp \
 		source/opt/basic_block.cpp \
 		source/opt/block_merge_pass.cpp \
 		source/opt/block_merge_util.cpp \
