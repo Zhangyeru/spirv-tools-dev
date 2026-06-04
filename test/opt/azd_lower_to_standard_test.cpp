@@ -379,11 +379,13 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF32) {
 ; CHECK-NOT: CooperativeMatrixKHR
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_4
-; CHECK: OpLoad %float
-; CHECK: OpCompositeConstruct
-; CHECK: OpCompositeExtract %v4float
-; CHECK: OpCompositeExtract %float
-; CHECK: OpStore
+; CHECK-DAG: OpFunctionCall %v4float
+; CHECK-DAG: OpFunctionCall %void
+; CHECK-DAG: OpLoad %float
+; CHECK-DAG: OpCompositeConstruct
+; CHECK-DAG: OpCompositeExtract %v4float
+; CHECK-DAG: OpCompositeExtract %float
+; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
@@ -1125,7 +1127,7 @@ OpFunctionEnd
   const std::string result = RunWithInjectedAlignedMemoryAccess(
       this, text, spv::Op::OpCooperativeMatrixLoadAZD);
   ExpectNoAzdOrCoopMatrix(result);
-  EXPECT_EQ(16u, CountSubstring(result, "Aligned 16"));
+  EXPECT_EQ(4u, CountSubstring(result, "Aligned 16"));
 }
 
 TEST_F(AzdLowerToStandardTest, MatrixStorePreservesAlignedMemoryAccess) {
@@ -1173,7 +1175,7 @@ OpFunctionEnd
   const std::string result = RunWithInjectedAlignedMemoryAccess(
       this, text, spv::Op::OpCooperativeMatrixStoreAZD);
   ExpectNoAzdOrCoopMatrix(result);
-  EXPECT_EQ(16u, CountSubstring(result, "Aligned 16"));
+  EXPECT_EQ(4u, CountSubstring(result, "Aligned 16"));
 }
 
 TEST_F(AzdLowerToStandardTest, VectorLoadPreservesAlignedMemoryAccess) {
@@ -1213,7 +1215,7 @@ OpFunctionEnd
   const std::string result = RunWithInjectedAlignedMemoryAccess(
       this, text, spv::Op::OpCooperativeVectorLoadAZD);
   ExpectNoAzdOrCoopMatrix(result);
-  EXPECT_EQ(8u, CountSubstring(result, "Aligned 16"));
+  EXPECT_EQ(4u, CountSubstring(result, "Aligned 16"));
 }
 
 TEST_F(AzdLowerToStandardTest, VectorStorePreservesAlignedMemoryAccess) {
@@ -1254,7 +1256,7 @@ OpFunctionEnd
   const std::string result = RunWithInjectedAlignedMemoryAccess(
       this, text, spv::Op::OpCooperativeVectorStoreAZD);
   ExpectNoAzdOrCoopMatrix(result);
-  EXPECT_EQ(8u, CountSubstring(result, "Aligned 16"));
+  EXPECT_EQ(4u, CountSubstring(result, "Aligned 16"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersVectorLoadStoreF16Packed) {
@@ -1263,11 +1265,13 @@ TEST_F(AzdLowerToStandardTest, LowersVectorLoadStoreF16Packed) {
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
 ; CHECK: OpTypeArray %v4half %uint_2
-; CHECK: OpLoad %half
-; CHECK: OpCompositeConstruct %v4half
-; CHECK: OpCompositeExtract %v4half
-; CHECK: OpCompositeExtract %half
-; CHECK: OpStore
+; CHECK-DAG: OpFunctionCall %v4half
+; CHECK-DAG: OpFunctionCall %void
+; CHECK-DAG: OpLoad %half
+; CHECK-DAG: OpCompositeConstruct %v4half
+; CHECK-DAG: OpCompositeExtract %v4half
+; CHECK-DAG: OpCompositeExtract %half
+; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorAZD
@@ -1310,11 +1314,13 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF16PackedRowMajor) {
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
 ; CHECK: OpTypeArray %v4half %uint_8
-; CHECK: OpLoad %half
-; CHECK: OpCompositeConstruct %v4half
-; CHECK: OpCompositeExtract %v4half
-; CHECK: OpCompositeExtract %half
-; CHECK: OpStore
+; CHECK-DAG: OpFunctionCall %v4half
+; CHECK-DAG: OpFunctionCall %void
+; CHECK-DAG: OpLoad %half
+; CHECK-DAG: OpCompositeConstruct %v4half
+; CHECK-DAG: OpCompositeExtract %v4half
+; CHECK-DAG: OpCompositeExtract %half
+; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixAZD
