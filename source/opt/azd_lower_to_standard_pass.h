@@ -15,6 +15,7 @@
 #ifndef SOURCE_OPT_AZD_LOWER_TO_STANDARD_PASS_H_
 #define SOURCE_OPT_AZD_LOWER_TO_STANDARD_PASS_H_
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,6 +26,7 @@
 namespace spvtools {
 namespace opt {
 
+class Function;
 class Instruction;
 class InstructionBuilder;
 struct Operand;
@@ -94,6 +96,7 @@ class AzdLowerToStandardPass : public Pass {
                                       Instruction* insert_after);
   uint32_t GetOrCreatePointerType(uint32_t pointee_type_id,
                                   spv::StorageClass storage_class);
+  uint32_t GetOrCreateVoidType();
   uint32_t GetOrCreateUIntType();
   uint32_t GetOrCreateUIntConstant(uint32_t value);
   uint32_t GetOrCreateUIntTypeAfter(Instruction** insert_after);
@@ -112,6 +115,14 @@ class AzdLowerToStandardPass : public Pass {
   uint32_t BuildElementAccess(InstructionBuilder* builder, Instruction* user,
                               uint32_t pointer_id, uint32_t component_type_id,
                               uint32_t element_index_id);
+  uint32_t BuildElementAccessFromPointerType(InstructionBuilder* builder,
+                                             uint32_t pointer_type_id,
+                                             uint32_t pointer_id,
+                                             uint32_t component_type_id,
+                                             uint32_t element_index_id);
+  uint32_t BuildCapturedPointer(InstructionBuilder* builder,
+                                uint32_t pointer_id);
+  bool IsModuleVisibleValue(uint32_t id) const;
   uint32_t ExtractCompositeElement(InstructionBuilder* builder,
                                    uint32_t component_type_id,
                                    uint32_t composite_id, uint32_t index);
@@ -155,11 +166,32 @@ class AzdLowerToStandardPass : public Pass {
                                     const MatrixTypeInfo& c, uint32_t a_id,
                                     uint32_t b_id, uint32_t c_id,
                                     std::vector<uint32_t>* element_ids);
+  void AddGeneratedFunction(std::unique_ptr<Function> function,
+                            uint32_t function_id);
+  std::string MemoryOperandsKey(
+      const std::vector<Operand>& memory_operands) const;
   uint32_t GetOrCreateFunctionType(uint32_t return_type_id,
                                    const std::vector<uint32_t>& param_type_ids);
+  uint32_t GetOrCreatePackedLoadFunction(
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
+      uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
+  uint32_t GetOrCreatePackedStoreFunction(
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
+      uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
+  uint32_t GetOrCreateTileWeightFunctionPackedVec4(
+      const MatrixTypeInfo& matrix);
+  uint32_t GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias);
   uint32_t GetOrCreateMatmulPatternFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c);
+  std::string TileWeightFunctionKey(const MatrixTypeInfo& matrix) const;
+  std::string VectorMatmulPatternFunctionKey(const VectorTypeInfo& result,
+                                             const VectorTypeInfo& input,
+                                             const MatrixTypeInfo& matrix,
+                                             const VectorTypeInfo* bias,
+                                             bool has_bias) const;
   std::string MatmulPatternFunctionKey(const MatrixTypeInfo& result,
                                        const MatrixTypeInfo& a,
                                        const MatrixTypeInfo& b,
@@ -188,6 +220,7 @@ class AzdLowerToStandardPass : public Pass {
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
   uint32_t GetLoweredType(uint32_t type_id) const;
+  uint32_t GetPointerTypeId(uint32_t pointer_id) const;
   uint32_t GetPointeeType(uint32_t pointer_type_id) const;
   bool GetConstantU32(uint32_t id, uint32_t* value) const;
   bool IsFloat16Type(uint32_t type_id) const;
@@ -208,8 +241,13 @@ class AzdLowerToStandardPass : public Pass {
   std::unordered_map<uint32_t, MatrixTypeInfo> matrix_types_;
   std::unordered_map<uint32_t, VectorTypeInfo> vector_types_;
   std::unordered_map<uint32_t, uint32_t> lowered_types_;
+  std::unordered_map<std::string, uint32_t> packed_load_functions_;
+  std::unordered_map<std::string, uint32_t> packed_store_functions_;
+  std::unordered_map<std::string, uint32_t> tile_weight_functions_;
+  std::unordered_map<std::string, uint32_t> vector_matmul_pattern_functions_;
   std::unordered_map<std::string, uint32_t> matmul_pattern_functions_;
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;
+  std::unordered_set<uint32_t> generated_function_ids_;
 };
 
 }  // namespace opt

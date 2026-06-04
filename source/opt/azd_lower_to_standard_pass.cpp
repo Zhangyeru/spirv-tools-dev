@@ -93,8 +93,13 @@ Pass::Status AzdLowerToStandardPass::Process() {
   matrix_types_.clear();
   vector_types_.clear();
   lowered_types_.clear();
+  packed_load_functions_.clear();
+  packed_store_functions_.clear();
+  tile_weight_functions_.clear();
+  vector_matmul_pattern_functions_.clear();
   matmul_pattern_functions_.clear();
   matmul_pattern_function_ids_.clear();
+  generated_function_ids_.clear();
 
   bool has_azd = false;
   get_module()->ForEachInst([this, &has_azd](Instruction* inst) {
@@ -468,17 +473,46 @@ bool AzdLowerToStandardPass::PrepareMatmulPatternFunctions() {
 
 bool AzdLowerToStandardPass::LowerAzdInstructions(
     std::vector<Instruction*>* to_kill) {
-  bool ok = true;
-  get_module()->ForEachInst([this, to_kill, &ok](Instruction* inst) {
-    if (!ok) return;
-
+  std::vector<Instruction*> worklist;
+  get_module()->ForEachInst([this, &worklist](Instruction* inst) {
     BasicBlock* block = context()->get_instr_block(inst);
     Function* function = block ? block->GetParent() : nullptr;
-    if (function && matmul_pattern_function_ids_.find(function->result_id()) !=
-                        matmul_pattern_function_ids_.end()) {
+    if (function && generated_function_ids_.find(function->result_id()) !=
+                        generated_function_ids_.end()) {
       return;
     }
 
+    switch (inst->opcode()) {
+      case spv::Op::OpCooperativeMatrixLoadAZD:
+      case spv::Op::OpCooperativeMatrixStoreAZD:
+      case spv::Op::OpCooperativeMatrixMulAddAZD:
+      case spv::Op::OpCooperativeMatrixLengthAZD:
+      case spv::Op::OpCooperativeVectorLoadAZD:
+      case spv::Op::OpCooperativeVectorStoreAZD:
+      case spv::Op::OpCooperativeVectorMatrixMulAZD:
+      case spv::Op::OpCooperativeVectorMatrixMulAddAZD:
+        worklist.push_back(inst);
+        break;
+      case spv::Op::OpCompositeConstruct:
+        if (IsAzdType(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpCompositeExtract:
+        worklist.push_back(inst);
+        break;
+      case spv::Op::OpConstantNull:
+      case spv::Op::OpUndef:
+        if (IsAzdType(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpBitcast:
+        if (TypeContainsAzd(inst->type_id())) worklist.push_back(inst);
+        break;
+      default:
+        break;
+    }
+  });
+
+  for (Instruction* inst : worklist) {
+    bool ok = true;
     switch (inst->opcode()) {
       case spv::Op::OpCooperativeMatrixLoadAZD:
         ok = LowerMatrixLoad(inst);
@@ -505,24 +539,25 @@ bool AzdLowerToStandardPass::LowerAzdInstructions(
         ok = LowerVectorMatrixMul(inst, true);
         break;
       case spv::Op::OpCompositeConstruct:
-        if (IsAzdType(inst->type_id())) ok = LowerCompositeConstruct(inst);
+        ok = LowerCompositeConstruct(inst);
         break;
       case spv::Op::OpCompositeExtract:
         ok = LowerCompositeExtract(inst);
         break;
       case spv::Op::OpConstantNull:
       case spv::Op::OpUndef:
-        if (IsAzdType(inst->type_id())) ok = LowerNullOrUndef(inst);
+        ok = LowerNullOrUndef(inst);
         break;
       case spv::Op::OpBitcast:
-        if (TypeContainsAzd(inst->type_id())) ok = LowerAzdBitcast(inst);
+        ok = LowerAzdBitcast(inst);
         break;
       default:
         break;
     }
-  });
+    if (!ok) return false;
+  }
 
-  return ok;
+  return true;
 }
 
 bool AzdLowerToStandardPass::ReplaceAzdTypeUses() {
@@ -615,6 +650,32 @@ bool AzdLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
       CopyMemoryOperands(inst, kAzdMatrixLoadMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
+    if (layout ==
+        static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
+      const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
+      const uint32_t load_function_id = GetOrCreatePackedLoadFunction(
+          pointer_id, pointer_type_id, info->component_type_id,
+          info->packed_vec4_type_id, memory_operands);
+      if (pointer_type_id == 0 || load_function_id == 0) return false;
+
+      element_ids.reserve(info->rows * info->packed_cols);
+      for (uint32_t row = 0; row < info->rows; ++row) {
+        for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
+          const uint32_t index_id = BuildMatrixElementIndex(
+              &builder, inst, *info, shape_id, offset_id, layout, row,
+              col_pack * kPackedVec4Width);
+          if (index_id == 0) return false;
+          Instruction* vec = builder.AddFunctionCall(
+              info->packed_vec4_type_id, load_function_id, {index_id});
+          if (!vec) return false;
+          element_ids.push_back(vec->result_id());
+        }
+      }
+
+      RebuildAsCompositeConstruct(inst, info->lowered_type_id, element_ids);
+      return true;
+    }
+
     element_ids.reserve(info->rows * info->packed_cols);
     for (uint32_t row = 0; row < info->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
@@ -702,6 +763,37 @@ bool AzdLowerToStandardPass::LowerMatrixStore(
       CopyMemoryOperands(inst, kAzdMatrixStoreMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
+    if (layout ==
+        static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
+      const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
+      const uint32_t store_function_id = GetOrCreatePackedStoreFunction(
+          pointer_id, pointer_type_id, info->component_type_id,
+          info->packed_vec4_type_id, memory_operands);
+      const uint32_t void_type_id = GetOrCreateVoidType();
+      if (pointer_type_id == 0 || store_function_id == 0 || void_type_id == 0) {
+        return false;
+      }
+
+      for (uint32_t row = 0; row < info->rows; ++row) {
+        for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
+          const uint32_t vec_id = ExtractCompositeElement(
+              &builder, info->packed_vec4_type_id, object_id,
+              MatrixPackedIndex(*info, row, col_pack));
+          const uint32_t index_id = BuildMatrixElementIndex(
+              &builder, inst, *info, shape_id, offset_id, layout, row,
+              col_pack * kPackedVec4Width);
+          if (vec_id == 0 || index_id == 0) return false;
+          if (!builder.AddFunctionCall(void_type_id, store_function_id,
+                                       {index_id, vec_id})) {
+            return false;
+          }
+        }
+      }
+
+      to_kill->push_back(inst);
+      return true;
+    }
+
     for (uint32_t row = 0; row < info->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
         const uint32_t vec_id = ExtractCompositeElement(
@@ -954,23 +1046,19 @@ bool AzdLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
       CopyMemoryOperands(inst, kAzdVectorLoadMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
+    const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
+    const uint32_t load_function_id = GetOrCreatePackedLoadFunction(
+        pointer_id, pointer_type_id, info->component_type_id,
+        info->packed_vec4_type_id, memory_operands);
+    if (pointer_type_id == 0 || load_function_id == 0) return false;
+
     element_ids.reserve(info->packed_length);
     for (uint32_t pack = 0; pack < info->packed_length; ++pack) {
-      std::vector<uint32_t> lane_ids;
-      lane_ids.reserve(kPackedVec4Width);
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-        const uint32_t index_id =
-            GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
-        const uint32_t elem_ptr_id = BuildElementAccess(
-            &builder, inst, pointer_id, info->component_type_id, index_id);
-        if (elem_ptr_id == 0) return false;
-        const uint32_t load_id = AddLoad(&builder, info->component_type_id,
-                                         elem_ptr_id, memory_operands);
-        if (load_id == 0) return false;
-        lane_ids.push_back(load_id);
-      }
-      Instruction* vec =
-          builder.AddCompositeConstruct(info->packed_vec4_type_id, lane_ids);
+      const uint32_t index_id =
+          GetOrCreateUIntConstant(pack * kPackedVec4Width);
+      if (index_id == 0) return false;
+      Instruction* vec = builder.AddFunctionCall(info->packed_vec4_type_id,
+                                                 load_function_id, {index_id});
       if (!vec) return false;
       element_ids.push_back(vec->result_id());
     }
@@ -1021,21 +1109,25 @@ bool AzdLowerToStandardPass::LowerVectorStore(
       CopyMemoryOperands(inst, kAzdVectorStoreMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
+    const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
+    const uint32_t store_function_id = GetOrCreatePackedStoreFunction(
+        pointer_id, pointer_type_id, info->component_type_id,
+        info->packed_vec4_type_id, memory_operands);
+    const uint32_t void_type_id = GetOrCreateVoidType();
+    if (pointer_type_id == 0 || store_function_id == 0 || void_type_id == 0) {
+      return false;
+    }
+
     for (uint32_t pack = 0; pack < info->packed_length; ++pack) {
       const uint32_t vec_id = ExtractCompositeElement(
           &builder, info->packed_vec4_type_id, object_id, pack);
       if (vec_id == 0) return false;
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-        const uint32_t value_id = ExtractCompositeElement(
-            &builder, info->component_type_id, vec_id, lane);
-        const uint32_t index_id =
-            GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
-        const uint32_t elem_ptr_id = BuildElementAccess(
-            &builder, inst, pointer_id, info->component_type_id, index_id);
-        if (value_id == 0 || elem_ptr_id == 0) return false;
-        if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) {
-          return false;
-        }
+      const uint32_t index_id =
+          GetOrCreateUIntConstant(pack * kPackedVec4Width);
+      if (index_id == 0) return false;
+      if (!builder.AddFunctionCall(void_type_id, store_function_id,
+                                   {index_id, vec_id})) {
+        return false;
       }
     }
 
@@ -1111,17 +1203,14 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
     return false;
   }
 
-  InstructionBuilder builder(
-      context(), inst,
-      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  std::vector<uint32_t> element_ids;
-  if (!BuildVectorMatrixMulPatternPackedVec4(
-          &builder, *result, *input, *matrix, bias, input_inst->result_id(),
-          matrix_inst->result_id(), bias_inst ? bias_inst->result_id() : 0,
-          has_bias, &element_ids)) {
-    return false;
-  }
-  RebuildAsCompositeConstruct(inst, result->lowered_type_id, element_ids);
+  const uint32_t function_id = GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+      *result, *input, *matrix, bias, has_bias);
+  if (function_id == 0) return false;
+  std::vector<uint32_t> argument_ids = {input_inst->result_id(),
+                                        matrix_inst->result_id()};
+  if (has_bias) argument_ids.push_back(bias_inst->result_id());
+  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id,
+                        argument_ids);
   return true;
 }
 
@@ -1474,6 +1563,21 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePointerType(
   return result_id;
 }
 
+uint32_t AzdLowerToStandardPass::GetOrCreateVoidType() {
+  for (Instruction& inst : get_module()->types_values()) {
+    if (inst.opcode() == spv::Op::OpTypeVoid) {
+      return inst.result_id();
+    }
+  }
+
+  const uint32_t result_id = TakeNextId();
+  if (result_id == 0) return 0;
+  context()->AddType(MakeUnique<Instruction>(context(), spv::Op::OpTypeVoid, 0,
+                                             result_id,
+                                             std::initializer_list<Operand>{}));
+  return result_id;
+}
+
 uint32_t AzdLowerToStandardPass::GetOrCreateUIntType() {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypeInt &&
@@ -1734,6 +1838,81 @@ uint32_t AzdLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
               "AZD load/store pointer must point to the component or a "
               "component array");
   return 0;
+}
+
+uint32_t AzdLowerToStandardPass::BuildElementAccessFromPointerType(
+    InstructionBuilder* builder, uint32_t pointer_type_id, uint32_t pointer_id,
+    uint32_t component_type_id, uint32_t element_index_id) {
+  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
+    ReportError(nullptr, "AZD load/store pointer must be a pointer");
+    return 0;
+  }
+
+  const uint32_t pointee_type_id = pointer_type->GetSingleWordInOperand(1);
+  Instruction* pointee_type = get_def_use_mgr()->GetDef(pointee_type_id);
+  if (!pointee_type) return 0;
+
+  if (pointee_type_id == component_type_id) {
+    ReportError(nullptr,
+                "AZD scalar pointer load/store cannot be chunk-lowered");
+    return 0;
+  }
+
+  if ((pointee_type->opcode() == spv::Op::OpTypeRuntimeArray ||
+       pointee_type->opcode() == spv::Op::OpTypeArray) &&
+      pointee_type->GetSingleWordInOperand(0) == component_type_id) {
+    const uint32_t storage_class = pointer_type->GetSingleWordInOperand(0);
+    const uint32_t component_pointer_type_id = GetOrCreatePointerType(
+        component_type_id, static_cast<spv::StorageClass>(storage_class));
+    Instruction* access = builder->AddAccessChain(
+        component_pointer_type_id, pointer_id, {element_index_id});
+    return access ? access->result_id() : 0;
+  }
+
+  ReportError(nullptr,
+              "AZD load/store pointer must point to the component or a "
+              "component array");
+  return 0;
+}
+
+uint32_t AzdLowerToStandardPass::BuildCapturedPointer(
+    InstructionBuilder* builder, uint32_t pointer_id) {
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  if (!pointer) return 0;
+
+  if (pointer->opcode() == spv::Op::OpVariable &&
+      context()->get_instr_block(pointer) == nullptr) {
+    return pointer_id;
+  }
+
+  if (pointer->opcode() != spv::Op::OpAccessChain &&
+      pointer->opcode() != spv::Op::OpInBoundsAccessChain) {
+    return 0;
+  }
+
+  const uint32_t base_pointer_id = pointer->GetSingleWordInOperand(0);
+  const uint32_t captured_base_id =
+      BuildCapturedPointer(builder, base_pointer_id);
+  if (captured_base_id == 0) return 0;
+
+  std::vector<uint32_t> index_ids;
+  index_ids.reserve(pointer->NumInOperands() - 1);
+  for (uint32_t i = 1; i < pointer->NumInOperands(); ++i) {
+    const uint32_t index_id = pointer->GetSingleWordInOperand(i);
+    if (!IsModuleVisibleValue(index_id)) return 0;
+    index_ids.push_back(index_id);
+  }
+
+  Instruction* access =
+      builder->AddAccessChain(pointer->type_id(), captured_base_id, index_ids);
+  return access ? access->result_id() : 0;
+}
+
+bool AzdLowerToStandardPass::IsModuleVisibleValue(uint32_t id) const {
+  Instruction* inst = get_def_use_mgr()->GetDef(id);
+  if (!inst) return false;
+  return context()->get_instr_block(inst) == nullptr;
 }
 
 uint32_t AzdLowerToStandardPass::ExtractCompositeElement(
@@ -2010,6 +2189,41 @@ bool AzdLowerToStandardPass::BuildMatmulPatternPackedVec4(
   return true;
 }
 
+void AzdLowerToStandardPass::AddGeneratedFunction(
+    std::unique_ptr<Function> function, uint32_t function_id) {
+  if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse)) {
+    function->ForEachInst(
+        [this](Instruction* inst) { context()->AnalyzeDefUse(inst); });
+  }
+
+  if (context()->AreAnalysesValid(IRContext::kAnalysisInstrToBlockMapping)) {
+    for (BasicBlock& basic_block : *function) {
+      context()->set_instr_block(basic_block.GetLabelInst(), &basic_block);
+      for (Instruction& inst : basic_block) {
+        context()->set_instr_block(&inst, &basic_block);
+      }
+    }
+  }
+
+  context()->AddFunction(std::move(function));
+  generated_function_ids_.insert(function_id);
+}
+
+std::string AzdLowerToStandardPass::MemoryOperandsKey(
+    const std::vector<Operand>& memory_operands) const {
+  std::string key;
+  for (const Operand& operand : memory_operands) {
+    key += std::to_string(static_cast<uint32_t>(operand.type));
+    key += ':';
+    for (uint32_t word : operand.words) {
+      key += std::to_string(word);
+      key += ',';
+    }
+    key += ';';
+  }
+  return key;
+}
+
 uint32_t AzdLowerToStandardPass::GetOrCreateFunctionType(
     uint32_t return_type_id, const std::vector<uint32_t>& param_type_ids) {
   for (Instruction& inst : get_module()->types_values()) {
@@ -2040,6 +2254,443 @@ uint32_t AzdLowerToStandardPass::GetOrCreateFunctionType(
   context()->AddType(MakeUnique<Instruction>(context(), spv::Op::OpTypeFunction,
                                              0, type_id, operands));
   return type_id;
+}
+
+uint32_t AzdLowerToStandardPass::GetOrCreatePackedLoadFunction(
+    uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
+    uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
+  const std::string key =
+      std::to_string(pointer_id) + "|" + std::to_string(pointer_type_id) + "|" +
+      std::to_string(component_type_id) + "|" + std::to_string(vec4_type_id) +
+      "|" + MemoryOperandsKey(memory_operands);
+  auto cached = packed_load_functions_.find(key);
+  if (cached != packed_load_functions_.end()) return cached->second;
+
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(vec4_type_id, {uint_type_id});
+  if (uint_type_id == 0 || function_type_id == 0) return 0;
+
+  const uint32_t function_id = TakeNextId();
+  if (function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start =
+      MakeUnique<Instruction>(context(), spv::Op::OpFunction, vec4_type_id,
+                              function_id, std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  const uint32_t base_param_id = TakeNextId();
+  if (base_param_id == 0) return 0;
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, uint_type_id, base_param_id,
+      std::initializer_list<Operand>{}));
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block = MakeUnique<BasicBlock>(
+      MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
+                              std::initializer_list<Operand>{}));
+
+  InstructionBuilder builder(context(), block.get());
+  const uint32_t captured_pointer_id =
+      BuildCapturedPointer(&builder, pointer_id);
+  if (captured_pointer_id == 0) return 0;
+
+  std::vector<uint32_t> lane_ids;
+  lane_ids.reserve(kPackedVec4Width);
+  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+    const uint32_t lane_const_id = GetOrCreateUIntConstant(lane);
+    if (lane_const_id == 0) return 0;
+    Instruction* index = nullptr;
+    if (lane == 0) {
+      index = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd, base_param_id,
+                                  lane_const_id);
+    } else {
+      index = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd, base_param_id,
+                                  lane_const_id);
+    }
+    if (!index) return 0;
+    const uint32_t elem_ptr_id = BuildElementAccessFromPointerType(
+        &builder, pointer_type_id, captured_pointer_id, component_type_id,
+        index->result_id());
+    if (elem_ptr_id == 0) return 0;
+    const uint32_t load_id =
+        AddLoad(&builder, component_type_id, elem_ptr_id, memory_operands);
+    if (load_id == 0) return 0;
+    lane_ids.push_back(load_id);
+  }
+
+  Instruction* vec = builder.AddCompositeConstruct(vec4_type_id, lane_ids);
+  if (!vec) return 0;
+  if (!builder.AddUnaryOp(0, spv::Op::OpReturnValue, vec->result_id())) {
+    return 0;
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(block));
+  AddGeneratedFunction(std::move(function), function_id);
+
+  packed_load_functions_[key] = function_id;
+  return function_id;
+}
+
+uint32_t AzdLowerToStandardPass::GetOrCreatePackedStoreFunction(
+    uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
+    uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
+  const std::string key =
+      std::to_string(pointer_id) + "|" + std::to_string(pointer_type_id) + "|" +
+      std::to_string(component_type_id) + "|" + std::to_string(vec4_type_id) +
+      "|" + MemoryOperandsKey(memory_operands);
+  auto cached = packed_store_functions_.find(key);
+  if (cached != packed_store_functions_.end()) return cached->second;
+
+  const uint32_t void_type_id = GetOrCreateVoidType();
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(void_type_id, {uint_type_id, vec4_type_id});
+  if (void_type_id == 0 || uint_type_id == 0 || function_type_id == 0) {
+    return 0;
+  }
+
+  const uint32_t function_id = TakeNextId();
+  if (function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start =
+      MakeUnique<Instruction>(context(), spv::Op::OpFunction, void_type_id,
+                              function_id, std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  const uint32_t base_param_id = TakeNextId();
+  const uint32_t value_param_id = TakeNextId();
+  if (base_param_id == 0 || value_param_id == 0) {
+    return 0;
+  }
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, uint_type_id, base_param_id,
+      std::initializer_list<Operand>{}));
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, vec4_type_id, value_param_id,
+      std::initializer_list<Operand>{}));
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block = MakeUnique<BasicBlock>(
+      MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
+                              std::initializer_list<Operand>{}));
+
+  InstructionBuilder builder(context(), block.get());
+  const uint32_t captured_pointer_id =
+      BuildCapturedPointer(&builder, pointer_id);
+  if (captured_pointer_id == 0) return 0;
+
+  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+    const uint32_t lane_const_id = GetOrCreateUIntConstant(lane);
+    if (lane_const_id == 0) return 0;
+    Instruction* index = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                             base_param_id, lane_const_id);
+    if (!index) return 0;
+    const uint32_t value_id = ExtractCompositeElement(
+        &builder, component_type_id, value_param_id, lane);
+    const uint32_t elem_ptr_id = BuildElementAccessFromPointerType(
+        &builder, pointer_type_id, captured_pointer_id, component_type_id,
+        index->result_id());
+    if (value_id == 0 || elem_ptr_id == 0) return 0;
+    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) return 0;
+  }
+
+  if (!builder.AddNullaryOp(0, spv::Op::OpReturn)) return 0;
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(block));
+  AddGeneratedFunction(std::move(function), function_id);
+
+  packed_store_functions_[key] = function_id;
+  return function_id;
+}
+
+uint32_t AzdLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
+    const MatrixTypeInfo& matrix) {
+  const std::string key = TileWeightFunctionKey(matrix);
+  auto cached = tile_weight_functions_.find(key);
+  if (cached != tile_weight_functions_.end()) return cached->second;
+
+  Instruction* insertion_point =
+      get_def_use_mgr()->GetDef(matrix.lowered_type_id);
+  if (!insertion_point) return 0;
+  const uint32_t weight_array_type_id = GetOrCreatePackedArrayType(
+      matrix.packed_vec4_type_id, kPackedVec4Width, insertion_point);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t function_type_id = GetOrCreateFunctionType(
+      weight_array_type_id,
+      {matrix.lowered_type_id, uint_type_id, uint_type_id});
+  if (weight_array_type_id == 0 || uint_type_id == 0 || function_type_id == 0) {
+    return 0;
+  }
+
+  const uint32_t function_id = TakeNextId();
+  if (function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, weight_array_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  const uint32_t matrix_param_id = TakeNextId();
+  const uint32_t row_param_id = TakeNextId();
+  const uint32_t col_pack_param_id = TakeNextId();
+  if (matrix_param_id == 0 || row_param_id == 0 || col_pack_param_id == 0) {
+    return 0;
+  }
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, matrix.lowered_type_id,
+      matrix_param_id, std::initializer_list<Operand>{}));
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, uint_type_id, row_param_id,
+      std::initializer_list<Operand>{}));
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, uint_type_id, col_pack_param_id,
+      std::initializer_list<Operand>{}));
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block = MakeUnique<BasicBlock>(
+      MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
+                              std::initializer_list<Operand>{}));
+
+  InstructionBuilder builder(context(), block.get());
+  const uint32_t matrix_ptr_type_id = GetOrCreatePointerType(
+      matrix.lowered_type_id, spv::StorageClass::Function);
+  const uint32_t vec4_ptr_type_id = GetOrCreatePointerType(
+      matrix.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t packed_cols_id = GetOrCreateUIntConstant(matrix.packed_cols);
+  if (matrix_ptr_type_id == 0 || vec4_ptr_type_id == 0 || packed_cols_id == 0) {
+    return 0;
+  }
+
+  Instruction* matrix_var = builder.AddVariable(
+      matrix_ptr_type_id, static_cast<uint32_t>(spv::StorageClass::Function));
+  if (!matrix_var) return 0;
+  if (!builder.AddStore(matrix_var->result_id(), matrix_param_id)) return 0;
+
+  std::vector<uint32_t> weight_vec_ids;
+  weight_vec_ids.reserve(kPackedVec4Width);
+  for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+    const uint32_t row_lane_id = GetOrCreateUIntConstant(row_lane);
+    if (row_lane_id == 0) return 0;
+    Instruction* row = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                           row_param_id, row_lane_id);
+    if (!row) return 0;
+    Instruction* row_offset = builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpIMul, row->result_id(), packed_cols_id);
+    if (!row_offset) return 0;
+    Instruction* flat_index =
+        builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                            row_offset->result_id(), col_pack_param_id);
+    if (!flat_index) return 0;
+    Instruction* vec_ptr = builder.AddAccessChain(
+        vec4_ptr_type_id, matrix_var->result_id(), {flat_index->result_id()});
+    if (!vec_ptr) return 0;
+    Instruction* vec =
+        builder.AddLoad(matrix.packed_vec4_type_id, vec_ptr->result_id());
+    if (!vec) return 0;
+    weight_vec_ids.push_back(vec->result_id());
+  }
+
+  Instruction* weights =
+      builder.AddCompositeConstruct(weight_array_type_id, weight_vec_ids);
+  if (!weights) return 0;
+  if (!builder.AddUnaryOp(0, spv::Op::OpReturnValue, weights->result_id())) {
+    return 0;
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(block));
+  AddGeneratedFunction(std::move(function), function_id);
+
+  tile_weight_functions_[key] = function_id;
+  return function_id;
+}
+
+uint32_t
+AzdLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias) {
+  const std::string key =
+      VectorMatmulPatternFunctionKey(result, input, matrix, bias, has_bias);
+  auto cached = vector_matmul_pattern_functions_.find(key);
+  if (cached != vector_matmul_pattern_functions_.end()) return cached->second;
+
+  const bool use_tile_weight = IsPackedVec4(input) && IsPackedVec4(matrix);
+  uint32_t tile_weight_function_id = 0;
+  uint32_t weight_array_type_id = 0;
+  if (use_tile_weight) {
+    tile_weight_function_id = GetOrCreateTileWeightFunctionPackedVec4(matrix);
+    if (tile_weight_function_id == 0) return 0;
+
+    Instruction* insertion_point =
+        get_def_use_mgr()->GetDef(matrix.lowered_type_id);
+    if (!insertion_point) return 0;
+    weight_array_type_id = GetOrCreatePackedArrayType(
+        matrix.packed_vec4_type_id, kPackedVec4Width, insertion_point);
+    if (weight_array_type_id == 0) return 0;
+  }
+
+  std::vector<uint32_t> param_type_ids = {input.lowered_type_id,
+                                          matrix.lowered_type_id};
+  if (has_bias) {
+    if (!bias) return 0;
+    param_type_ids.push_back(bias->lowered_type_id);
+  }
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(result.lowered_type_id, param_type_ids);
+  if (function_type_id == 0) return 0;
+
+  const uint32_t function_id = TakeNextId();
+  if (function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  const uint32_t input_param_id = TakeNextId();
+  const uint32_t matrix_param_id = TakeNextId();
+  uint32_t bias_param_id = 0;
+  if (input_param_id == 0 || matrix_param_id == 0) return 0;
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, input.lowered_type_id,
+      input_param_id, std::initializer_list<Operand>{}));
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, matrix.lowered_type_id,
+      matrix_param_id, std::initializer_list<Operand>{}));
+  if (has_bias) {
+    bias_param_id = TakeNextId();
+    if (bias_param_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, bias->lowered_type_id,
+        bias_param_id, std::initializer_list<Operand>{}));
+  }
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block = MakeUnique<BasicBlock>(
+      MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
+                              std::initializer_list<Operand>{}));
+
+  InstructionBuilder builder(context(), block.get());
+  const uint32_t vec4_type_id = result.packed_vec4_type_id;
+  const uint32_t zero4_id = GetOrCreateZero(vec4_type_id);
+  if (zero4_id == 0) return 0;
+
+  if (!use_tile_weight) {
+    std::vector<uint32_t> element_ids;
+    if (!BuildVectorMatrixMulPatternPackedVec4(
+            &builder, result, input, matrix, bias, input_param_id,
+            matrix_param_id, bias_param_id, has_bias, &element_ids)) {
+      return 0;
+    }
+    Instruction* result_construct =
+        builder.AddCompositeConstruct(result.lowered_type_id, element_ids);
+    if (!result_construct) return 0;
+    if (!builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                            result_construct->result_id())) {
+      return 0;
+    }
+
+    function->SetFunctionEnd(
+        MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                                std::initializer_list<Operand>{}));
+    function->AddBasicBlock(std::move(block));
+    AddGeneratedFunction(std::move(function), function_id);
+
+    vector_matmul_pattern_functions_[key] = function_id;
+    return function_id;
+  }
+
+  std::vector<uint32_t> element_ids(result.packed_length, 0);
+  for (uint32_t out_pack = 0; out_pack < result.packed_length; ++out_pack) {
+    std::vector<uint32_t> acc(kPackedVec4Width, zero4_id);
+    const uint32_t row_id =
+        GetOrCreateUIntConstant(out_pack * kPackedVec4Width);
+    if (row_id == 0) return 0;
+
+    for (uint32_t k_pack = 0; k_pack < input.packed_length; ++k_pack) {
+      const uint32_t v = ExtractCompositeElement(
+          &builder, input.packed_vec4_type_id, input_param_id, k_pack);
+      const uint32_t col_id = GetOrCreateUIntConstant(k_pack);
+      if (v == 0 || col_id == 0) return 0;
+      Instruction* weights =
+          builder.AddFunctionCall(weight_array_type_id, tile_weight_function_id,
+                                  {matrix_param_id, row_id, col_id});
+      if (!weights) return 0;
+
+      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+        const uint32_t weight = ExtractCompositeElement(
+            &builder, vec4_type_id, weights->result_id(), lane);
+        if (weight == 0) return 0;
+        Instruction* mul =
+            builder.AddBinaryOp(vec4_type_id, spv::Op::OpFMul, v, weight);
+        if (!mul) return 0;
+        Instruction* add = builder.AddBinaryOp(vec4_type_id, spv::Op::OpFAdd,
+                                               acc[lane], mul->result_id());
+        if (!add) return 0;
+        acc[lane] = add->result_id();
+      }
+    }
+
+    std::vector<uint32_t> lane_ids;
+    lane_ids.reserve(kPackedVec4Width);
+    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      uint32_t reduced =
+          BuildHorizontalReduce(&builder, result.component_type_id, acc[lane]);
+      if (reduced == 0) return 0;
+      if (has_bias) {
+        const uint32_t bias_value = ExtractVectorScalar(
+            &builder, *bias, bias_param_id, out_pack * kPackedVec4Width + lane);
+        if (bias_value == 0) return 0;
+        Instruction* add = builder.AddBinaryOp(
+            result.component_type_id, spv::Op::OpFAdd, reduced, bias_value);
+        if (!add) return 0;
+        reduced = add->result_id();
+      }
+      lane_ids.push_back(reduced);
+    }
+
+    Instruction* vec = builder.AddCompositeConstruct(vec4_type_id, lane_ids);
+    if (!vec) return 0;
+    element_ids[out_pack] = vec->result_id();
+  }
+
+  Instruction* result_construct =
+      builder.AddCompositeConstruct(result.lowered_type_id, element_ids);
+  if (!result_construct) return 0;
+  if (!builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                          result_construct->result_id())) {
+    return 0;
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(block));
+  AddGeneratedFunction(std::move(function), function_id);
+
+  vector_matmul_pattern_functions_[key] = function_id;
+  return function_id;
 }
 
 uint32_t AzdLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
@@ -2102,25 +2753,78 @@ uint32_t AzdLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                               std::initializer_list<Operand>{}));
   function->AddBasicBlock(std::move(block));
-
-  if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse)) {
-    function->ForEachInst(
-        [this](Instruction* inst) { context()->AnalyzeDefUse(inst); });
-  }
-
-  if (context()->AreAnalysesValid(IRContext::kAnalysisInstrToBlockMapping)) {
-    for (BasicBlock& basic_block : *function) {
-      context()->set_instr_block(basic_block.GetLabelInst(), &basic_block);
-      for (Instruction& inst : basic_block) {
-        context()->set_instr_block(&inst, &basic_block);
-      }
-    }
-  }
-
-  context()->AddFunction(std::move(function));
+  AddGeneratedFunction(std::move(function), function_id);
   matmul_pattern_functions_[key] = function_id;
   matmul_pattern_function_ids_.insert(function_id);
   return function_id;
+}
+
+std::string AzdLowerToStandardPass::TileWeightFunctionKey(
+    const MatrixTypeInfo& matrix) const {
+  std::string key;
+  key.reserve(96);
+  key += std::to_string(matrix.component_type_id);
+  key += ':';
+  key += std::to_string(matrix.rows);
+  key += 'x';
+  key += std::to_string(matrix.cols);
+  key += ':';
+  key += std::to_string(matrix.lowered_type_id);
+  key += ':';
+  key += std::to_string(matrix.packed_vec4_type_id);
+  key += ':';
+  key += std::to_string(matrix.packed_cols);
+  key += ':';
+  key += (matrix.packed_f16vec4 ? "h" : (matrix.packed_f32vec4 ? "f" : "s"));
+  return key;
+}
+
+std::string AzdLowerToStandardPass::VectorMatmulPatternFunctionKey(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias,
+    bool has_bias) const {
+  std::string key;
+  key.reserve(220);
+  auto append_vector = [&key](const VectorTypeInfo& info) {
+    key += std::to_string(info.component_type_id);
+    key += ':';
+    key += std::to_string(info.length);
+    key += ':';
+    key += std::to_string(info.lowered_type_id);
+    key += ':';
+    key += std::to_string(info.packed_vec4_type_id);
+    key += ':';
+    key += std::to_string(info.packed_length);
+    key += ':';
+    key += (info.packed_f16vec4 ? "h" : (info.packed_f32vec4 ? "f" : "s"));
+  };
+  auto append_matrix = [&key](const MatrixTypeInfo& info) {
+    key += std::to_string(info.component_type_id);
+    key += ':';
+    key += std::to_string(info.rows);
+    key += 'x';
+    key += std::to_string(info.cols);
+    key += ':';
+    key += std::to_string(info.lowered_type_id);
+    key += ':';
+    key += std::to_string(info.packed_vec4_type_id);
+    key += ':';
+    key += std::to_string(info.packed_cols);
+    key += ':';
+    key += (info.packed_f16vec4 ? "h" : (info.packed_f32vec4 ? "f" : "s"));
+  };
+  append_vector(result);
+  key += '|';
+  append_vector(input);
+  key += '|';
+  append_matrix(matrix);
+  key += '|';
+  key += has_bias ? 'b' : 'n';
+  if (has_bias && bias) {
+    key += '|';
+    append_vector(*bias);
+  }
+  return key;
 }
 
 std::string AzdLowerToStandardPass::MatmulPatternFunctionKey(
@@ -2195,6 +2899,9 @@ bool AzdLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
       result.component_type_id != matrix.component_type_id) {
     return false;
   }
+  if (result.length != matrix.rows || input.length != matrix.cols) {
+    return false;
+  }
   return !bias || IsSamePackedVec4Kind(result, *bias);
 }
 
@@ -2244,6 +2951,11 @@ AzdLowerToStandardPass::GetVectorType(uint32_t type_id) const {
 uint32_t AzdLowerToStandardPass::GetLoweredType(uint32_t type_id) const {
   auto it = lowered_types_.find(type_id);
   return it == lowered_types_.end() ? 0 : it->second;
+}
+
+uint32_t AzdLowerToStandardPass::GetPointerTypeId(uint32_t pointer_id) const {
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  return pointer ? pointer->type_id() : 0;
 }
 
 uint32_t AzdLowerToStandardPass::GetPointeeType(
