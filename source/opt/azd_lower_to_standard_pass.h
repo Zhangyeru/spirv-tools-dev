@@ -17,6 +17,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "source/opt/pass.h"
@@ -26,10 +27,11 @@ namespace opt {
 
 class Instruction;
 class InstructionBuilder;
+struct Operand;
 
 // Lowers AZD cooperative matrix/vector types and operations to ordinary SPIR-V
-// scalar array code.  The MVP intentionally supports only f32 values with
-// single-function SSA/local-variable use.
+// array code.  f16 values lower to packed vec4 arrays.  f32 values use packed
+// vec4 arrays when naturally 4-wide, and scalar arrays otherwise.
 class AzdLowerToStandardPass : public Pass {
  public:
   const char* name() const override { return "azd-lower-to-standard"; }
@@ -42,6 +44,10 @@ class AzdLowerToStandardPass : public Pass {
     uint32_t rows = 0;
     uint32_t cols = 0;
     uint32_t lowered_type_id = 0;
+    bool packed_f16vec4 = false;
+    bool packed_f32vec4 = false;
+    uint32_t packed_vec4_type_id = 0;
+    uint32_t packed_cols = 0;
   };
 
   struct VectorTypeInfo {
@@ -49,10 +55,15 @@ class AzdLowerToStandardPass : public Pass {
     uint32_t component_type_id = 0;
     uint32_t length = 0;
     uint32_t lowered_type_id = 0;
+    bool packed_f16vec4 = false;
+    bool packed_f32vec4 = false;
+    uint32_t packed_vec4_type_id = 0;
+    uint32_t packed_length = 0;
   };
 
   bool CollectAzdTypes();
   bool LegalizeModule();
+  bool PrepareMatmulPatternFunctions();
   bool LowerAzdInstructions(std::vector<Instruction*>* to_kill);
   bool ReplaceAzdTypeUses();
   bool CleanupAzdDeclarations(const std::vector<Instruction*>& to_kill);
@@ -61,14 +72,26 @@ class AzdLowerToStandardPass : public Pass {
   bool LowerMatrixLoad(Instruction* inst);
   bool LowerMatrixStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerMatrixMulAdd(Instruction* inst);
+  bool LowerMatrixMulAddPackedVec4(Instruction* inst);
+  bool LowerMatrixMulAddScalarFallback(Instruction* inst);
   bool LowerMatrixLength(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
+  bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
+  bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
+  bool LowerCompositeConstruct(Instruction* inst);
+  bool LowerCompositeExtract(Instruction* inst);
+  bool LowerNullOrUndef(Instruction* inst);
   bool LowerAzdBitcast(Instruction* inst);
 
   uint32_t GetOrCreateArrayType(uint32_t component_type_id, uint32_t length,
                                 Instruction* insert_after);
+  uint32_t GetOrCreateVectorType(uint32_t component_type_id,
+                                 uint32_t component_count,
+                                 Instruction** insert_after);
+  uint32_t GetOrCreatePackedArrayType(uint32_t vec4_type_id, uint32_t length,
+                                      Instruction* insert_after);
   uint32_t GetOrCreatePointerType(uint32_t pointee_type_id,
                                   spv::StorageClass storage_class);
   uint32_t GetOrCreateUIntType();
@@ -92,14 +115,82 @@ class AzdLowerToStandardPass : public Pass {
   uint32_t ExtractCompositeElement(InstructionBuilder* builder,
                                    uint32_t component_type_id,
                                    uint32_t composite_id, uint32_t index);
+  uint32_t AddLoad(InstructionBuilder* builder, uint32_t type_id,
+                   uint32_t pointer_id,
+                   const std::vector<Operand>& memory_operands);
+  bool AddStore(InstructionBuilder* builder, uint32_t pointer_id,
+                uint32_t object_id,
+                const std::vector<Operand>& memory_operands);
+  std::vector<Operand> CopyMemoryOperands(const Instruction* inst,
+                                          uint32_t first_in_operand) const;
+  uint32_t ExtractVectorScalar(InstructionBuilder* builder,
+                               const VectorTypeInfo& info, uint32_t vector_id,
+                               uint32_t index);
+  uint32_t ExtractMatrixScalar(InstructionBuilder* builder,
+                               const MatrixTypeInfo& info, uint32_t matrix_id,
+                               uint32_t row, uint32_t col);
+  uint32_t BuildMatrixRowVector(InstructionBuilder* builder,
+                                const MatrixTypeInfo& info, uint32_t matrix_id,
+                                uint32_t row, uint32_t col_start,
+                                uint32_t vec4_type_id);
+  uint32_t BuildMatrixColumnVector(InstructionBuilder* builder,
+                                   const MatrixTypeInfo& info,
+                                   uint32_t matrix_id, uint32_t row_start,
+                                   uint32_t col, uint32_t vec4_type_id);
+  uint32_t BuildVectorTimesScalar(InstructionBuilder* builder,
+                                  uint32_t vec4_type_id, uint32_t vector_id,
+                                  uint32_t scalar_id);
+  uint32_t BuildHorizontalReduce(InstructionBuilder* builder,
+                                 uint32_t component_type_id,
+                                 uint32_t vector_id);
+  bool BuildVectorMatrixMulPatternPackedVec4(
+      InstructionBuilder* builder, const VectorTypeInfo& result,
+      const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
+      const VectorTypeInfo* bias, uint32_t input_id, uint32_t matrix_id,
+      uint32_t bias_id, bool has_bias, std::vector<uint32_t>* element_ids);
+  bool BuildMatmulPatternPackedVec4(InstructionBuilder* builder,
+                                    const MatrixTypeInfo& result,
+                                    const MatrixTypeInfo& a,
+                                    const MatrixTypeInfo& b,
+                                    const MatrixTypeInfo& c, uint32_t a_id,
+                                    uint32_t b_id, uint32_t c_id,
+                                    std::vector<uint32_t>* element_ids);
+  uint32_t GetOrCreateFunctionType(uint32_t return_type_id,
+                                   const std::vector<uint32_t>& param_type_ids);
+  uint32_t GetOrCreateMatmulPatternFunctionPackedVec4(
+      const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c);
+  std::string MatmulPatternFunctionKey(const MatrixTypeInfo& result,
+                                       const MatrixTypeInfo& a,
+                                       const MatrixTypeInfo& b,
+                                       const MatrixTypeInfo& c) const;
+  bool IsPackedVec4(const MatrixTypeInfo& info) const;
+  bool IsPackedVec4(const VectorTypeInfo& info) const;
+  bool IsSamePackedVec4Kind(const MatrixTypeInfo& a,
+                            const MatrixTypeInfo& b) const;
+  bool IsSamePackedVec4Kind(const VectorTypeInfo& a,
+                            const VectorTypeInfo& b) const;
+  bool CanUsePackedVec4MatrixMulAdd(const MatrixTypeInfo& result,
+                                    const MatrixTypeInfo& a,
+                                    const MatrixTypeInfo& b,
+                                    const MatrixTypeInfo& c) const;
+  bool CanUsePackedVec4VectorMatrixMul(const VectorTypeInfo& result,
+                                       const VectorTypeInfo& input,
+                                       const MatrixTypeInfo& matrix,
+                                       const VectorTypeInfo* bias) const;
   uint32_t MatrixFlatIndex(const MatrixTypeInfo& info, uint32_t row,
                            uint32_t col) const;
+  uint32_t MatrixPackedIndex(const MatrixTypeInfo& info, uint32_t row,
+                             uint32_t col_pack) const;
+  uint32_t VectorPackedIndex(uint32_t scalar_index) const;
+  uint32_t PackedLane(uint32_t scalar_index) const;
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
   uint32_t GetLoweredType(uint32_t type_id) const;
   uint32_t GetPointeeType(uint32_t pointer_type_id) const;
   bool GetConstantU32(uint32_t id, uint32_t* value) const;
+  bool IsFloat16Type(uint32_t type_id) const;
   bool IsFloat32Type(uint32_t type_id) const;
   bool IsAzdType(uint32_t type_id) const;
   bool TypeContainsAzd(uint32_t type_id) const;
@@ -109,11 +200,16 @@ class AzdLowerToStandardPass : public Pass {
   bool RemoveSourceExtensionByName(const char* extension_name);
   void RebuildAsCompositeConstruct(Instruction* inst, uint32_t type_id,
                                    const std::vector<uint32_t>& element_ids);
+  void RebuildAsFunctionCall(Instruction* inst, uint32_t type_id,
+                             uint32_t function_id,
+                             const std::vector<uint32_t>& argument_ids);
   void ReportError(const Instruction* inst, const std::string& message) const;
 
   std::unordered_map<uint32_t, MatrixTypeInfo> matrix_types_;
   std::unordered_map<uint32_t, VectorTypeInfo> vector_types_;
   std::unordered_map<uint32_t, uint32_t> lowered_types_;
+  std::unordered_map<std::string, uint32_t> matmul_pattern_functions_;
+  std::unordered_set<uint32_t> matmul_pattern_function_ids_;
 };
 
 }  // namespace opt
