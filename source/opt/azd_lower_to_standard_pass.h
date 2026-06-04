@@ -29,6 +29,7 @@ namespace opt {
 class Function;
 class Instruction;
 class InstructionBuilder;
+class BasicBlock;
 struct Operand;
 
 // Lowers AZD cooperative matrix/vector types and operations to ordinary SPIR-V
@@ -97,6 +98,7 @@ class AzdLowerToStandardPass : public Pass {
   uint32_t GetOrCreatePointerType(uint32_t pointee_type_id,
                                   spv::StorageClass storage_class);
   uint32_t GetOrCreateVoidType();
+  uint32_t GetOrCreateBoolType();
   uint32_t GetOrCreateUIntType();
   uint32_t GetOrCreateUIntConstant(uint32_t value);
   uint32_t GetOrCreateUIntTypeAfter(Instruction** insert_after);
@@ -120,8 +122,34 @@ class AzdLowerToStandardPass : public Pass {
                                              uint32_t pointer_id,
                                              uint32_t component_type_id,
                                              uint32_t element_index_id);
+  Instruction* AddFunctionVariable(Function* function, uint32_t pointer_type_id,
+                                   uint32_t initializer_id = 0);
+  BasicBlock* MakeBasicBlock(uint32_t label_id);
+  bool BuildPackedMatrixLoadOuterLoop(
+      Instruction* insert_before, const MatrixTypeInfo& info,
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t shape_id,
+      uint32_t offset_id, uint32_t layout,
+      const std::vector<Operand>& memory_operands, uint32_t* result_id);
+  bool BuildPackedMatrixStoreOuterLoop(
+      Instruction* insert_before, const MatrixTypeInfo& info,
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t object_id,
+      uint32_t shape_id, uint32_t offset_id, uint32_t layout,
+      const std::vector<Operand>& memory_operands);
+  bool BuildPackedVectorLoadOuterLoop(
+      Instruction* insert_before, const VectorTypeInfo& info,
+      uint32_t pointer_id, uint32_t pointer_type_id,
+      const std::vector<Operand>& memory_operands, uint32_t* result_id);
+  bool BuildPackedVectorStoreOuterLoop(
+      Instruction* insert_before, const VectorTypeInfo& info,
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t object_id,
+      const std::vector<Operand>& memory_operands);
+  uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
+                                          Instruction* user, uint32_t shape_id,
+                                          uint32_t offset_id, uint32_t cols,
+                                          uint32_t base_id);
   uint32_t BuildCapturedPointer(InstructionBuilder* builder,
                                 uint32_t pointer_id);
+  bool CanCapturePointer(uint32_t pointer_id) const;
   bool IsModuleVisibleValue(uint32_t id) const;
   uint32_t ExtractCompositeElement(InstructionBuilder* builder,
                                    uint32_t component_type_id,
@@ -151,6 +179,11 @@ class AzdLowerToStandardPass : public Pass {
   uint32_t BuildVectorTimesScalar(InstructionBuilder* builder,
                                   uint32_t vec4_type_id, uint32_t vector_id,
                                   uint32_t scalar_id);
+  uint32_t BuildScalarSplat(InstructionBuilder* builder, uint32_t vec4_type_id,
+                            uint32_t scalar_id);
+  uint32_t BuildFma(InstructionBuilder* builder, uint32_t type_id,
+                    uint32_t multiplicand_id, uint32_t multiplier_id,
+                    uint32_t addend_id);
   uint32_t BuildHorizontalReduce(InstructionBuilder* builder,
                                  uint32_t component_type_id,
                                  uint32_t vector_id);
@@ -172,13 +205,15 @@ class AzdLowerToStandardPass : public Pass {
       const std::vector<Operand>& memory_operands) const;
   uint32_t GetOrCreateFunctionType(uint32_t return_type_id,
                                    const std::vector<uint32_t>& param_type_ids);
-  uint32_t GetOrCreatePackedLoadFunction(
+  uint32_t GetOrCreatePackedLoadChunkFunction(
       uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
       uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
-  uint32_t GetOrCreatePackedStoreFunction(
+  uint32_t GetOrCreatePackedStoreChunkFunction(
       uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
       uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
   uint32_t GetOrCreateTileWeightFunctionPackedVec4(
+      const MatrixTypeInfo& matrix);
+  uint32_t GetOrCreateMatmulTileWeightFunctionPackedVec4(
       const MatrixTypeInfo& matrix);
   uint32_t GetOrCreateVectorMatmulPatternFunctionPackedVec4(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
@@ -187,6 +222,7 @@ class AzdLowerToStandardPass : public Pass {
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c);
   std::string TileWeightFunctionKey(const MatrixTypeInfo& matrix) const;
+  std::string MatmulTileWeightFunctionKey(const MatrixTypeInfo& matrix) const;
   std::string VectorMatmulPatternFunctionKey(const VectorTypeInfo& result,
                                              const VectorTypeInfo& input,
                                              const MatrixTypeInfo& matrix,
@@ -216,6 +252,7 @@ class AzdLowerToStandardPass : public Pass {
                              uint32_t col_pack) const;
   uint32_t VectorPackedIndex(uint32_t scalar_index) const;
   uint32_t PackedLane(uint32_t scalar_index) const;
+  uint32_t GetOrCreateGLSLStd450Import();
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
@@ -241,9 +278,10 @@ class AzdLowerToStandardPass : public Pass {
   std::unordered_map<uint32_t, MatrixTypeInfo> matrix_types_;
   std::unordered_map<uint32_t, VectorTypeInfo> vector_types_;
   std::unordered_map<uint32_t, uint32_t> lowered_types_;
-  std::unordered_map<std::string, uint32_t> packed_load_functions_;
-  std::unordered_map<std::string, uint32_t> packed_store_functions_;
+  std::unordered_map<std::string, uint32_t> packed_load_chunk_functions_;
+  std::unordered_map<std::string, uint32_t> packed_store_chunk_functions_;
   std::unordered_map<std::string, uint32_t> tile_weight_functions_;
+  std::unordered_map<std::string, uint32_t> matmul_tile_weight_functions_;
   std::unordered_map<std::string, uint32_t> vector_matmul_pattern_functions_;
   std::unordered_map<std::string, uint32_t> matmul_pattern_functions_;
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;

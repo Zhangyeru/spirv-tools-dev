@@ -46,8 +46,8 @@ void ExpectPackedVec4Math(const std::string& text,
   EXPECT_NE(std::string::npos,
             text.find("OpTypeVector " + component_name + " 4"));
   EXPECT_GT(CountSubstring(text, "OpTypeArray %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFMul %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFAdd %v4"), 0u);
+  EXPECT_GT(CountSubstring(text, "OpExtInst %v4"), 0u);
+  EXPECT_GT(CountSubstring(text, " Fma "), 0u);
   EXPECT_EQ(0u, CountSubstring(text, "OpVectorTimesScalar"));
 }
 
@@ -57,8 +57,8 @@ void ExpectPackedVec4MatmulPattern(const std::string& text,
   EXPECT_NE(std::string::npos,
             text.find("OpTypeVector " + component_name + " 4"));
   EXPECT_GT(CountSubstring(text, "OpTypeArray %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFMul %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFAdd %v4"), 0u);
+  EXPECT_GT(CountSubstring(text, "OpExtInst %v4"), 0u);
+  EXPECT_GT(CountSubstring(text, " Fma "), 0u);
   EXPECT_GT(CountSubstring(text, "OpCompositeExtract " + component_name), 0u);
   EXPECT_GT(CountSubstring(text, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(text, "OpReturnValue"), 0u);
@@ -146,8 +146,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatmul4x4x4F32Tiled) {
 ; CHECK-NOT: OpCooperativeMatrix
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_4
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 ; CHECK: OpCompositeConstruct
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
@@ -208,9 +208,9 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   const std::string& output = std::get<0>(result);
   ExpectPackedVec4MatmulPattern(output, "%float");
-  EXPECT_EQ(2u, CountSubstring(output, "OpFunctionCall"));
-  EXPECT_EQ(16u, CountSubstring(output, "OpFMul %v4float"));
-  EXPECT_EQ(3u, CountSubstring(output, "OpFunctionParameter"));
+  EXPECT_EQ(3u, CountSubstring(output, "OpFunctionCall"));
+  EXPECT_EQ(16u, CountSubstring(output, "OpExtInst %v4float"));
+  EXPECT_EQ(6u, CountSubstring(output, "OpFunctionParameter"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersMatmul3x5x4F32TiledTail) {
@@ -267,8 +267,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatmul2x4x4F32ExactTile) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_2
 ; CHECK: OpTypeArray %v4float %uint_4
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
@@ -309,8 +309,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatmul3x5x8F32PackedKTail) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_10
 ; CHECK: OpTypeArray %v4float %uint_6
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
@@ -379,12 +379,13 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF32) {
 ; CHECK-NOT: CooperativeMatrixKHR
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_4
-; CHECK-DAG: OpFunctionCall %v4float
-; CHECK-DAG: OpFunctionCall %void
+; CHECK-DAG: OpLoopMerge
 ; CHECK-DAG: OpLoad %float
 ; CHECK-DAG: OpCompositeConstruct
-; CHECK-DAG: OpCompositeExtract %v4float
 ; CHECK-DAG: OpCompositeExtract %float
+; CHECK-DAG: OpFunctionCall %v4float
+; CHECK-DAG: OpFunctionCall %void
+; CHECK-DAG: OpCopyObject
 ; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
@@ -423,7 +424,9 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpLoopMerge"));
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpFunctionCall"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMul8x8F32Tile4) {
@@ -435,8 +438,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMul8x8F32Tile4) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_2
 ; CHECK: OpTypeArray %v4float %uint_16
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -477,8 +480,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMulAdd8x8F32Tile4WithBias) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_2
 ; CHECK: OpTypeArray %v4float %uint_16
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -562,8 +565,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMulF32PackedKTail) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_2
 ; CHECK: OpTypeArray %float %uint_40
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -1265,12 +1268,12 @@ TEST_F(AzdLowerToStandardTest, LowersVectorLoadStoreF16Packed) {
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
 ; CHECK: OpTypeArray %v4half %uint_2
+; CHECK-DAG: OpLoopMerge
+; CHECK-DAG: OpLoad %half
+; CHECK-DAG: OpLoad %v4half
+; CHECK-DAG: OpCompositeExtract %half
 ; CHECK-DAG: OpFunctionCall %v4half
 ; CHECK-DAG: OpFunctionCall %void
-; CHECK-DAG: OpLoad %half
-; CHECK-DAG: OpCompositeConstruct %v4half
-; CHECK-DAG: OpCompositeExtract %v4half
-; CHECK-DAG: OpCompositeExtract %half
 ; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability Float16
@@ -1306,6 +1309,8 @@ OpFunctionEnd
 
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   ExpectNoAzdOrCoopMatrix(std::get<0>(result));
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpLoopMerge"));
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpFunctionCall"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF16PackedRowMajor) {
@@ -1314,12 +1319,12 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF16PackedRowMajor) {
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
 ; CHECK: OpTypeArray %v4half %uint_8
+; CHECK-DAG: OpLoopMerge
+; CHECK-DAG: OpLoad %half
+; CHECK-DAG: OpLoad %v4half
+; CHECK-DAG: OpCompositeExtract %half
 ; CHECK-DAG: OpFunctionCall %v4half
 ; CHECK-DAG: OpFunctionCall %void
-; CHECK-DAG: OpLoad %half
-; CHECK-DAG: OpCompositeConstruct %v4half
-; CHECK-DAG: OpCompositeExtract %v4half
-; CHECK-DAG: OpCompositeExtract %half
 ; CHECK-DAG: OpStore
 OpCapability Shader
 OpCapability Float16
@@ -1360,6 +1365,8 @@ OpFunctionEnd
 
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   ExpectNoAzdOrCoopMatrix(std::get<0>(result));
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpLoopMerge"));
+  EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpFunctionCall"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersMatrixLoadStoreF16PackedColumnMajor) {
@@ -1420,8 +1427,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMul16x64F16Packed) {
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
-; CHECK: OpFMul %v4half
-; CHECK: OpFAdd %v4half
+; CHECK: OpExtInst %v4half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorAZD
@@ -1458,8 +1465,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMulAdd16x64F16Packed) {
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
-; CHECK: OpFMul %v4half
-; CHECK: OpFAdd %v4half
+; CHECK: OpExtInst %v4half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorAZD
@@ -1497,8 +1504,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixMulAdd4x16x8F16Packed) {
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
-; CHECK: OpFMul %v4half
-; CHECK: OpFAdd %v4half
+; CHECK: OpExtInst %v4half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixAZD
@@ -1535,8 +1542,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatrixMulAdd16x16x16F16Packed) {
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
-; CHECK: OpFMul %v4half
-; CHECK: OpFAdd %v4half
+; CHECK: OpExtInst %v4half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixAZD
@@ -1570,8 +1577,8 @@ TEST_F(AzdLowerToStandardTest, LowersPackedF16MatrixMulAdd8x8) {
 ; CHECK: OpTypeFloat 16
 ; CHECK: OpTypeVector %half 4
 ; CHECK: OpTypeArray %v4half %uint_16
-; CHECK: OpFMul %v4half
-; CHECK: OpFAdd %v4half
+; CHECK: OpExtInst %v4half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixAZD
@@ -1606,8 +1613,8 @@ TEST_F(AzdLowerToStandardTest, LowersPackedF32MatrixMulAdd8x8) {
 ; CHECK: OpTypeFloat 32
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_16
-; CHECK: OpFMul %v4float
-; CHECK: OpFAdd %v4float
+; CHECK: OpExtInst %v4float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
