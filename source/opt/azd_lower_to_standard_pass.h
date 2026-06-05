@@ -89,6 +89,7 @@ class AzdLowerToStandardPass : public Pass {
   bool LowerMatrixLength(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
+  bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
@@ -152,6 +153,16 @@ class AzdLowerToStandardPass : public Pass {
       Instruction* insert_before, const VectorTypeInfo& info,
       uint32_t pointer_id, uint32_t pointer_type_id, uint32_t object_id,
       const std::vector<Operand>& memory_operands);
+  uint32_t BuildFusedVectorMatmulStoreFunctionPackedVec4(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, uint32_t input_pointer_id,
+      uint32_t input_pointer_type_id,
+      const std::vector<Operand>& input_memory_operands,
+      uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
+      uint32_t matrix_shape_id, uint32_t matrix_offset_id,
+      const std::vector<Operand>& matrix_memory_operands,
+      uint32_t output_pointer_id, uint32_t output_pointer_type_id,
+      const std::vector<Operand>& output_memory_operands);
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
                                           uint32_t offset_id, uint32_t cols,
@@ -227,9 +238,25 @@ class AzdLowerToStandardPass : public Pass {
   uint32_t GetOrCreateVectorMatmulPatternFunctionPackedVec4(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias);
+  uint32_t GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+      uint32_t input_pointer_type_id, uint32_t matrix_pointer_type_id,
+      uint32_t bias_pointer_type_id);
   uint32_t GetOrCreateMatmulPatternFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c);
+  uint32_t GetFunctionPointerOperandForLoad(Instruction* inst,
+                                            uint32_t original_pointee_type_id,
+                                            uint32_t lowered_pointee_type_id,
+                                            uint32_t* pointer_type_id) const;
+  Instruction* TraceFunctionValueSource(Instruction* value_inst,
+                                        Instruction* before,
+                                        std::vector<Instruction*>* chain,
+                                        uint32_t depth = 0) const;
+  Instruction* FindLastStoreToFunctionPointer(uint32_t pointer_id,
+                                              Instruction* before) const;
+  bool IsFunctionPointer(uint32_t pointer_id) const;
   std::string TileWeightFunctionKey(const MatrixTypeInfo& matrix) const;
   std::string MatmulTileWeightFunctionKey(const MatrixTypeInfo& matrix) const;
   std::string VectorMatmulPatternFunctionKey(const VectorTypeInfo& result,

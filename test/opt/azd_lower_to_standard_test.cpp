@@ -209,9 +209,9 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   const std::string& output = std::get<0>(result);
   ExpectPackedVec4MatmulPattern(output, "%float");
-  EXPECT_EQ(3u, CountSubstring(output, "OpFunctionCall"));
-  EXPECT_EQ(16u, CountSubstring(output, "OpExtInst %v4float"));
-  EXPECT_EQ(6u, CountSubstring(output, "OpFunctionParameter"));
+  EXPECT_EQ(2u, CountSubstring(output, "OpFunctionCall"));
+  EXPECT_EQ(4u, CountSubstring(output, "OpExtInst %v4float"));
+  EXPECT_EQ(3u, CountSubstring(output, "OpFunctionParameter"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersMatmul3x5x4F32TiledTail) {
