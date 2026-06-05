@@ -156,12 +156,8 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
         return false;
       }
 
-      if (IsFloat16Type(info.component_type_id)) {
-        if (info.cols % kPackedVec4Width != 0) {
-          ReportError(inst,
-                      "f16 packed AZD matrix columns must be divisible by 4");
-          return false;
-        }
+      if (IsFloat16Type(info.component_type_id) &&
+          ShouldUsePackedVec4(info.cols)) {
         Instruction* insertion_point = inst;
         info.packed_f16vec4 = true;
         info.packed_cols = info.cols / kPackedVec4Width;
@@ -172,7 +168,7 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
             info.packed_vec4_type_id, info.rows * info.packed_cols,
             insertion_point);
       } else if (IsFloat32Type(info.component_type_id) &&
-                 info.cols % kPackedVec4Width == 0) {
+                 ShouldUsePackedVec4(info.cols)) {
         Instruction* insertion_point = inst;
         info.packed_f32vec4 = true;
         info.packed_cols = info.cols / kPackedVec4Width;
@@ -182,7 +178,8 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
         info.lowered_type_id = GetOrCreatePackedArrayType(
             info.packed_vec4_type_id, info.rows * info.packed_cols,
             insertion_point);
-      } else if (IsFloat32Type(info.component_type_id)) {
+      } else if (IsFloat16Type(info.component_type_id) ||
+                 IsFloat32Type(info.component_type_id)) {
         info.lowered_type_id = GetOrCreateArrayType(
             info.component_type_id, static_cast<uint32_t>(element_count), inst);
       } else {
@@ -211,12 +208,8 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
       ReportError(inst, "AZD cooperative vector length is unsupported");
       return false;
     }
-    if (IsFloat16Type(info.component_type_id)) {
-      if (info.length % kPackedVec4Width != 0) {
-        ReportError(inst,
-                    "f16 packed AZD vector length must be divisible by 4");
-        return false;
-      }
+    if (IsFloat16Type(info.component_type_id) &&
+        ShouldUsePackedVec4(info.length)) {
       Instruction* insertion_point = inst;
       info.packed_f16vec4 = true;
       info.packed_length = info.length / kPackedVec4Width;
@@ -226,7 +219,7 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
       info.lowered_type_id = GetOrCreatePackedArrayType(
           info.packed_vec4_type_id, info.packed_length, insertion_point);
     } else if (IsFloat32Type(info.component_type_id) &&
-               info.length % kPackedVec4Width == 0) {
+               ShouldUsePackedVec4(info.length)) {
       Instruction* insertion_point = inst;
       info.packed_f32vec4 = true;
       info.packed_length = info.length / kPackedVec4Width;
@@ -235,7 +228,8 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
       if (info.packed_vec4_type_id == 0) return false;
       info.lowered_type_id = GetOrCreatePackedArrayType(
           info.packed_vec4_type_id, info.packed_length, insertion_point);
-    } else if (IsFloat32Type(info.component_type_id)) {
+    } else if (IsFloat16Type(info.component_type_id) ||
+               IsFloat32Type(info.component_type_id)) {
       info.lowered_type_id =
           GetOrCreateArrayType(info.component_type_id, info.length, inst);
     } else {
@@ -3748,6 +3742,11 @@ bool AzdLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
     return false;
   }
   return !bias || IsSamePackedVec4Kind(result, *bias);
+}
+
+bool AzdLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {
+  return lowering_mode_ == LoweringMode::kPreferPackedVec4 &&
+         extent % kPackedVec4Width == 0;
 }
 
 uint32_t AzdLowerToStandardPass::MatrixFlatIndex(const MatrixTypeInfo& info,

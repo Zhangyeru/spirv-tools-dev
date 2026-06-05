@@ -106,9 +106,11 @@ Options (in lexicographical order):)",
                Fixes OpTypeCooperativeMatrixAZD use operands based on AZD
                cooperative matrix multiply operand roles.)");
   printf(R"(
-  --azd-lower-to-standard
+  --azd-lower-to-standard[=pack|scalar]
                Lowers supported AZD cooperative matrix/vector ops and types to
-               ordinary scalar-array SPIR-V and removes AZD declarations.)");
+               ordinary SPIR-V arrays and removes AZD declarations. Defaults
+               to pack, which uses packed vec4 arrays for 4-wide f16/f32 types
+               and scalar arrays otherwise. Use scalar to force scalar arrays.)");
   printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help

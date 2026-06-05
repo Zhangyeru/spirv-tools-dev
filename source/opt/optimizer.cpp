@@ -322,7 +322,16 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   if (pass_name == "azd-fix-cooperative-matrix-use") {
     RegisterPass(CreateAzdFixCooperativeMatrixUsePass());
   } else if (pass_name == "azd-lower-to-standard") {
-    RegisterPass(CreateAzdLowerToStandardPass());
+    if (pass_args.empty() || pass_args == "pack") {
+      RegisterPass(CreateAzdLowerToStandardPass());
+    } else if (pass_args == "scalar") {
+      RegisterPass(CreateAzdLowerToStandardPass(true));
+    } else {
+      Errorf(consumer(), nullptr, {},
+             "Invalid argument for --azd-lower-to-standard: %s",
+             pass_args.c_str());
+      return false;
+    }
   } else if (pass_name == "strip-debug") {
     RegisterPass(CreateStripDebugInfoPass());
   } else if (pass_name == "strip-reflect") {
@@ -1106,8 +1115,16 @@ Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass() {
 }
 
 Optimizer::PassToken CreateAzdLowerToStandardPass() {
+  return CreateAzdLowerToStandardPass(false);
+}
+
+Optimizer::PassToken CreateAzdLowerToStandardPass(bool force_scalar_lowering) {
+  const auto mode =
+      force_scalar_lowering
+          ? opt::AzdLowerToStandardPass::LoweringMode::kForceScalar
+          : opt::AzdLowerToStandardPass::LoweringMode::kPreferPackedVec4;
   return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::AzdLowerToStandardPass>());
+      MakeUnique<opt::AzdLowerToStandardPass>(mode));
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

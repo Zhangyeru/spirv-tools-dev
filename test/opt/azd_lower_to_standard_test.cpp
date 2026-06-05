@@ -65,10 +65,11 @@ void ExpectPackedVec4MatmulPattern(const std::string& text,
   EXPECT_EQ(0u, CountSubstring(text, "OpVectorTimesScalar"));
 }
 
-void ExpectScalarFallbackMath(const std::string& text) {
+void ExpectScalarFallbackMath(const std::string& text,
+                              const std::string& component_name = "%float") {
   ExpectNoAzdOrCoopMatrix(text);
   EXPECT_GT(CountSubstring(text, "OpFMul"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFAdd %float"), 0u);
+  EXPECT_GT(CountSubstring(text, "OpFAdd " + component_name), 0u);
   EXPECT_EQ(0u, CountSubstring(text, "OpVectorTimesScalar"));
 }
 
@@ -853,6 +854,90 @@ OpFunctionEnd
   ExpectNoAzdOrCoopMatrix(std::get<0>(result));
 }
 
+TEST_F(AzdLowerToStandardTest, DefaultPreferPackedFallsBackToScalarF16Matrix) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_10
+; CHECK: {{%\w+}} = OpCompositeConstruct %_arr_half_uint_10 {{%\w+}} {{%\w+}} {{%\w+}}
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixAZD
+OpExtension "SPV_AZD_neural_matrix"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%uint_10 = OpConstant %uint 10
+%half = OpTypeFloat 16
+%h0 = OpUndef %half
+%h1 = OpUndef %half
+%h2 = OpUndef %half
+%h3 = OpUndef %half
+%h4 = OpUndef %half
+%h5 = OpUndef %half
+%h6 = OpUndef %half
+%h7 = OpUndef %half
+%h8 = OpUndef %half
+%h9 = OpUndef %half
+%mat2x5 = OpTypeCooperativeMatrixAZD %half %uint_2 %uint_5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%m = OpCompositeConstruct %mat2x5 %h0 %h1 %h2 %h3 %h4 %h5 %h6 %h7 %h8 %h9
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoAzdOrCoopMatrix(disassembly);
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+}
+
+TEST_F(AzdLowerToStandardTest,
+       ForceScalarModeLowersAlignedF16AndF32TypesToScalar) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_16
+; CHECK: OpTypeArray %float %uint_8
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixAZD
+OpCapability CooperativeVectorAZD
+OpExtension "SPV_AZD_neural_matrix"
+OpExtension "SPV_AZD_cooperative_vector"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%uint_16 = OpConstant %uint 16
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%mat2x8 = OpTypeCooperativeMatrixAZD %half %uint_2 %uint_8
+%vec8 = OpTypeCooperativeVectorAZD %float %uint_8
+%m = OpConstantNull %mat2x8
+%v = OpConstantNull %vec8
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(
+      text, true, AzdLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoAzdOrCoopMatrix(disassembly);
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+}
+
 TEST_F(AzdLowerToStandardTest, LowerCompositeExtractPackedF16Matrix) {
   const std::string text = R"(
 ; CHECK-NOT: AZD
@@ -1026,6 +1111,42 @@ OpFunctionEnd
 
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   ExpectNoAzdOrCoopMatrix(std::get<0>(result));
+}
+
+TEST_F(AzdLowerToStandardTest,
+       DefaultPreferPackedFallsBackToScalarF16ExtractAndNull) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_10
+; CHECK: {{%\w+}} = OpConstantNull %_arr_half_uint_10
+; CHECK: {{%\w+}} = OpCompositeExtract %half {{%\w+}} 9
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixAZD
+OpExtension "SPV_AZD_neural_matrix"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%uint_10 = OpConstant %uint 10
+%half = OpTypeFloat 16
+%mat2x5 = OpTypeCooperativeMatrixAZD %half %uint_2 %uint_5
+%m = OpConstantNull %mat2x5
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%x = OpCompositeExtract %half %m 1 4
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoAzdOrCoopMatrix(disassembly);
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowerConstantNullPackedMatrix) {
@@ -1260,6 +1381,119 @@ OpFunctionEnd
       this, text, spv::Op::OpCooperativeVectorStoreAZD);
   ExpectNoAzdOrCoopMatrix(result);
   EXPECT_EQ(4u, CountSubstring(result, "Aligned 16"));
+}
+
+TEST_F(AzdLowerToStandardTest,
+       ForceScalarModeLowersF16VectorLoadStoreToScalar) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_8
+; CHECK: OpLoad %half
+; CHECK: OpStore
+; CHECK-NOT: OpTypeVector %half 4
+; CHECK-NOT: OpFunctionCall
+; CHECK-NOT: OpLoopMerge
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorAZD
+OpExtension "SPV_AZD_cooperative_vector"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%vec8 = OpTypeCooperativeVectorAZD %half %uint_8
+%_runtimearr_half = OpTypeRuntimeArray %half
+%Buf = OpTypeStruct %_runtimearr_half
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%buf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %buf %int_0
+%v = OpCooperativeVectorLoadAZD %vec8 %base
+OpCooperativeVectorStoreAZD %base %v
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(
+      text, true, AzdLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoAzdOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpLoad %half"));
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpStore"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+}
+
+TEST_F(AzdLowerToStandardTest,
+       ForceScalarModeLowersF16MatrixLoadStoreToScalar) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_16
+; CHECK: OpLoad %half
+; CHECK: OpStore
+; CHECK-NOT: OpTypeVector %half 4
+; CHECK-NOT: OpFunctionCall
+; CHECK-NOT: OpLoopMerge
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixAZD
+OpExtension "SPV_AZD_neural_matrix"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%uint_16 = OpConstant %uint 16
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_4 = OpConstant %float 4
+%v2float = OpTypeVector %float 2
+%shape = OpConstantComposite %v2float %float_4 %float_4
+%offset = OpConstantComposite %v2float %float_0 %float_0
+%half = OpTypeFloat 16
+%mat4x4 = OpTypeCooperativeMatrixAZD %half %uint_4 %uint_4
+%_runtimearr_half = OpTypeRuntimeArray %half
+%Buf = OpTypeStruct %_runtimearr_half
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%buf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %buf %int_0
+%m = OpCooperativeMatrixLoadAZD %mat4x4 %base %shape %offset %int_0
+OpCooperativeMatrixStoreAZD %base %m %shape %offset %int_0
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(
+      text, true, AzdLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoAzdOrCoopMatrix(disassembly);
+  EXPECT_EQ(16u, CountSubstring(disassembly, "OpLoad %half"));
+  EXPECT_EQ(16u, CountSubstring(disassembly, "OpStore"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
 }
 
 TEST_F(AzdLowerToStandardTest, LowersVectorLoadStoreF16Packed) {
@@ -1759,6 +1993,46 @@ OpFunctionEnd
 
   auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(text, true);
   ExpectScalarFallbackMath(std::get<0>(result));
+}
+
+TEST_F(AzdLowerToStandardTest,
+       ForceScalarModeUsesScalarFallbackForAlignedF16MatrixMulAdd) {
+  const std::string text = R"(
+; CHECK-NOT: AZD
+; CHECK: OpTypeArray %half %uint_16
+; CHECK: OpFMul
+; CHECK: OpFAdd %half
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixAZD
+OpExtension "SPV_AZD_neural_matrix"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%uint_16 = OpConstant %uint 16
+%half = OpTypeFloat 16
+%mat4x4 = OpTypeCooperativeMatrixAZD %half %uint_4 %uint_4
+%a = OpUndef %mat4x4
+%b = OpUndef %mat4x4
+%c = OpConstantNull %mat4x4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%d = OpCooperativeMatrixMulAddAZD %mat4x4 %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<AzdLowerToStandardPass>(
+      text, true, AzdLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectScalarFallbackMath(disassembly, "%half");
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
 }
 
 TEST_F(AzdLowerToStandardTest, FailsLargeMatrixMulAddLowering) {

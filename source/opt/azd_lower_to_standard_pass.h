@@ -33,10 +33,19 @@ class BasicBlock;
 struct Operand;
 
 // Lowers AZD cooperative matrix/vector types and operations to ordinary SPIR-V
-// array code.  f16 values lower to packed vec4 arrays.  f32 values use packed
-// vec4 arrays when naturally 4-wide, and scalar arrays otherwise.
+// array code.  By default, f16/f32 values use packed vec4 arrays when naturally
+// 4-wide, and scalar arrays otherwise.
 class AzdLowerToStandardPass : public Pass {
  public:
+  enum class LoweringMode {
+    kPreferPackedVec4,
+    kForceScalar,
+  };
+
+  explicit AzdLowerToStandardPass(
+      LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4)
+      : lowering_mode_(lowering_mode) {}
+
   const char* name() const override { return "azd-lower-to-standard"; }
   Status Process() override;
 
@@ -246,6 +255,7 @@ class AzdLowerToStandardPass : public Pass {
                                        const VectorTypeInfo& input,
                                        const MatrixTypeInfo& matrix,
                                        const VectorTypeInfo* bias) const;
+  bool ShouldUsePackedVec4(uint32_t extent) const;
   uint32_t MatrixFlatIndex(const MatrixTypeInfo& info, uint32_t row,
                            uint32_t col) const;
   uint32_t MatrixPackedIndex(const MatrixTypeInfo& info, uint32_t row,
@@ -286,6 +296,7 @@ class AzdLowerToStandardPass : public Pass {
   std::unordered_map<std::string, uint32_t> matmul_pattern_functions_;
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;
   std::unordered_set<uint32_t> generated_function_ids_;
+  LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
 };
 
 }  // namespace opt
