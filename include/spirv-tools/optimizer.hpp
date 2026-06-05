@@ -847,8 +847,9 @@ Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass();
 
 // Creates an AZD cooperative matrix/vector lowering pass.
 // This pass lowers supported AZD cooperative types and operations to ordinary
-// scalar-array SPIR-V and removes AZD capabilities/extensions.
+// SPIR-V arrays and removes AZD capabilities/extensions.
 Optimizer::PassToken CreateAzdLowerToStandardPass();
+Optimizer::PassToken CreateAzdLowerToStandardPass(bool force_scalar_lowering);
 
 // Replaces the internal version of GLSLstd450 InterpolateAt* extended
 // instructions with the externally valid version. The internal version allows

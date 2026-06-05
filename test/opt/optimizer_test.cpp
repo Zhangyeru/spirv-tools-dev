@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "spirv-tools/optimizer.hpp"
+
 #include <string>
 #include <vector>
 
 #include "gmock/gmock.h"
 #include "spirv-tools/libspirv.hpp"
-#include "spirv-tools/optimizer.hpp"
 #include "test/opt/pass_fixture.h"
 
 namespace spvtools {
@@ -197,6 +198,9 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       "-Os",
       "--legalize-hlsl"};
   EXPECT_TRUE(opt.RegisterPassesFromFlags(pass_flags));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard=pack"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard=scalar"));
 
   // Test some invalid flags.
   EXPECT_FALSE(opt.RegisterPassFromFlag("-O2"));
@@ -219,8 +223,10 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
 
   EXPECT_FALSE(opt.RegisterPassFromFlag("--loop-unroll-partial"));
   EXPECT_EQ(msg_level, SPV_MSG_ERROR);
-}
 
+  EXPECT_FALSE(opt.RegisterPassFromFlag("--azd-lower-to-standard=bad"));
+  EXPECT_EQ(msg_level, SPV_MSG_ERROR);
+}
 
 TEST(Optimizer, RemoveNop) {
   // Test that OpNops are removed even if no optimizations are run.
