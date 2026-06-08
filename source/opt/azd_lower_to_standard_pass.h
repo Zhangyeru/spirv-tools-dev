@@ -250,6 +250,17 @@ class AzdLowerToStandardPass : public Pass {
                                             uint32_t original_pointee_type_id,
                                             uint32_t lowered_pointee_type_id,
                                             uint32_t* pointer_type_id) const;
+  bool CanMoveLoadToUse(Instruction* load, Instruction* use,
+                        bool function_memory,
+                        uint32_t first_memory_operand) const;
+  bool HasUnsafeMemoryInstructionBetween(Instruction* start, Instruction* end,
+                                         bool function_memory) const;
+  bool InstructionMayWriteOrOrderMemory(const Instruction* inst,
+                                        bool function_memory) const;
+  bool MemoryAccessOperandsAreMovable(const Instruction* inst,
+                                      uint32_t first_in_operand) const;
+  bool GetPointerStorageClass(uint32_t pointer_id,
+                              uint32_t* storage_class) const;
   Instruction* TraceFunctionValueSource(Instruction* value_inst,
                                         Instruction* before,
                                         std::vector<Instruction*>* chain,
@@ -301,6 +312,7 @@ class AzdLowerToStandardPass : public Pass {
   bool IsFloat32Type(uint32_t type_id) const;
   bool IsAzdType(uint32_t type_id) const;
   bool TypeContainsAzd(uint32_t type_id) const;
+  bool HasAzdTypeReference(const Instruction* inst) const;
   bool IsAzdOpcode(spv::Op opcode) const;
   bool IsAzdCapabilityOrExtension(const Instruction* inst) const;
   bool RemoveExtensionByName(const char* extension_name);
