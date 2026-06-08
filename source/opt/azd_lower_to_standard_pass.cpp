@@ -621,7 +621,7 @@ bool AzdLowerToStandardPass::FinalAzdCheck() const {
   get_module()->ForEachInst([this, &ok](Instruction* inst) {
     if (!ok) return;
     if (IsAzdOpcode(inst->opcode()) || IsAzdCapabilityOrExtension(inst) ||
-        TypeContainsAzd(inst->type_id())) {
+        HasAzdTypeReference(inst)) {
       ReportError(inst, "AZD lowering left AZD op/type/capability/extension");
       ok = false;
     }
@@ -1238,6 +1238,12 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       !IsModuleVisibleValue(matrix_offset_id)) {
     return true;
   }
+  if (!CanMoveLoadToUse(input_load, inst, /*function_memory=*/false,
+                        kAzdVectorLoadMemoryOperandsInIdx) ||
+      !CanMoveLoadToUse(matrix_load, inst, /*function_memory=*/false,
+                        kAzdMatrixLoadMemoryOperandsInIdx)) {
+    return true;
+  }
 
   std::vector<Instruction*> kill_list;
   std::unordered_set<Instruction*> kill_set;
@@ -1354,7 +1360,11 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
                                                   &bias_ptr_type_id)
                : 0;
   if (IsPackedVec4(*input) && IsPackedVec4(*matrix) && input_ptr_id != 0 &&
-      matrix_ptr_id != 0 && (!has_bias || bias_ptr_id != 0)) {
+      matrix_ptr_id != 0 && (!has_bias || bias_ptr_id != 0) &&
+      CanMoveLoadToUse(input_inst, inst, /*function_memory=*/true, 1) &&
+      CanMoveLoadToUse(matrix_inst, inst, /*function_memory=*/true, 1) &&
+      (!has_bias ||
+       CanMoveLoadToUse(bias_inst, inst, /*function_memory=*/true, 1))) {
     function_id = GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
         *result, *input, *matrix, bias, has_bias, input_ptr_type_id,
         matrix_ptr_type_id, bias_ptr_type_id);
@@ -5171,6 +5181,77 @@ uint32_t AzdLowerToStandardPass::GetFunctionPointerOperandForLoad(
   return pointer_id;
 }
 
+bool AzdLowerToStandardPass::CanMoveLoadToUse(
+    Instruction* load, Instruction* use, bool function_memory,
+    uint32_t first_memory_operand) const {
+  if (!load || !use) return false;
+  if (!MemoryAccessOperandsAreMovable(load, first_memory_operand)) return false;
+  return !HasUnsafeMemoryInstructionBetween(load, use, function_memory);
+}
+
+bool AzdLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
+    Instruction* start, Instruction* end, bool function_memory) const {
+  if (!start || !end) return true;
+  BasicBlock* start_block = context()->get_instr_block(start);
+  BasicBlock* end_block = context()->get_instr_block(end);
+  if (!start_block || start_block != end_block) return true;
+
+  bool after_start = false;
+  for (Instruction& inst : *start_block) {
+    if (&inst == start) {
+      after_start = true;
+      continue;
+    }
+    if (&inst == end) return false;
+    if (!after_start) continue;
+    if (InstructionMayWriteOrOrderMemory(&inst, function_memory)) return true;
+  }
+  return true;
+}
+
+bool AzdLowerToStandardPass::InstructionMayWriteOrOrderMemory(
+    const Instruction* inst, bool function_memory) const {
+  if (!inst) return true;
+  if (inst->IsAtomicOp()) return true;
+
+  auto pointer_write_matches = [this, function_memory](uint32_t pointer_id) {
+    uint32_t storage_class = 0;
+    if (!GetPointerStorageClass(pointer_id, &storage_class)) return true;
+    const bool is_function =
+        storage_class == uint32_t(spv::StorageClass::Function);
+    return function_memory ? is_function : !is_function;
+  };
+
+  switch (inst->opcode()) {
+    case spv::Op::OpStore:
+      return inst->NumInOperands() >= 1 &&
+             pointer_write_matches(inst->GetSingleWordInOperand(0));
+    case spv::Op::OpCopyMemory:
+    case spv::Op::OpCopyMemorySized:
+      return inst->NumInOperands() >= 1 &&
+             pointer_write_matches(inst->GetSingleWordInOperand(0));
+    case spv::Op::OpFunctionCall:
+    case spv::Op::OpControlBarrier:
+    case spv::Op::OpMemoryBarrier:
+    case spv::Op::OpImageWrite:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool AzdLowerToStandardPass::MemoryAccessOperandsAreMovable(
+    const Instruction* inst, uint32_t first_in_operand) const {
+  if (!inst || inst->NumInOperands() <= first_in_operand) return true;
+  const Operand& access = inst->GetInOperand(first_in_operand);
+  if (access.type != SPV_OPERAND_TYPE_MEMORY_ACCESS || access.words.empty()) {
+    return false;
+  }
+  const uint32_t mask = access.words[0];
+  const uint32_t allowed = uint32_t(spv::MemoryAccessMask::Aligned);
+  return (mask & ~allowed) == 0;
+}
+
 Instruction* AzdLowerToStandardPass::TraceFunctionValueSource(
     Instruction* value_inst, Instruction* before,
     std::vector<Instruction*>* chain, uint32_t depth) const {
@@ -5216,6 +5297,20 @@ bool AzdLowerToStandardPass::IsFunctionPointer(uint32_t pointer_id) const {
   return pointer_type && pointer_type->opcode() == spv::Op::OpTypePointer &&
          pointer_type->GetSingleWordInOperand(0) ==
              uint32_t(spv::StorageClass::Function);
+}
+
+bool AzdLowerToStandardPass::GetPointerStorageClass(
+    uint32_t pointer_id, uint32_t* storage_class) const {
+  if (storage_class) *storage_class = 0;
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  if (!pointer || pointer->type_id() == 0) return false;
+  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer->type_id());
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+      pointer_type->NumInOperands() < 2) {
+    return false;
+  }
+  if (storage_class) *storage_class = pointer_type->GetSingleWordInOperand(0);
+  return true;
 }
 
 uint32_t AzdLowerToStandardPass::GetLoweredType(uint32_t type_id) const {
@@ -5298,6 +5393,23 @@ bool AzdLowerToStandardPass::TypeContainsAzd(uint32_t type_id) const {
     default:
       return false;
   }
+}
+
+bool AzdLowerToStandardPass::HasAzdTypeReference(
+    const Instruction* inst) const {
+  if (!inst) return false;
+  if (TypeContainsAzd(inst->type_id())) return true;
+  if (inst->result_id() != 0 && IsTypeInst(inst->opcode()) &&
+      TypeContainsAzd(inst->result_id())) {
+    return true;
+  }
+
+  bool has_azd_type_ref = false;
+  inst->ForEachInId([this, &has_azd_type_ref](const uint32_t* id) {
+    if (has_azd_type_ref) return;
+    if (TypeContainsAzd(*id)) has_azd_type_ref = true;
+  });
+  return has_azd_type_ref;
 }
 
 bool AzdLowerToStandardPass::IsAzdOpcode(spv::Op opcode) const {
