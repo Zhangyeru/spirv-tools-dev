@@ -68,8 +68,10 @@ void ExpectPackedVec4MatmulPattern(const std::string& text,
 void ExpectScalarFallbackMath(const std::string& text,
                               const std::string& component_name = "%float") {
   ExpectNoAzdOrCoopMatrix(text);
-  EXPECT_GT(CountSubstring(text, "OpFMul"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpFAdd " + component_name), 0u);
+  EXPECT_GT(CountSubstring(text, "OpExtInst " + component_name), 0u);
+  EXPECT_GT(CountSubstring(text, " Fma "), 0u);
+  EXPECT_EQ(0u, CountSubstring(text, "OpFMul"));
+  EXPECT_EQ(0u, CountSubstring(text, "OpFAdd " + component_name));
   EXPECT_EQ(0u, CountSubstring(text, "OpVectorTimesScalar"));
 }
 
@@ -224,8 +226,8 @@ TEST_F(AzdLowerToStandardTest, LowersMatmul3x5x4F32TiledTail) {
 ; CHECK: OpTypeArray %v4float %uint_3
 ; CHECK: OpTypeArray %float %uint_20
 ; CHECK: OpTypeArray %float %uint_15
-; CHECK: OpFMul
-; CHECK: OpFAdd
+; CHECK: OpExtInst %float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
@@ -523,8 +525,8 @@ TEST_F(AzdLowerToStandardTest, LowersVectorMatrixMulTailNNotMultipleOf4) {
 ; CHECK: OpTypeArray %v4float %uint_2
 ; CHECK: OpTypeArray %float %uint_10
 ; CHECK: OpTypeArray %v4float %uint_20
-; CHECK: OpFMul
-; CHECK: OpFAdd
+; CHECK: OpExtInst %float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -2025,8 +2027,8 @@ TEST_F(AzdLowerToStandardTest, F32MatrixMulAddUsesScalarFallbackWhenUnaligned) {
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeArray %float %uint_15
 ; CHECK: OpTypeArray %float %uint_9
-; CHECK: OpFMul
-; CHECK: OpFAdd %float
+; CHECK: OpExtInst %float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeMatrixAZD
 OpExtension "SPV_AZD_neural_matrix"
@@ -2065,8 +2067,8 @@ TEST_F(AzdLowerToStandardTest,
 ; CHECK: OpTypeArray %float %uint_5
 ; CHECK: OpTypeArray %float %uint_3
 ; CHECK: OpTypeArray %float %uint_15
-; CHECK: OpFMul
-; CHECK: OpFAdd %float
+; CHECK: OpExtInst %float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -2105,8 +2107,8 @@ TEST_F(AzdLowerToStandardTest,
 ; CHECK: OpTypeArray %float %uint_5
 ; CHECK: OpTypeArray %float %uint_3
 ; CHECK: OpTypeArray %float %uint_15
-; CHECK: OpFMul
-; CHECK: OpFAdd %float
+; CHECK: OpExtInst %float
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability CooperativeVectorAZD
 OpCapability CooperativeMatrixAZD
@@ -2144,8 +2146,8 @@ TEST_F(AzdLowerToStandardTest,
   const std::string text = R"(
 ; CHECK-NOT: AZD
 ; CHECK: OpTypeArray %half %uint_16
-; CHECK: OpFMul
-; CHECK: OpFAdd %half
+; CHECK: OpExtInst %half
+; CHECK-SAME: Fma
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixAZD
@@ -2175,7 +2177,6 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectScalarFallbackMath(disassembly, "%half");
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
-  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
 }
 

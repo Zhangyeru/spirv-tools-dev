@@ -940,14 +940,11 @@ bool AzdLowerToStandardPass::LowerMatrixMulAddScalarFallback(
 
         for (uint32_t i = 0; i < tile_m; ++i) {
           for (uint32_t j = 0; j < tile_n; ++j) {
-            Instruction* mul = builder.AddBinaryOp(
-                float_type_id, spv::Op::OpFMul, a_elems[i], b_elems[j]);
-            if (!mul) return false;
-            Instruction* add =
-                builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd,
-                                    acc[i * tile_n + j], mul->result_id());
-            if (!add) return false;
-            acc[i * tile_n + j] = add->result_id();
+            const uint32_t fma =
+                BuildFma(&builder, float_type_id, a_elems[i], b_elems[j],
+                         acc[i * tile_n + j]);
+            if (fma == 0) return false;
+            acc[i * tile_n + j] = fma;
           }
         }
       }
@@ -1449,13 +1446,10 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
         const uint32_t w_id = ExtractMatrixScalar(
             &builder, *matrix, matrix_inst->result_id(), col, k);
         if (w_id == 0) return false;
-        Instruction* mul =
-            builder.AddBinaryOp(float_type_id, spv::Op::OpFMul, x_id, w_id);
-        if (!mul) return false;
-        Instruction* add = builder.AddBinaryOp(float_type_id, spv::Op::OpFAdd,
-                                               acc[j], mul->result_id());
-        if (!add) return false;
-        acc[j] = add->result_id();
+        const uint32_t fma =
+            BuildFma(&builder, float_type_id, x_id, w_id, acc[j]);
+        if (fma == 0) return false;
+        acc[j] = fma;
       }
     }
 
