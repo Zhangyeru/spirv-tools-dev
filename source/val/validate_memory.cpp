@@ -83,6 +83,13 @@ bool IsFloat2Type(ValidationState_t& _, uint32_t type_id) {
          _.GetBitWidth(type->word(2)) == 32;
 }
 
+bool IsInt2Type(ValidationState_t& _, uint32_t type_id) {
+  const auto* type = _.FindDef(type_id);
+  return type && type->opcode() == spv::Op::OpTypeVector &&
+         type->word(3) == 2 && _.IsIntScalarType(type->word(2)) &&
+         _.GetBitWidth(type->word(2)) == 32;
+}
+
 // Returns true if the two instructions represent structs that, as far as the
 // validator can tell, have the exact same data layout.
 bool AreLayoutCompatibleStructs(ValidationState_t& _, const Instruction* type1,
@@ -2169,10 +2176,10 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
       (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 3u : 2u;
   const auto matrix_shape_id = inst->GetOperandAs<uint32_t>(matrix_shape_index);
   const auto matrix_shape = _.FindDef(matrix_shape_id);
-  if (!matrix_shape || !IsFloat2Type(_, matrix_shape->type_id())) {
+  if (!matrix_shape || !IsInt2Type(_, matrix_shape->type_id())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << "Matrix Shape operand <id> " << _.getIdName(matrix_shape_id)
-           << " must be a vec2.";
+           << " must be an ivec2.";
   }
 
   const auto matrix_offset_index =
@@ -2180,10 +2187,10 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
   const auto matrix_offset_id =
       inst->GetOperandAs<uint32_t>(matrix_offset_index);
   const auto matrix_offset = _.FindDef(matrix_offset_id);
-  if (!matrix_offset || !IsFloat2Type(_, matrix_offset->type_id())) {
+  if (!matrix_offset || !IsInt2Type(_, matrix_offset->type_id())) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << "Matrix Offset operand <id> " << _.getIdName(matrix_offset_id)
-           << " must be a vec2.";
+           << " must be an ivec2.";
   }
 
   const auto matrix_layout_index =
