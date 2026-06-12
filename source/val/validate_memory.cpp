@@ -2682,7 +2682,7 @@ spv_result_t ValidateCooperativeVectorLoadStoreHW(ValidationState_t& _,
     type_id = inst->type_id();
     opname = "spv::Op::OpCooperativeVectorLoadHW";
   } else {
-    type_id = _.FindDef(inst->GetOperandAs<uint32_t>(1))->type_id();
+    type_id = _.FindDef(inst->GetOperandAs<uint32_t>(2))->type_id();
     opname = "spv::Op::OpCooperativeVectorStoreHW";
   }
 
@@ -2704,8 +2704,13 @@ spv_result_t ValidateCooperativeVectorLoadStoreHW(ValidationState_t& _,
   if (auto error = ValidateCooperativeVectorPointer(_, inst, opname, pointer_index))
     return error;
 
+  const auto offset_index =
+      (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) ? 3u : 1u;
+  if (auto error = ValidateInt32Operand(_, inst, offset_index, opname, "Offset"))
+    return error;
+
   const auto memory_access_index =
-      (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) ? 3u : 2u;
+      (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) ? 4u : 3u;
   if (inst->operands().size() > memory_access_index) {
     if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
       return error;
@@ -3079,9 +3084,9 @@ spv_result_t ValidateCooperativeVectorMatrixMulHW(ValidationState_t& _,
   }
 
   if (auto error = check_equal(input_type->GetOperandAs<uint32_t>(2u),
-                               matrix_type->GetOperandAs<uint32_t>(3u),
+                               matrix_type->GetOperandAs<uint32_t>(2u),
                                "input number of components",
-                               "matrix column count")) {
+                               "matrix first type parameter")) {
     return error;
   }
 
