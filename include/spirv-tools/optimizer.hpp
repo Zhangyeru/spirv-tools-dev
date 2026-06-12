@@ -840,11 +840,6 @@ Optimizer::PassToken CreateWrapOpKillPass();
 // capabilities.
 Optimizer::PassToken CreateAmdExtToKhrPass();
 
-// Creates an HW cooperative matrix use fix pass.
-// This pass updates OpTypeCooperativeMatrixHW use operands based on matrix
-// roles in OpCooperativeMatrixMulAddHW instructions.
-Optimizer::PassToken CreateHwFixCooperativeMatrixUsePass();
-
 // Replaces the internal version of GLSLstd450 InterpolateAt* extended
 // instructions with the externally valid version. The internal version allows
 // an OpLoad of the interpolant for the first argument. This pass removes the

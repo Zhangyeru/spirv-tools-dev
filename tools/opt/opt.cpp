@@ -102,10 +102,6 @@ Options (in lexicographical order):)",
                and VK_AMD_shader_trinary_minmax with equivalent code using core
                instructions and capabilities.)");
   printf(R"(
-  --hw-fix-cooperative-matrix-use
-               Fixes OpTypeCooperativeMatrixHW use operands based on HW
-               cooperative matrix multiply operand roles.)");
-  printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help
                for details.)");

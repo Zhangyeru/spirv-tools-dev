@@ -319,9 +319,7 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   //
   // Both Pass::name() and Pass::desc() should be static class members so they
   // can be invoked without creating a pass instance.
-  if (pass_name == "hw-fix-cooperative-matrix-use") {
-    RegisterPass(CreateHwFixCooperativeMatrixUsePass());
-  } else if (pass_name == "strip-debug") {
+  if (pass_name == "strip-debug") {
     RegisterPass(CreateStripDebugInfoPass());
   } else if (pass_name == "strip-reflect") {
     RegisterPass(CreateStripReflectInfoPass());
@@ -1096,11 +1094,6 @@ Optimizer::PassToken CreateWrapOpKillPass() {
 Optimizer::PassToken CreateAmdExtToKhrPass() {
   return MakeUnique<Optimizer::PassToken::Impl>(
       MakeUnique<opt::AmdExtensionToKhrPass>());
-}
-
-Optimizer::PassToken CreateHwFixCooperativeMatrixUsePass() {
-  return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::HwFixCooperativeMatrixUsePass>());
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

@@ -16,7 +16,6 @@ set(SPIRV_TOOLS_OPT_SOURCES
   aggressive_dead_code_elim_pass.h
   amd_ext_to_khr.h
   analyze_live_input_pass.h
-  hw_fix_cooperative_matrix_use_pass.h
   basic_block.h
   block_merge_pass.h
   block_merge_util.h
@@ -137,7 +136,6 @@ set(SPIRV_TOOLS_OPT_SOURCES
   aggressive_dead_code_elim_pass.cpp
   amd_ext_to_khr.cpp
   analyze_live_input_pass.cpp
-  hw_fix_cooperative_matrix_use_pass.cpp
   basic_block.cpp
   block_merge_pass.cpp
   block_merge_util.cpp
