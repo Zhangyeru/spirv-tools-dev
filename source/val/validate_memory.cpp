@@ -234,7 +234,9 @@ std::pair<spv::StorageClass, spv::StorageClass> GetStorageClass(
     case spv::Op::OpCooperativeMatrixLoadNV:
     case spv::Op::OpCooperativeMatrixLoadTensorNV:
     case spv::Op::OpCooperativeMatrixLoadKHR:
+    case spv::Op::OpCooperativeMatrixLoadHW:
     case spv::Op::OpCooperativeVectorLoadNV:
+    case spv::Op::OpCooperativeVectorLoadHW:
     case spv::Op::OpLoad: {
       auto load_pointer = _.FindDef(inst->GetOperandAs<uint32_t>(2));
       auto load_pointer_type = _.FindDef(load_pointer->type_id());
@@ -244,7 +246,9 @@ std::pair<spv::StorageClass, spv::StorageClass> GetStorageClass(
     case spv::Op::OpCooperativeMatrixStoreNV:
     case spv::Op::OpCooperativeMatrixStoreTensorNV:
     case spv::Op::OpCooperativeMatrixStoreKHR:
+    case spv::Op::OpCooperativeMatrixStoreHW:
     case spv::Op::OpCooperativeVectorStoreNV:
+    case spv::Op::OpCooperativeVectorStoreHW:
     case spv::Op::OpStore: {
       auto store_pointer = _.FindDef(inst->GetOperandAs<uint32_t>(0));
       auto store_pointer_type = _.FindDef(store_pointer->type_id());
@@ -337,7 +341,9 @@ spv_result_t CheckMemoryAccess(ValidationState_t& _, const Instruction* inst,
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadTensorNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixLoadKHR ||
-        inst->opcode() == spv::Op::OpCooperativeVectorLoadNV) {
+        inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW ||
+        inst->opcode() == spv::Op::OpCooperativeVectorLoadNV ||
+        inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
              << "MakePointerAvailableKHR cannot be used with OpLoad.";
     }
@@ -359,7 +365,9 @@ spv_result_t CheckMemoryAccess(ValidationState_t& _, const Instruction* inst,
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreKHR ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreTensorNV ||
-        inst->opcode() == spv::Op::OpCooperativeVectorStoreNV) {
+        inst->opcode() == spv::Op::OpCooperativeMatrixStoreHW ||
+        inst->opcode() == spv::Op::OpCooperativeVectorStoreNV ||
+        inst->opcode() == spv::Op::OpCooperativeVectorStoreHW) {
       return _.diag(SPV_ERROR_INVALID_ID, inst)
              << "MakePointerVisibleKHR cannot be used with OpStore.";
     }
@@ -2189,6 +2197,13 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
            << " must be a scalar integer type.";
   }
 
+  const auto memory_access_index =
+      (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 6u : 5u;
+  if (inst->operands().size() > memory_access_index) {
+    if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
+      return error;
+  }
+
   return SPV_SUCCESS;
 }
 
@@ -2679,7 +2694,17 @@ spv_result_t ValidateCooperativeVectorLoadStoreHW(ValidationState_t& _,
 
   const auto pointer_index =
       (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) ? 2u : 0u;
-  return ValidateCooperativeVectorPointer(_, inst, opname, pointer_index);
+  if (auto error = ValidateCooperativeVectorPointer(_, inst, opname, pointer_index))
+    return error;
+
+  const auto memory_access_index =
+      (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW) ? 3u : 2u;
+  if (inst->operands().size() > memory_access_index) {
+    if (auto error = CheckMemoryAccess(_, inst, memory_access_index))
+      return error;
+  }
+
+  return SPV_SUCCESS;
 }
 
 spv_result_t ValidateCooperativeVectorOuterProductNV(ValidationState_t& _,
