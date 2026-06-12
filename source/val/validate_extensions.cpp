@@ -1149,7 +1149,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
         if (!_.IsFloatScalarOrVectorType(result_type) &&
             !(supportsCoopVec &&
               (_.IsFloatCooperativeVectorNVType(result_type) ||
-               _.IsFloatCooperativeVectorAZDType(result_type)))) {
+               _.IsFloatCooperativeVectorHWType(result_type)))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be a float scalar or vector type";
@@ -1188,7 +1188,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
         if (!_.IsIntScalarOrVectorType(result_type) &&
             !(supportsCoopVec &&
               (_.IsIntCooperativeVectorNVType(result_type) ||
-               _.IsIntCooperativeVectorAZDType(result_type)))) {
+               _.IsIntCooperativeVectorHWType(result_type)))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be an int scalar or vector type";
@@ -1204,7 +1204,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
               (!_.IsIntScalarOrVectorType(operand_type) &&
                !(supportsCoopVec &&
                  (_.IsIntCooperativeVectorNVType(operand_type) ||
-                  _.IsIntCooperativeVectorAZDType(operand_type))))) {
+                  _.IsIntCooperativeVectorHWType(operand_type))))) {
             return _.diag(SPV_ERROR_INVALID_DATA, inst)
                    << ext_inst_name() << ": "
                    << "expected all operands to be int scalars or vectors";
@@ -1264,7 +1264,7 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
         if (!_.IsFloatScalarOrVectorType(result_type) &&
             !(supportsCoopVec &&
               (_.IsFloatCooperativeVectorNVType(result_type) ||
-               _.IsFloatCooperativeVectorAZDType(result_type)))) {
+               _.IsFloatCooperativeVectorHWType(result_type)))) {
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << ext_inst_name() << ": "
                  << "expected Result Type to be a 16 or 32-bit scalar or "

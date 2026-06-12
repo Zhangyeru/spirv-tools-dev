@@ -231,17 +231,17 @@ const char* spvOperandTypeStr(spv_operand_type_t type) {
       return "cooperative matrix layout";
     case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE:
       return "cooperative matrix use";
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE_AZD:
-    case SPV_OPERAND_TYPE_OPTIONAL_COOPERATIVE_MATRIX_USE_AZD:
-      return "cooperative matrix use AZD";
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE_HW:
+    case SPV_OPERAND_TYPE_OPTIONAL_COOPERATIVE_MATRIX_USE_HW:
+      return "cooperative matrix use HW";
     case SPV_OPERAND_TYPE_TENSOR_CLAMP_MODE:
       return "tensor clamp mode";
     case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE:
       return "cooperative matrix reduce";
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_AZD:
-      return "cooperative matrix reduce shift AZD";
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_OP_AZD:
-      return "cooperative matrix reduce op AZD";
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_HW:
+      return "cooperative matrix reduce shift HW";
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_OP_HW:
+      return "cooperative matrix reduce op HW";
     case SPV_OPERAND_TYPE_TENSOR_ADDRESSING_OPERANDS:
       return "tensor addressing operands";
     case SPV_OPERAND_TYPE_MATRIX_MULTIPLY_ACCUMULATE_OPERANDS:
@@ -309,8 +309,8 @@ const char* spvOperandTypeStr(spv_operand_type_t type) {
       return "overflow mode";
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT:
       return "cooperative vector matrix layout";
-    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_AZD:
-      return "cooperative vector matrix layout AZD";
+    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_HW:
+      return "cooperative vector matrix layout HW";
     case SPV_OPERAND_TYPE_COMPONENT_TYPE:
       return "component type";
 
@@ -405,7 +405,7 @@ bool spvOperandIsConcrete(spv_operand_type_t type) {
     case SPV_OPERAND_TYPE_PACKED_VECTOR_FORMAT:
     case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_LAYOUT:
     case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE:
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE_AZD:
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE_HW:
     case SPV_OPERAND_TYPE_INITIALIZATION_MODE_QUALIFIER:
     case SPV_OPERAND_TYPE_HOST_ACCESS_QUALIFIER:
     case SPV_OPERAND_TYPE_LOAD_CACHE_CONTROL:
@@ -413,10 +413,10 @@ bool spvOperandIsConcrete(spv_operand_type_t type) {
     case SPV_OPERAND_TYPE_NAMED_MAXIMUM_NUMBER_OF_REGISTERS:
     case SPV_OPERAND_TYPE_FPENCODING:
     case SPV_OPERAND_TYPE_TENSOR_CLAMP_MODE:
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_AZD:
-    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_OP_AZD:
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_SHIFT_HW:
+    case SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_REDUCE_OP_HW:
     case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT:
-    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_AZD:
+    case SPV_OPERAND_TYPE_COOPERATIVE_VECTOR_MATRIX_LAYOUT_HW:
     case SPV_OPERAND_TYPE_COMPONENT_TYPE:
       return true;
     default:
@@ -460,7 +460,7 @@ bool spvOperandIsOptional(spv_operand_type_t type) {
     case SPV_OPERAND_TYPE_OPTIONAL_ACCESS_QUALIFIER:
     case SPV_OPERAND_TYPE_OPTIONAL_PACKED_VECTOR_FORMAT:
     case SPV_OPERAND_TYPE_OPTIONAL_COOPERATIVE_MATRIX_OPERANDS:
-    case SPV_OPERAND_TYPE_OPTIONAL_COOPERATIVE_MATRIX_USE_AZD:
+    case SPV_OPERAND_TYPE_OPTIONAL_COOPERATIVE_MATRIX_USE_HW:
     case SPV_OPERAND_TYPE_OPTIONAL_MATRIX_MULTIPLY_ACCUMULATE_OPERANDS:
     case SPV_OPERAND_TYPE_OPTIONAL_CIV:
     case SPV_OPERAND_TYPE_OPTIONAL_RAW_ACCESS_CHAIN_OPERANDS:

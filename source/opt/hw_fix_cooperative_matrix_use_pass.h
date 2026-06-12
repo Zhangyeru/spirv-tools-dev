@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SOURCE_OPT_AZD_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
-#define SOURCE_OPT_AZD_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
+#ifndef SOURCE_OPT_HW_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
+#define SOURCE_OPT_HW_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
 
 #include <string>
 #include <unordered_map>
@@ -23,14 +23,14 @@
 namespace spvtools {
 namespace opt {
 
-// Fixes the optional use operand on OpTypeCooperativeMatrixAZD types based on
-// how cooperative matrix values are used by AZD matrix multiply instructions.
+// Fixes the optional use operand on OpTypeCooperativeMatrixHW types based on
+// how cooperative matrix values are used by HW matrix multiply instructions.
 // A/B uses may be mixed and are resolved by use count. Direct OperandAB and
 // Accumulator mixing for the same id is rejected instead of being reinterpreted.
-class AzdFixCooperativeMatrixUsePass : public Pass {
+class HwFixCooperativeMatrixUsePass : public Pass {
  public:
   const char* name() const override {
-    return "azd-fix-cooperative-matrix-use";
+    return "hw-fix-cooperative-matrix-use";
   }
   Status Process() override;
 
@@ -41,17 +41,17 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
     uint32_t accumulator_count = 0;
   };
 
-  bool IsAzdCooperativeMatrixType(uint32_t type_id) const;
-  bool IsAzdCooperativeMatrixTypeWithoutUse(uint32_t type_id) const;
+  bool IsHwCooperativeMatrixType(uint32_t type_id) const;
+  bool IsHwCooperativeMatrixTypeWithoutUse(uint32_t type_id) const;
   bool HasRoleConflict(const MatrixUseStat& stat) const;
   void ReportRoleConflict(uint32_t id) const;
   void AddValueUseStat(uint32_t value_id, uint32_t MatrixUseStat::*field);
   void AddUseStats(MatrixUseStat* target, const MatrixUseStat& source) const;
   bool ApplyDefaultUseAToUnclassifiedMatrices();
-  spv::CooperativeMatrixUseAZD InferUse(const MatrixUseStat& stat) const;
+  spv::CooperativeMatrixUseHW InferUse(const MatrixUseStat& stat) const;
 
-  uint32_t GetOrCreateAzdCooperativeMatrixTypeWithUse(
-      uint32_t old_type_id, spv::CooperativeMatrixUseAZD use);
+  uint32_t GetOrCreateHwCooperativeMatrixTypeWithUse(
+      uint32_t old_type_id, spv::CooperativeMatrixUseHW use);
   uint32_t GetOrCreatePointerType(uint32_t old_pointer_type_id,
                                   uint32_t pointee_type_id);
   uint32_t GetPointerTypePointeeType(uint32_t pointer_type_id) const;
@@ -100,4 +100,4 @@ class AzdFixCooperativeMatrixUsePass : public Pass {
 }  // namespace opt
 }  // namespace spvtools
 
-#endif  // SOURCE_OPT_AZD_FIX_COOPERATIVE_MATRIX_USE_PASS_H_
+#endif  // SOURCE_OPT_HW_FIX_COOPERATIVE_MATRIX_USE_PASS_H_

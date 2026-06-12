@@ -600,7 +600,7 @@ def generate_operand_kind_table(enums):
 
     # We have a few operand kinds that require their optional counterpart to
     # exist in the operand info table.
-    optional_enums = ['ImageOperands', 'AccessQualifier', 'MemoryAccess', 'PackedVectorFormat', 'CooperativeMatrixOperands', 'CooperativeMatrixUseAZD', 'MatrixMultiplyAccumulateOperands', 'RawAccessChainOperands', 'FPEncoding']
+    optional_enums = ['ImageOperands', 'AccessQualifier', 'MemoryAccess', 'PackedVectorFormat', 'CooperativeMatrixOperands', 'CooperativeMatrixUseHW', 'MatrixMultiplyAccumulateOperands', 'RawAccessChainOperands', 'FPEncoding']
     optional_enums = [e for e in enums if e[0] in optional_enums]
     enums.extend(optional_enums)
 

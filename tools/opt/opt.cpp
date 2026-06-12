@@ -102,8 +102,8 @@ Options (in lexicographical order):)",
                and VK_AMD_shader_trinary_minmax with equivalent code using core
                instructions and capabilities.)");
   printf(R"(
-  --azd-fix-cooperative-matrix-use
-               Fixes OpTypeCooperativeMatrixAZD use operands based on AZD
+  --hw-fix-cooperative-matrix-use
+               Fixes OpTypeCooperativeMatrixHW use operands based on HW
                cooperative matrix multiply operand roles.)");
   printf(R"(
   --before-hlsl-legalization

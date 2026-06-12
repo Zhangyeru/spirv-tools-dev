@@ -840,10 +840,10 @@ Optimizer::PassToken CreateWrapOpKillPass();
 // capabilities.
 Optimizer::PassToken CreateAmdExtToKhrPass();
 
-// Creates an AZD cooperative matrix use fix pass.
-// This pass updates OpTypeCooperativeMatrixAZD use operands based on matrix
-// roles in OpCooperativeMatrixMulAddAZD instructions.
-Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass();
+// Creates an HW cooperative matrix use fix pass.
+// This pass updates OpTypeCooperativeMatrixHW use operands based on matrix
+// roles in OpCooperativeMatrixMulAddHW instructions.
+Optimizer::PassToken CreateHwFixCooperativeMatrixUsePass();
 
 // Replaces the internal version of GLSLstd450 InterpolateAt* extended
 // instructions with the externally valid version. The internal version allows
