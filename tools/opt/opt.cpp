@@ -102,13 +102,9 @@ Options (in lexicographical order):)",
                and VK_AMD_shader_trinary_minmax with equivalent code using core
                instructions and capabilities.)");
   printf(R"(
-  --azd-fix-cooperative-matrix-use
-               Fixes OpTypeCooperativeMatrixAZD use operands based on AZD
-               cooperative matrix multiply operand roles.)");
-  printf(R"(
-  --azd-lower-to-standard[=pack|scalar]
-               Lowers supported AZD cooperative matrix/vector ops and types to
-               ordinary SPIR-V arrays and removes AZD declarations. Defaults
+  --hw-lower-to-standard[=pack|scalar]
+               Lowers supported HW cooperative matrix/vector ops and types to
+               ordinary SPIR-V arrays and removes HW declarations. Defaults
                to pack, which uses packed vec4 arrays for 4-wide f16/f32 types
                and scalar arrays otherwise. Use scalar to force scalar arrays.)");
   printf(R"(

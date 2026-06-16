@@ -198,9 +198,9 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       "-Os",
       "--legalize-hlsl"};
   EXPECT_TRUE(opt.RegisterPassesFromFlags(pass_flags));
-  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard"));
-  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard=pack"));
-  EXPECT_TRUE(opt.RegisterPassFromFlag("--azd-lower-to-standard=scalar"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--hw-lower-to-standard"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--hw-lower-to-standard=pack"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag("--hw-lower-to-standard=scalar"));
 
   // Test some invalid flags.
   EXPECT_FALSE(opt.RegisterPassFromFlag("-O2"));
@@ -224,7 +224,7 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
   EXPECT_FALSE(opt.RegisterPassFromFlag("--loop-unroll-partial"));
   EXPECT_EQ(msg_level, SPV_MSG_ERROR);
 
-  EXPECT_FALSE(opt.RegisterPassFromFlag("--azd-lower-to-standard=bad"));
+  EXPECT_FALSE(opt.RegisterPassFromFlag("--hw-lower-to-standard=bad"));
   EXPECT_EQ(msg_level, SPV_MSG_ERROR);
 }
 

@@ -25,8 +25,8 @@ grep -c "OpLoad" "$file" || true
 printf "OpStore: "
 grep -c "OpStore" "$file" || true
 
-printf "AZD: "
-grep -c "AZD" "$file" || true
+printf "HW: "
+grep -c "HW" "$file" || true
 
 printf "CooperativeMatrixKHR: "
 grep -c "CooperativeMatrixKHR" "$file" || true

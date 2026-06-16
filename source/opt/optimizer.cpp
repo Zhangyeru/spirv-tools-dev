@@ -319,16 +319,14 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   //
   // Both Pass::name() and Pass::desc() should be static class members so they
   // can be invoked without creating a pass instance.
-  if (pass_name == "azd-fix-cooperative-matrix-use") {
-    RegisterPass(CreateAzdFixCooperativeMatrixUsePass());
-  } else if (pass_name == "azd-lower-to-standard") {
+  if (pass_name == "hw-lower-to-standard") {
     if (pass_args.empty() || pass_args == "pack") {
-      RegisterPass(CreateAzdLowerToStandardPass());
+      RegisterPass(CreateHwLowerToStandardPass());
     } else if (pass_args == "scalar") {
-      RegisterPass(CreateAzdLowerToStandardPass(true));
+      RegisterPass(CreateHwLowerToStandardPass(true));
     } else {
       Errorf(consumer(), nullptr, {},
-             "Invalid argument for --azd-lower-to-standard: %s",
+             "Invalid argument for --hw-lower-to-standard: %s",
              pass_args.c_str());
       return false;
     }
@@ -1109,22 +1107,17 @@ Optimizer::PassToken CreateAmdExtToKhrPass() {
       MakeUnique<opt::AmdExtensionToKhrPass>());
 }
 
-Optimizer::PassToken CreateAzdFixCooperativeMatrixUsePass() {
-  return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::AzdFixCooperativeMatrixUsePass>());
+Optimizer::PassToken CreateHwLowerToStandardPass() {
+  return CreateHwLowerToStandardPass(false);
 }
 
-Optimizer::PassToken CreateAzdLowerToStandardPass() {
-  return CreateAzdLowerToStandardPass(false);
-}
-
-Optimizer::PassToken CreateAzdLowerToStandardPass(bool force_scalar_lowering) {
+Optimizer::PassToken CreateHwLowerToStandardPass(bool force_scalar_lowering) {
   const auto mode =
       force_scalar_lowering
-          ? opt::AzdLowerToStandardPass::LoweringMode::kForceScalar
-          : opt::AzdLowerToStandardPass::LoweringMode::kPreferPackedVec4;
+          ? opt::HwLowerToStandardPass::LoweringMode::kForceScalar
+          : opt::HwLowerToStandardPass::LoweringMode::kPreferPackedVec4;
   return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::AzdLowerToStandardPass>(mode));
+      MakeUnique<opt::HwLowerToStandardPass>(mode));
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

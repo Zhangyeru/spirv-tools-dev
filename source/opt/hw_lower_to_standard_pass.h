@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef SOURCE_OPT_AZD_LOWER_TO_STANDARD_PASS_H_
-#define SOURCE_OPT_AZD_LOWER_TO_STANDARD_PASS_H_
+#ifndef SOURCE_OPT_HW_LOWER_TO_STANDARD_PASS_H_
+#define SOURCE_OPT_HW_LOWER_TO_STANDARD_PASS_H_
 
 #include <memory>
 #include <string>
@@ -32,21 +32,21 @@ class InstructionBuilder;
 class BasicBlock;
 struct Operand;
 
-// Lowers AZD cooperative matrix/vector types and operations to ordinary SPIR-V
+// Lowers HW cooperative matrix/vector types and operations to ordinary SPIR-V
 // array code.  By default, f16/f32 values use packed vec4 arrays when naturally
 // 4-wide, and scalar arrays otherwise.
-class AzdLowerToStandardPass : public Pass {
+class HwLowerToStandardPass : public Pass {
  public:
   enum class LoweringMode {
     kPreferPackedVec4,
     kForceScalar,
   };
 
-  explicit AzdLowerToStandardPass(
+  explicit HwLowerToStandardPass(
       LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4)
       : lowering_mode_(lowering_mode) {}
 
-  const char* name() const override { return "azd-lower-to-standard"; }
+  const char* name() const override { return "hw-lower-to-standard"; }
   Status Process() override;
 
  private:
@@ -73,13 +73,13 @@ class AzdLowerToStandardPass : public Pass {
     uint32_t packed_length = 0;
   };
 
-  bool CollectAzdTypes();
+  bool CollectHwTypes();
   bool LegalizeModule();
   bool PrepareMatmulPatternFunctions();
-  bool LowerAzdInstructions(std::vector<Instruction*>* to_kill);
-  bool ReplaceAzdTypeUses();
-  bool CleanupAzdDeclarations(const std::vector<Instruction*>& to_kill);
-  bool FinalAzdCheck() const;
+  bool LowerHwInstructions(std::vector<Instruction*>* to_kill);
+  bool ReplaceHwTypeUses();
+  bool CleanupHwDeclarations(const std::vector<Instruction*>& to_kill);
+  bool FinalHwCheck() const;
 
   bool LowerMatrixLoad(Instruction* inst);
   bool LowerMatrixStore(Instruction* inst, std::vector<Instruction*>* to_kill);
@@ -96,7 +96,7 @@ class AzdLowerToStandardPass : public Pass {
   bool LowerCompositeConstruct(Instruction* inst);
   bool LowerCompositeExtract(Instruction* inst);
   bool LowerNullOrUndef(Instruction* inst);
-  bool LowerAzdBitcast(Instruction* inst);
+  bool LowerHwBitcast(Instruction* inst);
 
   uint32_t GetOrCreateArrayType(uint32_t component_type_id, uint32_t length,
                                 Instruction* insert_after);
@@ -310,11 +310,11 @@ class AzdLowerToStandardPass : public Pass {
   bool GetConstantU32(uint32_t id, uint32_t* value) const;
   bool IsFloat16Type(uint32_t type_id) const;
   bool IsFloat32Type(uint32_t type_id) const;
-  bool IsAzdType(uint32_t type_id) const;
-  bool TypeContainsAzd(uint32_t type_id) const;
-  bool HasAzdTypeReference(const Instruction* inst) const;
-  bool IsAzdOpcode(spv::Op opcode) const;
-  bool IsAzdCapabilityOrExtension(const Instruction* inst) const;
+  bool IsHwType(uint32_t type_id) const;
+  bool TypeContainsHw(uint32_t type_id) const;
+  bool HasHwTypeReference(const Instruction* inst) const;
+  bool IsHwOpcode(spv::Op opcode) const;
+  bool IsHwCapabilityOrExtension(const Instruction* inst) const;
   bool RemoveExtensionByName(const char* extension_name);
   bool RemoveSourceExtensionByName(const char* extension_name);
   void RebuildAsCompositeConstruct(Instruction* inst, uint32_t type_id,
@@ -341,4 +341,4 @@ class AzdLowerToStandardPass : public Pass {
 }  // namespace opt
 }  // namespace spvtools
 
-#endif  // SOURCE_OPT_AZD_LOWER_TO_STANDARD_PASS_H_
+#endif  // SOURCE_OPT_HW_LOWER_TO_STANDARD_PASS_H_

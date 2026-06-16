@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/azd_lower_to_standard_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 
 #include <algorithm>
 #include <array>
@@ -35,32 +35,34 @@ namespace spvtools {
 namespace opt {
 namespace {
 
-constexpr uint32_t kAzdMatrixLoadPointerInIdx = 0;
-constexpr uint32_t kAzdMatrixLoadShapeInIdx = 1;
-constexpr uint32_t kAzdMatrixLoadOffsetInIdx = 2;
-constexpr uint32_t kAzdMatrixLoadLayoutInIdx = 3;
-constexpr uint32_t kAzdMatrixLoadMemoryOperandsInIdx = 4;
+constexpr uint32_t kHwMatrixLoadPointerInIdx = 0;
+constexpr uint32_t kHwMatrixLoadShapeInIdx = 1;
+constexpr uint32_t kHwMatrixLoadOffsetInIdx = 2;
+constexpr uint32_t kHwMatrixLoadLayoutInIdx = 3;
+constexpr uint32_t kHwMatrixLoadMemoryOperandsInIdx = 4;
 
-constexpr uint32_t kAzdMatrixStorePointerInIdx = 0;
-constexpr uint32_t kAzdMatrixStoreObjectInIdx = 1;
-constexpr uint32_t kAzdMatrixStoreShapeInIdx = 2;
-constexpr uint32_t kAzdMatrixStoreOffsetInIdx = 3;
-constexpr uint32_t kAzdMatrixStoreLayoutInIdx = 4;
-constexpr uint32_t kAzdMatrixStoreMemoryOperandsInIdx = 5;
+constexpr uint32_t kHwMatrixStorePointerInIdx = 0;
+constexpr uint32_t kHwMatrixStoreObjectInIdx = 1;
+constexpr uint32_t kHwMatrixStoreShapeInIdx = 2;
+constexpr uint32_t kHwMatrixStoreOffsetInIdx = 3;
+constexpr uint32_t kHwMatrixStoreLayoutInIdx = 4;
+constexpr uint32_t kHwMatrixStoreMemoryOperandsInIdx = 5;
 
-constexpr uint32_t kAzdMatrixMulAddAInIdx = 0;
-constexpr uint32_t kAzdMatrixMulAddBInIdx = 1;
-constexpr uint32_t kAzdMatrixMulAddCInIdx = 2;
+constexpr uint32_t kHwMatrixMulAddAInIdx = 0;
+constexpr uint32_t kHwMatrixMulAddBInIdx = 1;
+constexpr uint32_t kHwMatrixMulAddCInIdx = 2;
 
-constexpr uint32_t kAzdVectorMatrixMulInputInIdx = 0;
-constexpr uint32_t kAzdVectorMatrixMulMatrixInIdx = 1;
-constexpr uint32_t kAzdVectorMatrixMulAddBiasInIdx = 2;
+constexpr uint32_t kHwVectorMatrixMulInputInIdx = 0;
+constexpr uint32_t kHwVectorMatrixMulMatrixInIdx = 1;
+constexpr uint32_t kHwVectorMatrixMulAddBiasInIdx = 2;
 
-constexpr uint32_t kAzdVectorLoadPointerInIdx = 0;
-constexpr uint32_t kAzdVectorLoadMemoryOperandsInIdx = 1;
-constexpr uint32_t kAzdVectorStorePointerInIdx = 0;
-constexpr uint32_t kAzdVectorStoreObjectInIdx = 1;
-constexpr uint32_t kAzdVectorStoreMemoryOperandsInIdx = 2;
+constexpr uint32_t kHwVectorLoadPointerInIdx = 0;
+constexpr uint32_t kHwVectorLoadOffsetInIdx = 1;
+constexpr uint32_t kHwVectorLoadMemoryOperandsInIdx = 2;
+constexpr uint32_t kHwVectorStorePointerInIdx = 0;
+constexpr uint32_t kHwVectorStoreOffsetInIdx = 1;
+constexpr uint32_t kHwVectorStoreObjectInIdx = 2;
+constexpr uint32_t kHwVectorStoreMemoryOperandsInIdx = 3;
 
 constexpr uint32_t kDefaultMaxLoweredElements = 131072;
 constexpr uint32_t kDefaultMaxLoweredMatmulMacs = 65536;
@@ -92,7 +94,7 @@ Instruction* AddTypeOrGlobalAfter(IRContext* context, Instruction* insert_after,
 
 }  // namespace
 
-Pass::Status AzdLowerToStandardPass::Process() {
+Pass::Status HwLowerToStandardPass::Process() {
   matrix_types_.clear();
   vector_types_.clear();
   lowered_types_.clear();
@@ -104,40 +106,40 @@ Pass::Status AzdLowerToStandardPass::Process() {
   matmul_pattern_function_ids_.clear();
   generated_function_ids_.clear();
 
-  bool has_azd = false;
-  get_module()->ForEachInst([this, &has_azd](Instruction* inst) {
-    has_azd |= IsAzdOpcode(inst->opcode()) || IsAzdCapabilityOrExtension(inst);
+  bool has_hw = false;
+  get_module()->ForEachInst([this, &has_hw](Instruction* inst) {
+    has_hw |= IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst);
   });
-  if (!has_azd) return Status::SuccessWithoutChange;
+  if (!has_hw) return Status::SuccessWithoutChange;
 
-  if (!CollectAzdTypes()) return Status::Failure;
+  if (!CollectHwTypes()) return Status::Failure;
   if (!LegalizeModule()) return Status::Failure;
   if (!PrepareMatmulPatternFunctions()) return Status::Failure;
 
   std::vector<Instruction*> to_kill;
-  if (!LowerAzdInstructions(&to_kill)) return Status::Failure;
-  if (!ReplaceAzdTypeUses()) return Status::Failure;
-  if (!CleanupAzdDeclarations(to_kill)) return Status::Failure;
-  if (!FinalAzdCheck()) return Status::Failure;
+  if (!LowerHwInstructions(&to_kill)) return Status::Failure;
+  if (!ReplaceHwTypeUses()) return Status::Failure;
+  if (!CleanupHwDeclarations(to_kill)) return Status::Failure;
+  if (!FinalHwCheck()) return Status::Failure;
 
   context()->InvalidateAnalyses(IRContext::kAnalysisTypes |
                                 IRContext::kAnalysisConstants);
   return Status::SuccessWithChange;
 }
 
-bool AzdLowerToStandardPass::CollectAzdTypes() {
-  std::vector<Instruction*> azd_types;
-  get_module()->ForEachInst([this, &azd_types](Instruction* inst) {
-    if (inst->opcode() == spv::Op::OpTypeCooperativeMatrixAZD ||
-        inst->opcode() == spv::Op::OpTypeCooperativeVectorAZD) {
-      azd_types.push_back(inst);
+bool HwLowerToStandardPass::CollectHwTypes() {
+  std::vector<Instruction*> hw_types;
+  get_module()->ForEachInst([this, &hw_types](Instruction* inst) {
+    if (inst->opcode() == spv::Op::OpTypeCooperativeMatrixHW ||
+        inst->opcode() == spv::Op::OpTypeCooperativeVectorHW) {
+      hw_types.push_back(inst);
     }
   });
 
-  for (Instruction* inst : azd_types) {
-    if (inst->opcode() == spv::Op::OpTypeCooperativeMatrixAZD) {
+  for (Instruction* inst : hw_types) {
+    if (inst->opcode() == spv::Op::OpTypeCooperativeMatrixHW) {
       if (inst->NumInOperands() < 3) {
-        ReportError(inst, "OpTypeCooperativeMatrixAZD is missing operands");
+        ReportError(inst, "OpTypeCooperativeMatrixHW is missing operands");
         return false;
       }
 
@@ -147,13 +149,13 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
       if (!GetConstantU32(inst->GetSingleWordInOperand(1), &info.rows) ||
           !GetConstantU32(inst->GetSingleWordInOperand(2), &info.cols)) {
         ReportError(inst,
-                    "AZD cooperative matrix rows/columns must be constants");
+                    "HW cooperative matrix rows/columns must be constants");
         return false;
       }
       const uint64_t element_count =
           static_cast<uint64_t>(info.rows) * static_cast<uint64_t>(info.cols);
       if (element_count == 0 || element_count > kDefaultMaxLoweredElements) {
-        ReportError(inst, "AZD cooperative matrix shape is unsupported");
+        ReportError(inst, "HW cooperative matrix shape is unsupported");
         return false;
       }
 
@@ -184,7 +186,7 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
         info.lowered_type_id = GetOrCreateArrayType(
             info.component_type_id, static_cast<uint32_t>(element_count), inst);
       } else {
-        ReportError(inst, "unsupported AZD cooperative matrix component type");
+        ReportError(inst, "unsupported HW cooperative matrix component type");
         return false;
       }
       if (info.lowered_type_id == 0) return false;
@@ -194,7 +196,7 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
     }
 
     if (inst->NumInOperands() < 2) {
-      ReportError(inst, "OpTypeCooperativeVectorAZD is missing operands");
+      ReportError(inst, "OpTypeCooperativeVectorHW is missing operands");
       return false;
     }
 
@@ -202,11 +204,11 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
     info.type_id = inst->result_id();
     info.component_type_id = inst->GetSingleWordInOperand(0);
     if (!GetConstantU32(inst->GetSingleWordInOperand(1), &info.length)) {
-      ReportError(inst, "AZD cooperative vector length must be constant");
+      ReportError(inst, "HW cooperative vector length must be constant");
       return false;
     }
     if (info.length == 0 || info.length > kDefaultMaxLoweredElements) {
-      ReportError(inst, "AZD cooperative vector length is unsupported");
+      ReportError(inst, "HW cooperative vector length is unsupported");
       return false;
     }
     if (IsFloat16Type(info.component_type_id) &&
@@ -234,7 +236,7 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
       info.lowered_type_id =
           GetOrCreateArrayType(info.component_type_id, info.length, inst);
     } else {
-      ReportError(inst, "unsupported AZD cooperative vector component type");
+      ReportError(inst, "unsupported HW cooperative vector component type");
       return false;
     }
     if (info.lowered_type_id == 0) return false;
@@ -245,18 +247,18 @@ bool AzdLowerToStandardPass::CollectAzdTypes() {
   return true;
 }
 
-bool AzdLowerToStandardPass::LegalizeModule() {
+bool HwLowerToStandardPass::LegalizeModule() {
   bool ok = true;
   get_module()->ForEachInst([this, &ok](Instruction* inst) {
     if (!ok) return;
 
     if (inst->opcode() == spv::Op::OpTypePointer &&
-        TypeContainsAzd(inst->GetSingleWordInOperand(1))) {
+        TypeContainsHw(inst->GetSingleWordInOperand(1))) {
       const auto storage_class =
           static_cast<spv::StorageClass>(inst->GetSingleWordInOperand(0));
       if (storage_class != spv::StorageClass::Function) {
         ReportError(inst,
-                    "AZD cooperative values may only be stored in Function "
+                    "HW cooperative values may only be stored in Function "
                     "variables before lowering");
         ok = false;
         return;
@@ -265,9 +267,9 @@ bool AzdLowerToStandardPass::LegalizeModule() {
 
     if (inst->opcode() == spv::Op::OpTypeFunction) {
       for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
-        if (TypeContainsAzd(inst->GetSingleWordInOperand(i))) {
+        if (TypeContainsHw(inst->GetSingleWordInOperand(i))) {
           ReportError(inst,
-                      "AZD cooperative values across function boundaries are "
+                      "HW cooperative values across function boundaries are "
                       "not supported");
           ok = false;
           return;
@@ -276,15 +278,15 @@ bool AzdLowerToStandardPass::LegalizeModule() {
     }
 
     if (inst->opcode() == spv::Op::OpFunction &&
-        TypeContainsAzd(inst->type_id())) {
-      ReportError(inst, "AZD cooperative function return is not supported");
+        TypeContainsHw(inst->type_id())) {
+      ReportError(inst, "HW cooperative function return is not supported");
       ok = false;
       return;
     }
 
     if (inst->opcode() == spv::Op::OpFunctionParameter &&
-        TypeContainsAzd(inst->type_id())) {
-      ReportError(inst, "AZD cooperative function parameter is not supported");
+        TypeContainsHw(inst->type_id())) {
+      ReportError(inst, "HW cooperative function parameter is not supported");
       ok = false;
       return;
     }
@@ -292,26 +294,26 @@ bool AzdLowerToStandardPass::LegalizeModule() {
     if (inst->opcode() == spv::Op::OpReturnValue && inst->NumInOperands() > 0) {
       Instruction* object =
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-      if (object && TypeContainsAzd(object->type_id())) {
-        ReportError(inst, "AZD cooperative function return is not supported");
+      if (object && TypeContainsHw(object->type_id())) {
+        ReportError(inst, "HW cooperative function return is not supported");
         ok = false;
         return;
       }
     }
 
-    if (inst->opcode() == spv::Op::OpPhi && TypeContainsAzd(inst->type_id())) {
-      ReportError(inst, "AZD cooperative OpPhi is not supported");
+    if (inst->opcode() == spv::Op::OpPhi && TypeContainsHw(inst->type_id())) {
+      ReportError(inst, "HW cooperative OpPhi is not supported");
       ok = false;
       return;
     }
 
-    if (inst->opcode() == spv::Op::OpCooperativeMatrixReduceAZD) {
-      ReportError(inst, "OpCooperativeMatrixReduceAZD is not supported");
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixReduceHW) {
+      ReportError(inst, "OpCooperativeMatrixReduceHW is not supported");
       ok = false;
       return;
     }
 
-    if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddAZD) {
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
       const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
       const MatrixTypeInfo* a = nullptr;
       const MatrixTypeInfo* b = nullptr;
@@ -331,7 +333,7 @@ bool AzdLowerToStandardPass::LegalizeModule() {
           result->rows != a->rows || result->cols != b->cols ||
           c->rows != result->rows || c->cols != result->cols) {
         ReportError(inst,
-                    "AZD cooperative matrix multiply shapes do not match");
+                    "HW cooperative matrix multiply shapes do not match");
         ok = false;
         return;
       }
@@ -340,42 +342,42 @@ bool AzdLowerToStandardPass::LegalizeModule() {
                                  static_cast<uint64_t>(a->cols);
       if (mac_count > kDefaultMaxLoweredMatmulMacs) {
         ReportError(inst,
-                    "AZD cooperative matrix multiply expansion is too large");
+                    "HW cooperative matrix multiply expansion is too large");
         ok = false;
         return;
       }
     }
 
-    if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAZD ||
-        inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddAZD) {
+    if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulHW ||
+        inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW) {
       const VectorTypeInfo* result = GetVectorType(inst->type_id());
       Instruction* input_inst =
-          inst->NumInOperands() > kAzdVectorMatrixMulInputInIdx
+          inst->NumInOperands() > kHwVectorMatrixMulInputInIdx
               ? get_def_use_mgr()->GetDef(
-                    inst->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx))
+                    inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx))
               : nullptr;
       Instruction* matrix_inst =
-          inst->NumInOperands() > kAzdVectorMatrixMulMatrixInIdx
+          inst->NumInOperands() > kHwVectorMatrixMulMatrixInIdx
               ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(
-                    kAzdVectorMatrixMulMatrixInIdx))
+                    kHwVectorMatrixMulMatrixInIdx))
               : nullptr;
       const VectorTypeInfo* input =
           input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
       const MatrixTypeInfo* matrix =
           matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
       const bool has_bias =
-          inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddAZD;
+          inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW;
       const VectorTypeInfo* bias = nullptr;
-      if (has_bias && inst->NumInOperands() > kAzdVectorMatrixMulAddBiasInIdx) {
+      if (has_bias && inst->NumInOperands() > kHwVectorMatrixMulAddBiasInIdx) {
         Instruction* bias_inst = get_def_use_mgr()->GetDef(
-            inst->GetSingleWordInOperand(kAzdVectorMatrixMulAddBiasInIdx));
+            inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
         bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
       }
       if (!result || !input || !matrix || input->length != matrix->cols ||
           result->length != matrix->rows ||
           (has_bias && (!bias || bias->length != result->length))) {
         ReportError(inst,
-                    "AZD cooperative vector matrix multiply shapes do "
+                    "HW cooperative vector matrix multiply shapes do "
                     "not match");
         ok = false;
         return;
@@ -384,7 +386,7 @@ bool AzdLowerToStandardPass::LegalizeModule() {
                                  static_cast<uint64_t>(input->length);
       if (mac_count > kDefaultMaxLoweredMatmulMacs) {
         ReportError(inst,
-                    "AZD cooperative vector matrix multiply expansion is too "
+                    "HW cooperative vector matrix multiply expansion is too "
                     "large");
         ok = false;
         return;
@@ -392,9 +394,9 @@ bool AzdLowerToStandardPass::LegalizeModule() {
     }
 
     if (inst->opcode() == spv::Op::OpBitcast &&
-        TypeContainsAzd(inst->type_id())) {
+        TypeContainsHw(inst->type_id())) {
       if (inst->NumInOperands() != 1) {
-        ReportError(inst, "unsupported AZD OpBitcast");
+        ReportError(inst, "unsupported HW OpBitcast");
         ok = false;
         return;
       }
@@ -404,13 +406,13 @@ bool AzdLowerToStandardPass::LegalizeModule() {
           GetLoweredType(object->type_id()) == 0 ||
           GetLoweredType(inst->type_id()) !=
               GetLoweredType(object->type_id())) {
-        ReportError(inst, "unsupported AZD OpBitcast");
+        ReportError(inst, "unsupported HW OpBitcast");
         ok = false;
         return;
       }
     }
 
-    if (!IsAzdOpcode(inst->opcode()) && TypeContainsAzd(inst->type_id())) {
+    if (!IsHwOpcode(inst->opcode()) && TypeContainsHw(inst->type_id())) {
       switch (inst->opcode()) {
         case spv::Op::OpUndef:
         case spv::Op::OpConstantNull:
@@ -423,7 +425,7 @@ bool AzdLowerToStandardPass::LegalizeModule() {
         case spv::Op::OpBitcast:
           break;
         default:
-          ReportError(inst, "unsupported AZD cooperative value use");
+          ReportError(inst, "unsupported HW cooperative value use");
           ok = false;
           return;
       }
@@ -433,10 +435,10 @@ bool AzdLowerToStandardPass::LegalizeModule() {
   return ok;
 }
 
-bool AzdLowerToStandardPass::PrepareMatmulPatternFunctions() {
+bool HwLowerToStandardPass::PrepareMatmulPatternFunctions() {
   std::vector<Instruction*> matmul_insts;
   get_module()->ForEachInst([&matmul_insts](Instruction* inst) {
-    if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddAZD) {
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
       matmul_insts.push_back(inst);
     }
   });
@@ -444,11 +446,11 @@ bool AzdLowerToStandardPass::PrepareMatmulPatternFunctions() {
   for (Instruction* inst : matmul_insts) {
     const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
     Instruction* a_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
+        inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
     Instruction* b_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
+        inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
     Instruction* c_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
+        inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
     const MatrixTypeInfo* a =
         a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
     const MatrixTypeInfo* b =
@@ -456,7 +458,7 @@ bool AzdLowerToStandardPass::PrepareMatmulPatternFunctions() {
     const MatrixTypeInfo* c =
         c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
     if (!result || !a || !b || !c) {
-      ReportError(inst, "invalid OpCooperativeMatrixMulAddAZD");
+      ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
       return false;
     }
     if (CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c) &&
@@ -468,11 +470,11 @@ bool AzdLowerToStandardPass::PrepareMatmulPatternFunctions() {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerAzdInstructions(
+bool HwLowerToStandardPass::LowerHwInstructions(
     std::vector<Instruction*>* to_kill) {
   std::vector<Instruction*> vector_stores;
   get_module()->ForEachInst([&vector_stores](Instruction* inst) {
-    if (inst->opcode() == spv::Op::OpCooperativeVectorStoreAZD) {
+    if (inst->opcode() == spv::Op::OpCooperativeVectorStoreHW) {
       vector_stores.push_back(inst);
     }
   });
@@ -492,28 +494,28 @@ bool AzdLowerToStandardPass::LowerAzdInstructions(
     }
 
     switch (inst->opcode()) {
-      case spv::Op::OpCooperativeMatrixLoadAZD:
-      case spv::Op::OpCooperativeMatrixStoreAZD:
-      case spv::Op::OpCooperativeMatrixMulAddAZD:
-      case spv::Op::OpCooperativeMatrixLengthAZD:
-      case spv::Op::OpCooperativeVectorLoadAZD:
-      case spv::Op::OpCooperativeVectorStoreAZD:
-      case spv::Op::OpCooperativeVectorMatrixMulAZD:
-      case spv::Op::OpCooperativeVectorMatrixMulAddAZD:
+      case spv::Op::OpCooperativeMatrixLoadHW:
+      case spv::Op::OpCooperativeMatrixStoreHW:
+      case spv::Op::OpCooperativeMatrixMulAddHW:
+      case spv::Op::OpCooperativeMatrixLengthHW:
+      case spv::Op::OpCooperativeVectorLoadHW:
+      case spv::Op::OpCooperativeVectorStoreHW:
+      case spv::Op::OpCooperativeVectorMatrixMulHW:
+      case spv::Op::OpCooperativeVectorMatrixMulAddHW:
         worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeConstruct:
-        if (IsAzdType(inst->type_id())) worklist.push_back(inst);
+        if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeExtract:
         worklist.push_back(inst);
         break;
       case spv::Op::OpConstantNull:
       case spv::Op::OpUndef:
-        if (IsAzdType(inst->type_id())) worklist.push_back(inst);
+        if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpBitcast:
-        if (TypeContainsAzd(inst->type_id())) worklist.push_back(inst);
+        if (TypeContainsHw(inst->type_id())) worklist.push_back(inst);
         break;
       default:
         break;
@@ -523,28 +525,28 @@ bool AzdLowerToStandardPass::LowerAzdInstructions(
   for (Instruction* inst : worklist) {
     bool ok = true;
     switch (inst->opcode()) {
-      case spv::Op::OpCooperativeMatrixLoadAZD:
+      case spv::Op::OpCooperativeMatrixLoadHW:
         ok = LowerMatrixLoad(inst);
         break;
-      case spv::Op::OpCooperativeMatrixStoreAZD:
+      case spv::Op::OpCooperativeMatrixStoreHW:
         ok = LowerMatrixStore(inst, to_kill);
         break;
-      case spv::Op::OpCooperativeMatrixMulAddAZD:
+      case spv::Op::OpCooperativeMatrixMulAddHW:
         ok = LowerMatrixMulAdd(inst);
         break;
-      case spv::Op::OpCooperativeMatrixLengthAZD:
+      case spv::Op::OpCooperativeMatrixLengthHW:
         ok = LowerMatrixLength(inst, to_kill);
         break;
-      case spv::Op::OpCooperativeVectorLoadAZD:
+      case spv::Op::OpCooperativeVectorLoadHW:
         ok = LowerVectorLoad(inst);
         break;
-      case spv::Op::OpCooperativeVectorStoreAZD:
+      case spv::Op::OpCooperativeVectorStoreHW:
         ok = LowerVectorStore(inst, to_kill);
         break;
-      case spv::Op::OpCooperativeVectorMatrixMulAZD:
+      case spv::Op::OpCooperativeVectorMatrixMulHW:
         ok = LowerVectorMatrixMul(inst, false);
         break;
-      case spv::Op::OpCooperativeVectorMatrixMulAddAZD:
+      case spv::Op::OpCooperativeVectorMatrixMulAddHW:
         ok = LowerVectorMatrixMul(inst, true);
         break;
       case spv::Op::OpCompositeConstruct:
@@ -558,7 +560,7 @@ bool AzdLowerToStandardPass::LowerAzdInstructions(
         ok = LowerNullOrUndef(inst);
         break;
       case spv::Op::OpBitcast:
-        ok = LowerAzdBitcast(inst);
+        ok = LowerHwBitcast(inst);
         break;
       default:
         break;
@@ -569,7 +571,7 @@ bool AzdLowerToStandardPass::LowerAzdInstructions(
   return true;
 }
 
-bool AzdLowerToStandardPass::ReplaceAzdTypeUses() {
+bool HwLowerToStandardPass::ReplaceHwTypeUses() {
   for (const auto& type_pair : lowered_types_) {
     Instruction* old_type = get_def_use_mgr()->GetDef(type_pair.first);
     Instruction* new_type = get_def_use_mgr()->GetDef(type_pair.second);
@@ -579,7 +581,7 @@ bool AzdLowerToStandardPass::ReplaceAzdTypeUses() {
   return true;
 }
 
-bool AzdLowerToStandardPass::CleanupAzdDeclarations(
+bool HwLowerToStandardPass::CleanupHwDeclarations(
     const std::vector<Instruction*>& to_kill) {
   bool modified = false;
   for (Instruction* inst : to_kill) {
@@ -605,42 +607,44 @@ bool AzdLowerToStandardPass::CleanupAzdDeclarations(
   }
 
   modified |=
-      context()->RemoveCapability(spv::Capability::CooperativeMatrixAZD);
+      context()->RemoveCapability(spv::Capability::CooperativeMatrixHW);
   modified |=
-      context()->RemoveCapability(spv::Capability::CooperativeVectorAZD);
+      context()->RemoveCapability(spv::Capability::CooperativeVectorHW);
   modified |= RemoveExtensionByName("SPV_AZD_neural_matrix");
   modified |= RemoveExtensionByName("SPV_AZD_cooperative_vector");
+  modified |= RemoveExtensionByName("SPV_HW_neural_shader");
   modified |= RemoveSourceExtensionByName("GL_AZD_neural_matrix");
   modified |= RemoveSourceExtensionByName("GL_AZD_cooperative_vector");
+  modified |= RemoveSourceExtensionByName("GL_HW_neural_shader");
   (void)modified;
   return true;
 }
 
-bool AzdLowerToStandardPass::FinalAzdCheck() const {
+bool HwLowerToStandardPass::FinalHwCheck() const {
   bool ok = true;
   get_module()->ForEachInst([this, &ok](Instruction* inst) {
     if (!ok) return;
-    if (IsAzdOpcode(inst->opcode()) || IsAzdCapabilityOrExtension(inst) ||
-        HasAzdTypeReference(inst)) {
-      ReportError(inst, "AZD lowering left AZD op/type/capability/extension");
+    if (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst) ||
+        HasHwTypeReference(inst)) {
+      ReportError(inst, "HW lowering left HW op/type/capability/extension");
       ok = false;
     }
   });
   return ok;
 }
 
-bool AzdLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
+bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
   const MatrixTypeInfo* info = GetMatrixType(inst->type_id());
   if (!info || inst->NumInOperands() < 4) {
-    ReportError(inst, "invalid OpCooperativeMatrixLoadAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixLoadHW");
     return false;
   }
 
   uint32_t layout = 0;
-  if (!GetConstantU32(inst->GetSingleWordInOperand(kAzdMatrixLoadLayoutInIdx),
+  if (!GetConstantU32(inst->GetSingleWordInOperand(kHwMatrixLoadLayoutInIdx),
                       &layout) ||
       layout > 1) {
-    ReportError(inst, "AZD matrix load layout must be RowMajor or ColumnMajor");
+    ReportError(inst, "HW matrix load layout must be RowMajor or ColumnMajor");
     return false;
   }
 
@@ -650,13 +654,13 @@ bool AzdLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
   std::vector<uint32_t> element_ids;
   element_ids.reserve(info->rows * info->cols);
   const uint32_t pointer_id =
-      inst->GetSingleWordInOperand(kAzdMatrixLoadPointerInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixLoadPointerInIdx);
   const uint32_t shape_id =
-      inst->GetSingleWordInOperand(kAzdMatrixLoadShapeInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixLoadShapeInIdx);
   const uint32_t offset_id =
-      inst->GetSingleWordInOperand(kAzdMatrixLoadOffsetInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixLoadOffsetInIdx);
   const std::vector<Operand> memory_operands =
-      CopyMemoryOperands(inst, kAzdMatrixLoadMemoryOperandsInIdx);
+      CopyMemoryOperands(inst, kHwMatrixLoadMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
     if (layout ==
@@ -725,28 +729,28 @@ bool AzdLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerMatrixStore(
+bool HwLowerToStandardPass::LowerMatrixStore(
     Instruction* inst, std::vector<Instruction*>* to_kill) {
   if (inst->NumInOperands() < 5) {
-    ReportError(inst, "invalid OpCooperativeMatrixStoreAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixStoreHW");
     return false;
   }
 
   Instruction* object = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixStoreObjectInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx));
   const MatrixTypeInfo* info =
       object ? GetMatrixType(object->type_id()) : nullptr;
   if (!info) {
-    ReportError(inst, "invalid AZD matrix store object");
+    ReportError(inst, "invalid HW matrix store object");
     return false;
   }
 
   uint32_t layout = 0;
-  if (!GetConstantU32(inst->GetSingleWordInOperand(kAzdMatrixStoreLayoutInIdx),
+  if (!GetConstantU32(inst->GetSingleWordInOperand(kHwMatrixStoreLayoutInIdx),
                       &layout) ||
       layout > 1) {
     ReportError(inst,
-                "AZD matrix store layout must be RowMajor or ColumnMajor");
+                "HW matrix store layout must be RowMajor or ColumnMajor");
     return false;
   }
 
@@ -754,15 +758,15 @@ bool AzdLowerToStandardPass::LowerMatrixStore(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   const uint32_t pointer_id =
-      inst->GetSingleWordInOperand(kAzdMatrixStorePointerInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixStorePointerInIdx);
   const uint32_t object_id =
-      inst->GetSingleWordInOperand(kAzdMatrixStoreObjectInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx);
   const uint32_t shape_id =
-      inst->GetSingleWordInOperand(kAzdMatrixStoreShapeInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixStoreShapeInIdx);
   const uint32_t offset_id =
-      inst->GetSingleWordInOperand(kAzdMatrixStoreOffsetInIdx);
+      inst->GetSingleWordInOperand(kHwMatrixStoreOffsetInIdx);
   const std::vector<Operand> memory_operands =
-      CopyMemoryOperands(inst, kAzdMatrixStoreMemoryOperandsInIdx);
+      CopyMemoryOperands(inst, kHwMatrixStoreMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
     if (layout ==
@@ -828,19 +832,19 @@ bool AzdLowerToStandardPass::LowerMatrixStore(
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
+bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
   Instruction* b_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
   const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
   const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
   const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
   if (!result || !a || !b || !c) {
-    ReportError(inst, "invalid OpCooperativeMatrixMulAddAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
   }
 
@@ -850,19 +854,19 @@ bool AzdLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   return LowerMatrixMulAddScalarFallback(inst);
 }
 
-bool AzdLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
+bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
   Instruction* b_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
   const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
   const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
   const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
   if (!result || !a || !b || !c) {
-    ReportError(inst, "invalid OpCooperativeMatrixMulAddAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
   }
 
@@ -877,20 +881,20 @@ bool AzdLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerMatrixMulAddScalarFallback(
+bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(
     Instruction* inst) {
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddAInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
   Instruction* b_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddBInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdMatrixMulAddCInIdx));
+      inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
   const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
   const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
   const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
   if (!result || !a || !b || !c) {
-    ReportError(inst, "invalid OpCooperativeMatrixMulAddAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
   }
 
@@ -989,21 +993,21 @@ bool AzdLowerToStandardPass::LowerMatrixMulAddScalarFallback(
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerMatrixLength(
+bool HwLowerToStandardPass::LowerMatrixLength(
     Instruction* inst, std::vector<Instruction*>* to_kill) {
   if (inst->NumInOperands() < 1) {
-    ReportError(inst, "invalid OpCooperativeMatrixLengthAZD");
+    ReportError(inst, "invalid OpCooperativeMatrixLengthHW");
     return false;
   }
   const MatrixTypeInfo* info = GetMatrixType(inst->GetSingleWordInOperand(0));
   if (!info) {
-    ReportError(inst, "invalid OpCooperativeMatrixLengthAZD type operand");
+    ReportError(inst, "invalid OpCooperativeMatrixLengthHW type operand");
     return false;
   }
   const uint32_t length_id =
       GetOrCreateConstant(inst->type_id(), info->rows * info->cols);
   if (length_id == 0) {
-    ReportError(inst, "OpCooperativeMatrixLengthAZD result type must be int32");
+    ReportError(inst, "OpCooperativeMatrixLengthHW result type must be int32");
     return false;
   }
   context()->ReplaceAllUsesWith(inst->result_id(), length_id);
@@ -1011,10 +1015,10 @@ bool AzdLowerToStandardPass::LowerMatrixLength(
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
+bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   const VectorTypeInfo* info = GetVectorType(inst->type_id());
   if (!info || inst->NumInOperands() < 1) {
-    ReportError(inst, "invalid OpCooperativeVectorLoadAZD");
+    ReportError(inst, "invalid OpCooperativeVectorLoadHW");
     return false;
   }
 
@@ -1024,9 +1028,9 @@ bool AzdLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   std::vector<uint32_t> element_ids;
   element_ids.reserve(info->length);
   const uint32_t pointer_id =
-      inst->GetSingleWordInOperand(kAzdVectorLoadPointerInIdx);
+      inst->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   const std::vector<Operand> memory_operands =
-      CopyMemoryOperands(inst, kAzdVectorLoadMemoryOperandsInIdx);
+      CopyMemoryOperands(inst, kHwVectorLoadMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
@@ -1086,19 +1090,19 @@ bool AzdLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerVectorStore(
+bool HwLowerToStandardPass::LowerVectorStore(
     Instruction* inst, std::vector<Instruction*>* to_kill) {
   if (inst->NumInOperands() < 2) {
-    ReportError(inst, "invalid OpCooperativeVectorStoreAZD");
+    ReportError(inst, "invalid OpCooperativeVectorStoreHW");
     return false;
   }
 
   Instruction* object = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorStoreObjectInIdx));
+      inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
   const VectorTypeInfo* info =
       object ? GetVectorType(object->type_id()) : nullptr;
   if (!info) {
-    ReportError(inst, "invalid AZD vector store object");
+    ReportError(inst, "invalid HW vector store object");
     return false;
   }
 
@@ -1106,11 +1110,11 @@ bool AzdLowerToStandardPass::LowerVectorStore(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   const uint32_t pointer_id =
-      inst->GetSingleWordInOperand(kAzdVectorStorePointerInIdx);
+      inst->GetSingleWordInOperand(kHwVectorStorePointerInIdx);
   const uint32_t object_id =
-      inst->GetSingleWordInOperand(kAzdVectorStoreObjectInIdx);
+      inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx);
   const std::vector<Operand> memory_operands =
-      CopyMemoryOperands(inst, kAzdVectorStoreMemoryOperandsInIdx);
+      CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx);
 
   if (IsPackedVec4(*info)) {
     bool fused = false;
@@ -1168,23 +1172,23 @@ bool AzdLowerToStandardPass::LowerVectorStore(
   return true;
 }
 
-bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
+bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
                                                             bool* handled) {
   if (handled) *handled = false;
   if (!handled || !inst || inst->NumInOperands() < 2) return false;
 
   Instruction* object = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorStoreObjectInIdx));
+      inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
   std::vector<Instruction*> object_chain;
   Instruction* matmul = TraceFunctionValueSource(object, inst, &object_chain);
-  if (!matmul || matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulAZD) {
+  if (!matmul || matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW) {
     return true;
   }
 
   Instruction* input_value = get_def_use_mgr()->GetDef(
-      matmul->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx));
+      matmul->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_value = get_def_use_mgr()->GetDef(
-      matmul->GetSingleWordInOperand(kAzdVectorMatrixMulMatrixInIdx));
+      matmul->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   std::vector<Instruction*> input_chain;
   std::vector<Instruction*> matrix_chain;
   Instruction* input_load =
@@ -1192,8 +1196,8 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   Instruction* matrix_load =
       TraceFunctionValueSource(matrix_value, matmul, &matrix_chain);
   if (!input_load || !matrix_load ||
-      input_load->opcode() != spv::Op::OpCooperativeVectorLoadAZD ||
-      matrix_load->opcode() != spv::Op::OpCooperativeMatrixLoadAZD) {
+      input_load->opcode() != spv::Op::OpCooperativeVectorLoadHW ||
+      matrix_load->opcode() != spv::Op::OpCooperativeMatrixLoadHW) {
     return true;
   }
 
@@ -1207,7 +1211,7 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
 
   uint32_t layout = 0;
   if (!GetConstantU32(
-          matrix_load->GetSingleWordInOperand(kAzdMatrixLoadLayoutInIdx),
+          matrix_load->GetSingleWordInOperand(kHwMatrixLoadLayoutInIdx),
           &layout) ||
       layout !=
           static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
@@ -1215,15 +1219,15 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   }
 
   const uint32_t input_pointer_id =
-      input_load->GetSingleWordInOperand(kAzdVectorLoadPointerInIdx);
+      input_load->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   const uint32_t matrix_pointer_id =
-      matrix_load->GetSingleWordInOperand(kAzdMatrixLoadPointerInIdx);
+      matrix_load->GetSingleWordInOperand(kHwMatrixLoadPointerInIdx);
   const uint32_t matrix_shape_id =
-      matrix_load->GetSingleWordInOperand(kAzdMatrixLoadShapeInIdx);
+      matrix_load->GetSingleWordInOperand(kHwMatrixLoadShapeInIdx);
   const uint32_t matrix_offset_id =
-      matrix_load->GetSingleWordInOperand(kAzdMatrixLoadOffsetInIdx);
+      matrix_load->GetSingleWordInOperand(kHwMatrixLoadOffsetInIdx);
   const uint32_t output_pointer_id =
-      inst->GetSingleWordInOperand(kAzdVectorStorePointerInIdx);
+      inst->GetSingleWordInOperand(kHwVectorStorePointerInIdx);
   const uint32_t input_pointer_type_id = GetPointerTypeId(input_pointer_id);
   const uint32_t matrix_pointer_type_id = GetPointerTypeId(matrix_pointer_id);
   const uint32_t output_pointer_type_id = GetPointerTypeId(output_pointer_id);
@@ -1236,9 +1240,9 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
     return true;
   }
   if (!CanMoveLoadToUse(input_load, inst, /*function_memory=*/false,
-                        kAzdVectorLoadMemoryOperandsInIdx) ||
+                        kHwVectorLoadMemoryOperandsInIdx) ||
       !CanMoveLoadToUse(matrix_load, inst, /*function_memory=*/false,
-                        kAzdMatrixLoadMemoryOperandsInIdx)) {
+                        kHwMatrixLoadMemoryOperandsInIdx)) {
     return true;
   }
 
@@ -1267,12 +1271,12 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
 
   const uint32_t function_id = BuildFusedVectorMatmulStoreFunctionPackedVec4(
       *result, *input, *matrix, input_pointer_id, input_pointer_type_id,
-      CopyMemoryOperands(input_load, kAzdVectorLoadMemoryOperandsInIdx),
+      CopyMemoryOperands(input_load, kHwVectorLoadMemoryOperandsInIdx),
       matrix_pointer_id, matrix_pointer_type_id, matrix_shape_id,
       matrix_offset_id,
-      CopyMemoryOperands(matrix_load, kAzdMatrixLoadMemoryOperandsInIdx),
+      CopyMemoryOperands(matrix_load, kHwMatrixLoadMemoryOperandsInIdx),
       output_pointer_id, output_pointer_type_id,
-      CopyMemoryOperands(inst, kAzdVectorStoreMemoryOperandsInIdx));
+      CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx));
   if (function_id == 0) return false;
 
   const uint32_t void_type_id = GetOrCreateVoidType();
@@ -1288,13 +1292,13 @@ bool AzdLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
+bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
                                                   bool has_bias) {
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulMatrixInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
   const MatrixTypeInfo* matrix =
@@ -1303,11 +1307,11 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdVectorMatrixMulAddBiasInIdx));
+        inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
     bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
-    ReportError(inst, "invalid AZD vector matrix multiply");
+    ReportError(inst, "invalid HW vector matrix multiply");
     return false;
   }
 
@@ -1317,13 +1321,13 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   return LowerVectorMatrixMulScalarFallback(inst, has_bias);
 }
 
-bool AzdLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
+bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
                                                             bool has_bias) {
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulMatrixInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
   const MatrixTypeInfo* matrix =
@@ -1332,11 +1336,11 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdVectorMatrixMulAddBiasInIdx));
+        inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
     bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
-    ReportError(inst, "invalid AZD vector matrix multiply");
+    ReportError(inst, "invalid HW vector matrix multiply");
     return false;
   }
 
@@ -1392,13 +1396,13 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
+bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
     Instruction* inst, bool has_bias) {
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulInputInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
-      inst->GetSingleWordInOperand(kAzdVectorMatrixMulMatrixInIdx));
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
   const MatrixTypeInfo* matrix =
@@ -1407,11 +1411,11 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kAzdVectorMatrixMulAddBiasInIdx));
+        inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
     bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
-    ReportError(inst, "invalid AZD vector matrix multiply");
+    ReportError(inst, "invalid HW vector matrix multiply");
     return false;
   }
 
@@ -1484,11 +1488,11 @@ bool AzdLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
+bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
   const VectorTypeInfo* vector = GetVectorType(inst->type_id());
   if (!matrix && !vector) {
-    ReportError(inst, "invalid AZD OpCompositeConstruct result type");
+    ReportError(inst, "invalid HW OpCompositeConstruct result type");
     return false;
   }
 
@@ -1512,7 +1516,7 @@ bool AzdLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
     const uint32_t expected_operands = matrix->rows * matrix->cols;
     if (inst->NumInOperands() != expected_operands) {
       ReportError(inst,
-                  "AZD matrix OpCompositeConstruct operand count is invalid");
+                  "HW matrix OpCompositeConstruct operand count is invalid");
       return false;
     }
 
@@ -1540,7 +1544,7 @@ bool AzdLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   const uint32_t expected_operands = vector->length;
   if (inst->NumInOperands() != expected_operands) {
     ReportError(inst,
-                "AZD vector OpCompositeConstruct operand count is invalid");
+                "HW vector OpCompositeConstruct operand count is invalid");
     return false;
   }
 
@@ -1561,7 +1565,7 @@ bool AzdLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
+bool HwLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
   if (inst->NumInOperands() < 1) return true;
   Instruction* object =
       get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
@@ -1574,13 +1578,13 @@ bool AzdLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
   if (matrix) {
     if (inst->NumInOperands() != 3 ||
         inst->type_id() != matrix->component_type_id) {
-      ReportError(inst, "unsupported AZD matrix OpCompositeExtract");
+      ReportError(inst, "unsupported HW matrix OpCompositeExtract");
       return false;
     }
     const uint32_t row = inst->GetSingleWordInOperand(1);
     const uint32_t col = inst->GetSingleWordInOperand(2);
     if (row >= matrix->rows || col >= matrix->cols) {
-      ReportError(inst, "AZD matrix OpCompositeExtract index is out of range");
+      ReportError(inst, "HW matrix OpCompositeExtract index is out of range");
       return false;
     }
 
@@ -1610,12 +1614,12 @@ bool AzdLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
 
   if (inst->NumInOperands() != 2 ||
       inst->type_id() != vector->component_type_id) {
-    ReportError(inst, "unsupported AZD vector OpCompositeExtract");
+    ReportError(inst, "unsupported HW vector OpCompositeExtract");
     return false;
   }
   const uint32_t index = inst->GetSingleWordInOperand(1);
   if (index >= vector->length) {
-    ReportError(inst, "AZD vector OpCompositeExtract index is out of range");
+    ReportError(inst, "HW vector OpCompositeExtract index is out of range");
     return false;
   }
 
@@ -1642,10 +1646,10 @@ bool AzdLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerNullOrUndef(Instruction* inst) {
+bool HwLowerToStandardPass::LowerNullOrUndef(Instruction* inst) {
   const uint32_t lowered_type_id = GetLoweredType(inst->type_id());
   if (lowered_type_id == 0) {
-    ReportError(inst, "invalid AZD null/undef result type");
+    ReportError(inst, "invalid HW null/undef result type");
     return false;
   }
   inst->SetResultType(lowered_type_id);
@@ -1653,14 +1657,14 @@ bool AzdLowerToStandardPass::LowerNullOrUndef(Instruction* inst) {
   return true;
 }
 
-bool AzdLowerToStandardPass::LowerAzdBitcast(Instruction* inst) {
+bool HwLowerToStandardPass::LowerHwBitcast(Instruction* inst) {
   inst->SetOpcode(spv::Op::OpCopyObject);
   inst->SetResultType(GetLoweredType(inst->type_id()));
   context()->UpdateDefUse(inst);
   return true;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateArrayType(
+uint32_t HwLowerToStandardPass::GetOrCreateArrayType(
     uint32_t component_type_id, uint32_t length, Instruction* insert_after) {
   Instruction* insertion_point = insert_after;
   uint32_t length_id = GetOrCreateUIntConstantAfter(length, &insertion_point);
@@ -1688,7 +1692,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateArrayType(
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateVectorType(
+uint32_t HwLowerToStandardPass::GetOrCreateVectorType(
     uint32_t component_type_id, uint32_t component_count,
     Instruction** insert_after) {
   for (Instruction& inst : get_module()->types_values()) {
@@ -1712,12 +1716,12 @@ uint32_t AzdLowerToStandardPass::GetOrCreateVectorType(
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreatePackedArrayType(
+uint32_t HwLowerToStandardPass::GetOrCreatePackedArrayType(
     uint32_t vec4_type_id, uint32_t length, Instruction* insert_after) {
   return GetOrCreateArrayType(vec4_type_id, length, insert_after);
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreatePointerType(
+uint32_t HwLowerToStandardPass::GetOrCreatePointerType(
     uint32_t pointee_type_id, spv::StorageClass storage_class) {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypePointer &&
@@ -1738,7 +1742,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePointerType(
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateVoidType() {
+uint32_t HwLowerToStandardPass::GetOrCreateVoidType() {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypeVoid) {
       return inst.result_id();
@@ -1753,7 +1757,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateVoidType() {
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateBoolType() {
+uint32_t HwLowerToStandardPass::GetOrCreateBoolType() {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypeBool) {
       return inst.result_id();
@@ -1768,7 +1772,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateBoolType() {
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateUIntType() {
+uint32_t HwLowerToStandardPass::GetOrCreateUIntType() {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypeInt &&
         inst.GetSingleWordInOperand(0) == 32 &&
@@ -1786,13 +1790,13 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntType() {
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateUIntConstant(uint32_t value) {
+uint32_t HwLowerToStandardPass::GetOrCreateUIntConstant(uint32_t value) {
   const uint32_t uint_type_id = GetOrCreateUIntType();
   if (uint_type_id == 0) return 0;
   return GetOrCreateConstant(uint_type_id, value);
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateUIntConstantAfter(
+uint32_t HwLowerToStandardPass::GetOrCreateUIntConstantAfter(
     uint32_t value, Instruction** insert_after) {
   const uint32_t uint_type_id = GetOrCreateUIntTypeAfter(insert_after);
   if (uint_type_id == 0) return 0;
@@ -1821,7 +1825,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntConstantAfter(
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateUIntTypeAfter(
+uint32_t HwLowerToStandardPass::GetOrCreateUIntTypeAfter(
     Instruction** insert_after) {
   bool can_reuse = true;
   for (Instruction& inst : get_module()->types_values()) {
@@ -1845,7 +1849,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateUIntTypeAfter(
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateConstant(uint32_t type_id,
+uint32_t HwLowerToStandardPass::GetOrCreateConstant(uint32_t type_id,
                                                      uint32_t value) {
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   if (!type || type->opcode() != spv::Op::OpTypeInt ||
@@ -1874,7 +1878,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateConstant(uint32_t type_id,
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
+uint32_t HwLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.type_id() == type_id &&
         (inst.opcode() == spv::Op::OpConstantNull ||
@@ -1892,19 +1896,19 @@ uint32_t AzdLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
   return result_id;
 }
 
-uint32_t AzdLowerToStandardPass::BuildPairComponentAsUInt(
+uint32_t HwLowerToStandardPass::BuildPairComponentAsUInt(
     InstructionBuilder* builder, Instruction* user, uint32_t pair_id,
     uint32_t component_index) {
   Instruction* pair = get_def_use_mgr()->GetDef(pair_id);
   if (!pair || pair->type_id() == 0) {
-    ReportError(user, "AZD matrix shape/offset must be a two-component value");
+    ReportError(user, "HW matrix shape/offset must be a two-component value");
     return 0;
   }
 
   Instruction* pair_type = get_def_use_mgr()->GetDef(pair->type_id());
   if (!pair_type || pair_type->opcode() != spv::Op::OpTypeVector ||
       pair_type->GetSingleWordInOperand(1) < 2) {
-    ReportError(user, "AZD matrix shape/offset must be a two-component vector");
+    ReportError(user, "HW matrix shape/offset must be a two-component vector");
     return 0;
   }
 
@@ -1931,11 +1935,11 @@ uint32_t AzdLowerToStandardPass::BuildPairComponentAsUInt(
     return converted ? converted->result_id() : 0;
   }
 
-  ReportError(user, "AZD matrix shape/offset component type is unsupported");
+  ReportError(user, "HW matrix shape/offset component type is unsupported");
   return 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildMatrixElementIndex(
+uint32_t HwLowerToStandardPass::BuildMatrixElementIndex(
     InstructionBuilder* builder, Instruction* user, const MatrixTypeInfo& info,
     uint32_t shape_id, uint32_t offset_id, uint32_t layout, uint32_t row,
     uint32_t col) {
@@ -1983,19 +1987,19 @@ uint32_t AzdLowerToStandardPass::BuildMatrixElementIndex(
   return index ? index->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
+uint32_t HwLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
                                                     Instruction* user,
                                                     uint32_t pointer_id,
                                                     uint32_t component_type_id,
                                                     uint32_t element_index_id) {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer || pointer->type_id() == 0) {
-    ReportError(user, "AZD load/store pointer is invalid");
+    ReportError(user, "HW load/store pointer is invalid");
     return 0;
   }
   Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer->type_id());
   if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
-    ReportError(user, "AZD load/store pointer must be a pointer");
+    ReportError(user, "HW load/store pointer must be a pointer");
     return 0;
   }
 
@@ -2009,7 +2013,7 @@ uint32_t AzdLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
       return pointer_id;
     }
     ReportError(user,
-                "AZD scalar pointer load/store only supports element zero");
+                "HW scalar pointer load/store only supports element zero");
     return 0;
   }
 
@@ -2025,17 +2029,17 @@ uint32_t AzdLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
   }
 
   ReportError(user,
-              "AZD load/store pointer must point to the component or a "
+              "HW load/store pointer must point to the component or a "
               "component array");
   return 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildElementAccessFromPointerType(
+uint32_t HwLowerToStandardPass::BuildElementAccessFromPointerType(
     InstructionBuilder* builder, uint32_t pointer_type_id, uint32_t pointer_id,
     uint32_t component_type_id, uint32_t element_index_id) {
   Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
   if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
-    ReportError(nullptr, "AZD load/store pointer must be a pointer");
+    ReportError(nullptr, "HW load/store pointer must be a pointer");
     return 0;
   }
 
@@ -2045,7 +2049,7 @@ uint32_t AzdLowerToStandardPass::BuildElementAccessFromPointerType(
 
   if (pointee_type_id == component_type_id) {
     ReportError(nullptr,
-                "AZD scalar pointer load/store cannot be chunk-lowered");
+                "HW scalar pointer load/store cannot be chunk-lowered");
     return 0;
   }
 
@@ -2061,12 +2065,12 @@ uint32_t AzdLowerToStandardPass::BuildElementAccessFromPointerType(
   }
 
   ReportError(nullptr,
-              "AZD load/store pointer must point to the component or a "
+              "HW load/store pointer must point to the component or a "
               "component array");
   return 0;
 }
 
-Instruction* AzdLowerToStandardPass::AddFunctionVariable(
+Instruction* HwLowerToStandardPass::AddFunctionVariable(
     Function* function, uint32_t pointer_type_id, uint32_t initializer_id) {
   if (!function || function->begin() == function->end()) return nullptr;
 
@@ -2098,7 +2102,7 @@ Instruction* AzdLowerToStandardPass::AddFunctionVariable(
   return variable_ptr;
 }
 
-BasicBlock* AzdLowerToStandardPass::MakeBasicBlock(uint32_t label_id) {
+BasicBlock* HwLowerToStandardPass::MakeBasicBlock(uint32_t label_id) {
   if (label_id == 0) return nullptr;
   BasicBlock* block = new BasicBlock(
       MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
@@ -2108,7 +2112,7 @@ BasicBlock* AzdLowerToStandardPass::MakeBasicBlock(uint32_t label_id) {
   return block;
 }
 
-uint32_t AzdLowerToStandardPass::BuildRowMajorMatrixMemoryIndex(
+uint32_t HwLowerToStandardPass::BuildRowMajorMatrixMemoryIndex(
     InstructionBuilder* builder, Instruction* user, uint32_t shape_id,
     uint32_t offset_id, uint32_t cols, uint32_t base_id) {
   const uint32_t uint_type_id = GetOrCreateUIntType();
@@ -2144,7 +2148,7 @@ uint32_t AzdLowerToStandardPass::BuildRowMajorMatrixMemoryIndex(
   return index ? index->result_id() : 0;
 }
 
-bool AzdLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
+bool HwLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
     Instruction* insert_before, const MatrixTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, uint32_t shape_id, uint32_t offset_id,
     uint32_t layout, const std::vector<Operand>& memory_operands,
@@ -2285,7 +2289,7 @@ bool AzdLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
   return true;
 }
 
-bool AzdLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
+bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
     Instruction* insert_before, const MatrixTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, uint32_t object_id, uint32_t shape_id,
     uint32_t offset_id, uint32_t layout,
@@ -2424,7 +2428,7 @@ bool AzdLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
   return true;
 }
 
-bool AzdLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
+bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, const std::vector<Operand>& memory_operands,
     uint32_t* result_id) {
@@ -2555,7 +2559,7 @@ bool AzdLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
   return true;
 }
 
-bool AzdLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
+bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, uint32_t object_id,
     const std::vector<Operand>& memory_operands) {
@@ -2685,7 +2689,7 @@ bool AzdLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
   return true;
 }
 
-uint32_t AzdLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, uint32_t input_pointer_id,
     uint32_t input_pointer_type_id,
@@ -2949,7 +2953,7 @@ uint32_t AzdLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
   return function_id;
 }
 
-uint32_t AzdLowerToStandardPass::BuildCapturedPointer(
+uint32_t HwLowerToStandardPass::BuildCapturedPointer(
     InstructionBuilder* builder, uint32_t pointer_id) {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer) return 0;
@@ -2982,7 +2986,7 @@ uint32_t AzdLowerToStandardPass::BuildCapturedPointer(
   return access ? access->result_id() : 0;
 }
 
-bool AzdLowerToStandardPass::CanCapturePointer(uint32_t pointer_id) const {
+bool HwLowerToStandardPass::CanCapturePointer(uint32_t pointer_id) const {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer) return false;
 
@@ -3008,13 +3012,13 @@ bool AzdLowerToStandardPass::CanCapturePointer(uint32_t pointer_id) const {
   return true;
 }
 
-bool AzdLowerToStandardPass::IsModuleVisibleValue(uint32_t id) const {
+bool HwLowerToStandardPass::IsModuleVisibleValue(uint32_t id) const {
   Instruction* inst = get_def_use_mgr()->GetDef(id);
   if (!inst) return false;
   return context()->get_instr_block(inst) == nullptr;
 }
 
-uint32_t AzdLowerToStandardPass::ExtractCompositeElement(
+uint32_t HwLowerToStandardPass::ExtractCompositeElement(
     InstructionBuilder* builder, uint32_t component_type_id,
     uint32_t composite_id, uint32_t index) {
   Instruction* extract =
@@ -3022,7 +3026,7 @@ uint32_t AzdLowerToStandardPass::ExtractCompositeElement(
   return extract ? extract->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::AddLoad(
+uint32_t HwLowerToStandardPass::AddLoad(
     InstructionBuilder* builder, uint32_t type_id, uint32_t pointer_id,
     const std::vector<Operand>& memory_operands) {
   std::vector<Operand> operands;
@@ -3036,7 +3040,7 @@ uint32_t AzdLowerToStandardPass::AddLoad(
   return added ? added->result_id() : 0;
 }
 
-bool AzdLowerToStandardPass::AddStore(
+bool HwLowerToStandardPass::AddStore(
     InstructionBuilder* builder, uint32_t pointer_id, uint32_t object_id,
     const std::vector<Operand>& memory_operands) {
   std::vector<Operand> operands;
@@ -3050,7 +3054,7 @@ bool AzdLowerToStandardPass::AddStore(
   return builder->AddInstruction(std::move(store)) != nullptr;
 }
 
-std::vector<Operand> AzdLowerToStandardPass::CopyMemoryOperands(
+std::vector<Operand> HwLowerToStandardPass::CopyMemoryOperands(
     const Instruction* inst, uint32_t first_in_operand) const {
   std::vector<Operand> operands;
   if (inst->NumInOperands() <= first_in_operand) return operands;
@@ -3061,7 +3065,7 @@ std::vector<Operand> AzdLowerToStandardPass::CopyMemoryOperands(
   return operands;
 }
 
-uint32_t AzdLowerToStandardPass::ExtractVectorScalar(
+uint32_t HwLowerToStandardPass::ExtractVectorScalar(
     InstructionBuilder* builder, const VectorTypeInfo& info, uint32_t vector_id,
     uint32_t index) {
   if (!IsPackedVec4(info)) {
@@ -3076,7 +3080,7 @@ uint32_t AzdLowerToStandardPass::ExtractVectorScalar(
                                  PackedLane(index));
 }
 
-uint32_t AzdLowerToStandardPass::ExtractMatrixScalar(
+uint32_t HwLowerToStandardPass::ExtractMatrixScalar(
     InstructionBuilder* builder, const MatrixTypeInfo& info, uint32_t matrix_id,
     uint32_t row, uint32_t col) {
   if (!IsPackedVec4(info)) {
@@ -3092,7 +3096,7 @@ uint32_t AzdLowerToStandardPass::ExtractMatrixScalar(
                                  PackedLane(col));
 }
 
-uint32_t AzdLowerToStandardPass::BuildMatrixRowVector(
+uint32_t HwLowerToStandardPass::BuildMatrixRowVector(
     InstructionBuilder* builder, const MatrixTypeInfo& info, uint32_t matrix_id,
     uint32_t row, uint32_t col_start, uint32_t vec4_type_id) {
   if (IsPackedVec4(info) && col_start % kPackedVec4Width == 0 &&
@@ -3120,7 +3124,7 @@ uint32_t AzdLowerToStandardPass::BuildMatrixRowVector(
   return vec ? vec->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildMatrixColumnVector(
+uint32_t HwLowerToStandardPass::BuildMatrixColumnVector(
     InstructionBuilder* builder, const MatrixTypeInfo& info, uint32_t matrix_id,
     uint32_t row_start, uint32_t col, uint32_t vec4_type_id) {
   const uint32_t zero_id = GetOrCreateZero(info.component_type_id);
@@ -3141,7 +3145,7 @@ uint32_t AzdLowerToStandardPass::BuildMatrixColumnVector(
   return vec ? vec->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildVectorTimesScalar(
+uint32_t HwLowerToStandardPass::BuildVectorTimesScalar(
     InstructionBuilder* builder, uint32_t vec4_type_id, uint32_t vector_id,
     uint32_t scalar_id) {
   const uint32_t scalar_vec_id =
@@ -3152,7 +3156,7 @@ uint32_t AzdLowerToStandardPass::BuildVectorTimesScalar(
   return mul ? mul->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildScalarSplat(InstructionBuilder* builder,
+uint32_t HwLowerToStandardPass::BuildScalarSplat(InstructionBuilder* builder,
                                                   uint32_t vec4_type_id,
                                                   uint32_t scalar_id) {
   std::vector<uint32_t> lane_ids(kPackedVec4Width, scalar_id);
@@ -3161,7 +3165,7 @@ uint32_t AzdLowerToStandardPass::BuildScalarSplat(InstructionBuilder* builder,
   return scalar_vec ? scalar_vec->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildFma(InstructionBuilder* builder,
+uint32_t HwLowerToStandardPass::BuildFma(InstructionBuilder* builder,
                                           uint32_t type_id,
                                           uint32_t multiplicand_id,
                                           uint32_t multiplier_id,
@@ -3183,7 +3187,7 @@ uint32_t AzdLowerToStandardPass::BuildFma(InstructionBuilder* builder,
   return added ? added->result_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::BuildHorizontalReduce(
+uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
     InstructionBuilder* builder, uint32_t component_type_id,
     uint32_t vector_id) {
   uint32_t sum =
@@ -3201,7 +3205,7 @@ uint32_t AzdLowerToStandardPass::BuildHorizontalReduce(
   return sum;
 }
 
-bool AzdLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
+bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
     InstructionBuilder* builder, const VectorTypeInfo& result,
     const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
     const VectorTypeInfo* bias, uint32_t input_id, uint32_t matrix_id,
@@ -3241,7 +3245,7 @@ bool AzdLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
   return true;
 }
 
-bool AzdLowerToStandardPass::BuildMatmulPatternPackedVec4(
+bool HwLowerToStandardPass::BuildMatmulPatternPackedVec4(
     InstructionBuilder* builder, const MatrixTypeInfo& result,
     const MatrixTypeInfo& a, const MatrixTypeInfo& b, const MatrixTypeInfo& c,
     uint32_t a_id, uint32_t b_id, uint32_t c_id,
@@ -3338,7 +3342,7 @@ bool AzdLowerToStandardPass::BuildMatmulPatternPackedVec4(
   return true;
 }
 
-void AzdLowerToStandardPass::AddGeneratedFunction(
+void HwLowerToStandardPass::AddGeneratedFunction(
     std::unique_ptr<Function> function, uint32_t function_id) {
   if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse)) {
     auto* def_use_mgr = context()->get_def_use_mgr();
@@ -3363,7 +3367,7 @@ void AzdLowerToStandardPass::AddGeneratedFunction(
   generated_function_ids_.insert(function_id);
 }
 
-std::string AzdLowerToStandardPass::MemoryOperandsKey(
+std::string HwLowerToStandardPass::MemoryOperandsKey(
     const std::vector<Operand>& memory_operands) const {
   std::string key;
   for (const Operand& operand : memory_operands) {
@@ -3378,7 +3382,7 @@ std::string AzdLowerToStandardPass::MemoryOperandsKey(
   return key;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateFunctionType(
+uint32_t HwLowerToStandardPass::GetOrCreateFunctionType(
     uint32_t return_type_id, const std::vector<uint32_t>& param_type_ids) {
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() != spv::Op::OpTypeFunction ||
@@ -3410,7 +3414,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateFunctionType(
   return type_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
+uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
     uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
     uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
   const std::string key =
@@ -3491,7 +3495,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
   return function_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
+uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
     uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
     uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
   const std::string key =
@@ -3572,7 +3576,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
   return function_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
     const MatrixTypeInfo& matrix) {
   const std::string key = TileWeightFunctionKey(matrix);
   auto cached = tile_weight_functions_.find(key);
@@ -3679,7 +3683,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
   return function_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
     const MatrixTypeInfo& matrix) {
   const std::string key = MatmulTileWeightFunctionKey(matrix);
   auto cached = matmul_tile_weight_functions_.find(key);
@@ -3799,7 +3803,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
 }
 
 uint32_t
-AzdLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias) {
   const std::string key =
@@ -4173,7 +4177,7 @@ AzdLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
 }
 
 uint32_t
-AzdLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
+HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
     uint32_t input_pointer_type_id, uint32_t matrix_pointer_type_id,
@@ -4507,7 +4511,7 @@ AzdLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   return function_id;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) {
   const std::string key = MatmulPatternFunctionKey(result, a, b, c);
@@ -4939,7 +4943,7 @@ uint32_t AzdLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
   return function_id;
 }
 
-std::string AzdLowerToStandardPass::TileWeightFunctionKey(
+std::string HwLowerToStandardPass::TileWeightFunctionKey(
     const MatrixTypeInfo& matrix) const {
   std::string key;
   key.reserve(96);
@@ -4959,12 +4963,12 @@ std::string AzdLowerToStandardPass::TileWeightFunctionKey(
   return key;
 }
 
-std::string AzdLowerToStandardPass::MatmulTileWeightFunctionKey(
+std::string HwLowerToStandardPass::MatmulTileWeightFunctionKey(
     const MatrixTypeInfo& matrix) const {
   return std::string("matmul|") + TileWeightFunctionKey(matrix);
 }
 
-std::string AzdLowerToStandardPass::VectorMatmulPatternFunctionKey(
+std::string HwLowerToStandardPass::VectorMatmulPatternFunctionKey(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias,
     bool has_bias) const {
@@ -5012,7 +5016,7 @@ std::string AzdLowerToStandardPass::VectorMatmulPatternFunctionKey(
   return key;
 }
 
-std::string AzdLowerToStandardPass::MatmulPatternFunctionKey(
+std::string HwLowerToStandardPass::MatmulPatternFunctionKey(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
   std::string key;
@@ -5042,15 +5046,15 @@ std::string AzdLowerToStandardPass::MatmulPatternFunctionKey(
   return key;
 }
 
-bool AzdLowerToStandardPass::IsPackedVec4(const MatrixTypeInfo& info) const {
+bool HwLowerToStandardPass::IsPackedVec4(const MatrixTypeInfo& info) const {
   return info.packed_f16vec4 || info.packed_f32vec4;
 }
 
-bool AzdLowerToStandardPass::IsPackedVec4(const VectorTypeInfo& info) const {
+bool HwLowerToStandardPass::IsPackedVec4(const VectorTypeInfo& info) const {
   return info.packed_f16vec4 || info.packed_f32vec4;
 }
 
-bool AzdLowerToStandardPass::IsSamePackedVec4Kind(
+bool HwLowerToStandardPass::IsSamePackedVec4Kind(
     const MatrixTypeInfo& a, const MatrixTypeInfo& b) const {
   return IsPackedVec4(a) && IsPackedVec4(b) &&
          a.packed_f16vec4 == b.packed_f16vec4 &&
@@ -5059,7 +5063,7 @@ bool AzdLowerToStandardPass::IsSamePackedVec4Kind(
          a.packed_vec4_type_id == b.packed_vec4_type_id;
 }
 
-bool AzdLowerToStandardPass::IsSamePackedVec4Kind(
+bool HwLowerToStandardPass::IsSamePackedVec4Kind(
     const VectorTypeInfo& a, const VectorTypeInfo& b) const {
   return IsPackedVec4(a) && IsPackedVec4(b) &&
          a.packed_f16vec4 == b.packed_f16vec4 &&
@@ -5068,7 +5072,7 @@ bool AzdLowerToStandardPass::IsSamePackedVec4Kind(
          a.packed_vec4_type_id == b.packed_vec4_type_id;
 }
 
-bool AzdLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
+bool HwLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
   return IsPackedVec4(result) &&
@@ -5076,7 +5080,7 @@ bool AzdLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
          IsSamePackedVec4Kind(result, b) && IsSamePackedVec4Kind(result, c);
 }
 
-bool AzdLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
+bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
   if (!IsPackedVec4(result) ||
@@ -5090,33 +5094,33 @@ bool AzdLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
   return !bias || IsSamePackedVec4Kind(result, *bias);
 }
 
-bool AzdLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {
+bool HwLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {
   return lowering_mode_ == LoweringMode::kPreferPackedVec4 &&
          extent % kPackedVec4Width == 0;
 }
 
-uint32_t AzdLowerToStandardPass::MatrixFlatIndex(const MatrixTypeInfo& info,
+uint32_t HwLowerToStandardPass::MatrixFlatIndex(const MatrixTypeInfo& info,
                                                  uint32_t row,
                                                  uint32_t col) const {
   return row * info.cols + col;
 }
 
-uint32_t AzdLowerToStandardPass::MatrixPackedIndex(const MatrixTypeInfo& info,
+uint32_t HwLowerToStandardPass::MatrixPackedIndex(const MatrixTypeInfo& info,
                                                    uint32_t row,
                                                    uint32_t col_pack) const {
   return row * info.packed_cols + col_pack;
 }
 
-uint32_t AzdLowerToStandardPass::VectorPackedIndex(
+uint32_t HwLowerToStandardPass::VectorPackedIndex(
     uint32_t scalar_index) const {
   return scalar_index / kPackedVec4Width;
 }
 
-uint32_t AzdLowerToStandardPass::PackedLane(uint32_t scalar_index) const {
+uint32_t HwLowerToStandardPass::PackedLane(uint32_t scalar_index) const {
   return scalar_index % kPackedVec4Width;
 }
 
-uint32_t AzdLowerToStandardPass::GetOrCreateGLSLStd450Import() {
+uint32_t HwLowerToStandardPass::GetOrCreateGLSLStd450Import() {
   uint32_t import_id =
       context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450();
   if (import_id != 0) return import_id;
@@ -5128,8 +5132,8 @@ uint32_t AzdLowerToStandardPass::GetOrCreateGLSLStd450Import() {
   return context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450();
 }
 
-const AzdLowerToStandardPass::MatrixTypeInfo*
-AzdLowerToStandardPass::GetMatrixType(uint32_t type_id) const {
+const HwLowerToStandardPass::MatrixTypeInfo*
+HwLowerToStandardPass::GetMatrixType(uint32_t type_id) const {
   auto it = matrix_types_.find(type_id);
   if (it != matrix_types_.end()) return &it->second;
   for (const auto& id_and_info : matrix_types_) {
@@ -5139,8 +5143,8 @@ AzdLowerToStandardPass::GetMatrixType(uint32_t type_id) const {
   return nullptr;
 }
 
-const AzdLowerToStandardPass::VectorTypeInfo*
-AzdLowerToStandardPass::GetVectorType(uint32_t type_id) const {
+const HwLowerToStandardPass::VectorTypeInfo*
+HwLowerToStandardPass::GetVectorType(uint32_t type_id) const {
   auto it = vector_types_.find(type_id);
   if (it != vector_types_.end()) return &it->second;
   for (const auto& id_and_info : vector_types_) {
@@ -5150,7 +5154,7 @@ AzdLowerToStandardPass::GetVectorType(uint32_t type_id) const {
   return nullptr;
 }
 
-uint32_t AzdLowerToStandardPass::GetFunctionPointerOperandForLoad(
+uint32_t HwLowerToStandardPass::GetFunctionPointerOperandForLoad(
     Instruction* inst, uint32_t original_pointee_type_id,
     uint32_t lowered_pointee_type_id, uint32_t* pointer_type_id) const {
   if (!inst || inst->opcode() != spv::Op::OpLoad || inst->NumInOperands() < 1) {
@@ -5175,7 +5179,7 @@ uint32_t AzdLowerToStandardPass::GetFunctionPointerOperandForLoad(
   return pointer_id;
 }
 
-bool AzdLowerToStandardPass::CanMoveLoadToUse(
+bool HwLowerToStandardPass::CanMoveLoadToUse(
     Instruction* load, Instruction* use, bool function_memory,
     uint32_t first_memory_operand) const {
   if (!load || !use) return false;
@@ -5183,7 +5187,7 @@ bool AzdLowerToStandardPass::CanMoveLoadToUse(
   return !HasUnsafeMemoryInstructionBetween(load, use, function_memory);
 }
 
-bool AzdLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
+bool HwLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
     Instruction* start, Instruction* end, bool function_memory) const {
   if (!start || !end) return true;
   BasicBlock* start_block = context()->get_instr_block(start);
@@ -5203,7 +5207,7 @@ bool AzdLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
   return true;
 }
 
-bool AzdLowerToStandardPass::InstructionMayWriteOrOrderMemory(
+bool HwLowerToStandardPass::InstructionMayWriteOrOrderMemory(
     const Instruction* inst, bool function_memory) const {
   if (!inst) return true;
   if (inst->IsAtomicOp()) return true;
@@ -5234,7 +5238,7 @@ bool AzdLowerToStandardPass::InstructionMayWriteOrOrderMemory(
   }
 }
 
-bool AzdLowerToStandardPass::MemoryAccessOperandsAreMovable(
+bool HwLowerToStandardPass::MemoryAccessOperandsAreMovable(
     const Instruction* inst, uint32_t first_in_operand) const {
   if (!inst || inst->NumInOperands() <= first_in_operand) return true;
   const Operand& access = inst->GetInOperand(first_in_operand);
@@ -5246,7 +5250,7 @@ bool AzdLowerToStandardPass::MemoryAccessOperandsAreMovable(
   return (mask & ~allowed) == 0;
 }
 
-Instruction* AzdLowerToStandardPass::TraceFunctionValueSource(
+Instruction* HwLowerToStandardPass::TraceFunctionValueSource(
     Instruction* value_inst, Instruction* before,
     std::vector<Instruction*>* chain, uint32_t depth) const {
   if (!value_inst || !before || !chain || depth > 8) return nullptr;
@@ -5268,7 +5272,7 @@ Instruction* AzdLowerToStandardPass::TraceFunctionValueSource(
   return TraceFunctionValueSource(stored_value, store, chain, depth + 1);
 }
 
-Instruction* AzdLowerToStandardPass::FindLastStoreToFunctionPointer(
+Instruction* HwLowerToStandardPass::FindLastStoreToFunctionPointer(
     uint32_t pointer_id, Instruction* before) const {
   BasicBlock* block = context()->get_instr_block(before);
   if (!block) return nullptr;
@@ -5284,7 +5288,7 @@ Instruction* AzdLowerToStandardPass::FindLastStoreToFunctionPointer(
   return last_store;
 }
 
-bool AzdLowerToStandardPass::IsFunctionPointer(uint32_t pointer_id) const {
+bool HwLowerToStandardPass::IsFunctionPointer(uint32_t pointer_id) const {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer || pointer->type_id() == 0) return false;
   Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer->type_id());
@@ -5293,7 +5297,7 @@ bool AzdLowerToStandardPass::IsFunctionPointer(uint32_t pointer_id) const {
              uint32_t(spv::StorageClass::Function);
 }
 
-bool AzdLowerToStandardPass::GetPointerStorageClass(
+bool HwLowerToStandardPass::GetPointerStorageClass(
     uint32_t pointer_id, uint32_t* storage_class) const {
   if (storage_class) *storage_class = 0;
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
@@ -5307,17 +5311,17 @@ bool AzdLowerToStandardPass::GetPointerStorageClass(
   return true;
 }
 
-uint32_t AzdLowerToStandardPass::GetLoweredType(uint32_t type_id) const {
+uint32_t HwLowerToStandardPass::GetLoweredType(uint32_t type_id) const {
   auto it = lowered_types_.find(type_id);
   return it == lowered_types_.end() ? 0 : it->second;
 }
 
-uint32_t AzdLowerToStandardPass::GetPointerTypeId(uint32_t pointer_id) const {
+uint32_t HwLowerToStandardPass::GetPointerTypeId(uint32_t pointer_id) const {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   return pointer ? pointer->type_id() : 0;
 }
 
-uint32_t AzdLowerToStandardPass::GetPointeeType(
+uint32_t HwLowerToStandardPass::GetPointeeType(
     uint32_t pointer_type_id) const {
   Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
   if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
@@ -5326,7 +5330,7 @@ uint32_t AzdLowerToStandardPass::GetPointeeType(
   return pointer_type->GetSingleWordInOperand(1);
 }
 
-bool AzdLowerToStandardPass::GetConstantU32(uint32_t id,
+bool HwLowerToStandardPass::GetConstantU32(uint32_t id,
                                             uint32_t* value) const {
   Instruction* inst = get_def_use_mgr()->GetDef(id);
   if (!inst) return false;
@@ -5349,26 +5353,26 @@ bool AzdLowerToStandardPass::GetConstantU32(uint32_t id,
   return true;
 }
 
-bool AzdLowerToStandardPass::IsFloat16Type(uint32_t type_id) const {
+bool HwLowerToStandardPass::IsFloat16Type(uint32_t type_id) const {
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   return type && type->opcode() == spv::Op::OpTypeFloat &&
          type->GetSingleWordInOperand(0) == 16;
 }
 
-bool AzdLowerToStandardPass::IsFloat32Type(uint32_t type_id) const {
+bool HwLowerToStandardPass::IsFloat32Type(uint32_t type_id) const {
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   return type && type->opcode() == spv::Op::OpTypeFloat &&
          type->GetSingleWordInOperand(0) == 32;
 }
 
-bool AzdLowerToStandardPass::IsAzdType(uint32_t type_id) const {
+bool HwLowerToStandardPass::IsHwType(uint32_t type_id) const {
   return matrix_types_.find(type_id) != matrix_types_.end() ||
          vector_types_.find(type_id) != vector_types_.end();
 }
 
-bool AzdLowerToStandardPass::TypeContainsAzd(uint32_t type_id) const {
+bool HwLowerToStandardPass::TypeContainsHw(uint32_t type_id) const {
   if (type_id == 0) return false;
-  if (IsAzdType(type_id)) return true;
+  if (IsHwType(type_id)) return true;
 
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   if (!type) return false;
@@ -5376,12 +5380,12 @@ bool AzdLowerToStandardPass::TypeContainsAzd(uint32_t type_id) const {
     case spv::Op::OpTypePointer:
     case spv::Op::OpTypeArray:
     case spv::Op::OpTypeRuntimeArray:
-      return TypeContainsAzd(type->GetSingleWordInOperand(
+      return TypeContainsHw(type->GetSingleWordInOperand(
           type->opcode() == spv::Op::OpTypePointer ? 1 : 0));
     case spv::Op::OpTypeFunction:
     case spv::Op::OpTypeStruct:
       for (uint32_t i = 0; i < type->NumInOperands(); ++i) {
-        if (TypeContainsAzd(type->GetSingleWordInOperand(i))) return true;
+        if (TypeContainsHw(type->GetSingleWordInOperand(i))) return true;
       }
       return false;
     default:
@@ -5389,64 +5393,66 @@ bool AzdLowerToStandardPass::TypeContainsAzd(uint32_t type_id) const {
   }
 }
 
-bool AzdLowerToStandardPass::HasAzdTypeReference(
+bool HwLowerToStandardPass::HasHwTypeReference(
     const Instruction* inst) const {
   if (!inst) return false;
-  if (TypeContainsAzd(inst->type_id())) return true;
+  if (TypeContainsHw(inst->type_id())) return true;
   if (inst->result_id() != 0 && IsTypeInst(inst->opcode()) &&
-      TypeContainsAzd(inst->result_id())) {
+      TypeContainsHw(inst->result_id())) {
     return true;
   }
 
-  bool has_azd_type_ref = false;
-  inst->ForEachInId([this, &has_azd_type_ref](const uint32_t* id) {
-    if (has_azd_type_ref) return;
-    if (TypeContainsAzd(*id)) has_azd_type_ref = true;
+  bool has_hw_type_ref = false;
+  inst->ForEachInId([this, &has_hw_type_ref](const uint32_t* id) {
+    if (has_hw_type_ref) return;
+    if (TypeContainsHw(*id)) has_hw_type_ref = true;
   });
-  return has_azd_type_ref;
+  return has_hw_type_ref;
 }
 
-bool AzdLowerToStandardPass::IsAzdOpcode(spv::Op opcode) const {
+bool HwLowerToStandardPass::IsHwOpcode(spv::Op opcode) const {
   switch (opcode) {
-    case spv::Op::OpTypeCooperativeMatrixAZD:
-    case spv::Op::OpCooperativeMatrixLoadAZD:
-    case spv::Op::OpCooperativeMatrixStoreAZD:
-    case spv::Op::OpCooperativeMatrixMulAddAZD:
-    case spv::Op::OpCooperativeMatrixLengthAZD:
-    case spv::Op::OpCooperativeMatrixReduceAZD:
-    case spv::Op::OpTypeCooperativeVectorAZD:
-    case spv::Op::OpCooperativeVectorLoadAZD:
-    case spv::Op::OpCooperativeVectorStoreAZD:
-    case spv::Op::OpCooperativeVectorMatrixMulAZD:
-    case spv::Op::OpCooperativeVectorMatrixMulAddAZD:
+    case spv::Op::OpTypeCooperativeMatrixHW:
+    case spv::Op::OpCooperativeMatrixLoadHW:
+    case spv::Op::OpCooperativeMatrixStoreHW:
+    case spv::Op::OpCooperativeMatrixMulAddHW:
+    case spv::Op::OpCooperativeMatrixLengthHW:
+    case spv::Op::OpCooperativeMatrixReduceHW:
+    case spv::Op::OpTypeCooperativeVectorHW:
+    case spv::Op::OpCooperativeVectorLoadHW:
+    case spv::Op::OpCooperativeVectorStoreHW:
+    case spv::Op::OpCooperativeVectorMatrixMulHW:
+    case spv::Op::OpCooperativeVectorMatrixMulAddHW:
       return true;
     default:
       return false;
   }
 }
 
-bool AzdLowerToStandardPass::IsAzdCapabilityOrExtension(
+bool HwLowerToStandardPass::IsHwCapabilityOrExtension(
     const Instruction* inst) const {
   if (inst->opcode() == spv::Op::OpCapability) {
     const auto capability =
         static_cast<spv::Capability>(inst->GetSingleWordInOperand(0));
-    return capability == spv::Capability::CooperativeMatrixAZD ||
-           capability == spv::Capability::CooperativeVectorAZD;
+    return capability == spv::Capability::CooperativeMatrixHW ||
+           capability == spv::Capability::CooperativeVectorHW;
   }
   if (inst->opcode() == spv::Op::OpExtension) {
     const std::string extension = inst->GetInOperand(0).AsString();
     return extension == "SPV_AZD_neural_matrix" ||
-           extension == "SPV_AZD_cooperative_vector";
+           extension == "SPV_AZD_cooperative_vector" ||
+           extension == "SPV_HW_neural_shader";
   }
   if (inst->opcode() == spv::Op::OpSourceExtension) {
     const std::string extension = inst->GetInOperand(0).AsString();
     return extension == "GL_AZD_neural_matrix" ||
-           extension == "GL_AZD_cooperative_vector";
+           extension == "GL_AZD_cooperative_vector" ||
+           extension == "GL_HW_neural_shader";
   }
   return false;
 }
 
-bool AzdLowerToStandardPass::RemoveExtensionByName(const char* extension_name) {
+bool HwLowerToStandardPass::RemoveExtensionByName(const char* extension_name) {
   return context()->KillInstructionIf(
       get_module()->extension_begin(), get_module()->extension_end(),
       [extension_name](Instruction* inst) {
@@ -5455,7 +5461,7 @@ bool AzdLowerToStandardPass::RemoveExtensionByName(const char* extension_name) {
       });
 }
 
-bool AzdLowerToStandardPass::RemoveSourceExtensionByName(
+bool HwLowerToStandardPass::RemoveSourceExtensionByName(
     const char* extension_name) {
   return context()->KillInstructionIf(
       get_module()->debug1_begin(), get_module()->debug1_end(),
@@ -5465,7 +5471,7 @@ bool AzdLowerToStandardPass::RemoveSourceExtensionByName(
       });
 }
 
-void AzdLowerToStandardPass::RebuildAsCompositeConstruct(
+void HwLowerToStandardPass::RebuildAsCompositeConstruct(
     Instruction* inst, uint32_t type_id,
     const std::vector<uint32_t>& element_ids) {
   std::vector<Operand> operands;
@@ -5477,7 +5483,7 @@ void AzdLowerToStandardPass::RebuildAsCompositeConstruct(
   context()->UpdateDefUse(inst);
 }
 
-void AzdLowerToStandardPass::RebuildAsFunctionCall(
+void HwLowerToStandardPass::RebuildAsFunctionCall(
     Instruction* inst, uint32_t type_id, uint32_t function_id,
     const std::vector<uint32_t>& argument_ids) {
   std::vector<Operand> operands;
@@ -5490,7 +5496,7 @@ void AzdLowerToStandardPass::RebuildAsFunctionCall(
   context()->UpdateDefUse(inst);
 }
 
-void AzdLowerToStandardPass::ReportError(const Instruction*,
+void HwLowerToStandardPass::ReportError(const Instruction*,
                                          const std::string& message) const {
   if (!consumer()) return;
   consumer()(SPV_MSG_ERROR, "", {0, 0, 0}, message.c_str());
