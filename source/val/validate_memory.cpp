@@ -3077,16 +3077,16 @@ spv_result_t ValidateCooperativeVectorMatrixMulHW(ValidationState_t& _,
   }
 
   if (auto error = check_equal(result_type->GetOperandAs<uint32_t>(2u),
-                               matrix_type->GetOperandAs<uint32_t>(2u),
+                               matrix_type->GetOperandAs<uint32_t>(3u),
                                "result number of components",
-                               "matrix row count")) {
+                               "matrix column count")) {
     return error;
   }
 
   if (auto error = check_equal(input_type->GetOperandAs<uint32_t>(2u),
                                matrix_type->GetOperandAs<uint32_t>(2u),
                                "input number of components",
-                               "matrix first type parameter")) {
+                               "matrix row count")) {
     return error;
   }
 

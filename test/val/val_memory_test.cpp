@@ -8516,6 +8516,63 @@ OpCooperativeVectorReduceSumAccumulateNV %array_ptr %offset %f16c
               HasSubstr("OpCooperativeVectorReduceSumAccumulateNV V type <id> "
                         "'28[%v4half]' is not a cooperative vector type."));
 }
+
+std::string GenCoopVecHWShader(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_20 = OpConstant %u32 20
+%u32_100 = OpConstant %u32 100
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%input_vec = OpTypeCooperativeVectorHW %f16 %u32_100
+%result_vec = OpTypeCooperativeVectorHW %f32 %u32_20
+%bad_result_vec = OpTypeCooperativeVectorHW %f32 %u32_100
+%matrix = OpTypeCooperativeMatrixHW %f16 %u32_100 %u32_20 MatrixUseAHW
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+%input = OpUndef %input_vec
+%mat = OpUndef %matrix
+%bias = OpUndef %result_vec
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulSuccess) {
+  const std::string spirv = GenCoopVecHWShader(R"(
+%result0 = OpCooperativeVectorMatrixMulHW %result_vec %input %mat
+%result1 = OpCooperativeVectorMatrixMulAddHW %result_vec %input %mat %bias
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulResultColumnMismatchFail) {
+  const std::string spirv = GenCoopVecHWShader(R"(
+%result0 = OpCooperativeVectorMatrixMulHW %bad_result_vec %input %mat
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("CooperativeVectorMatrixMulHW result number of "
+                        "components 100 does not match matrix column count 20"));
+}
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
