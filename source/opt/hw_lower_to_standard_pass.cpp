@@ -3208,7 +3208,7 @@ uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
 bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
     InstructionBuilder* builder, const VectorTypeInfo& result,
     const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
-    const VectorTypeInfo* bias, uint32_t input_id, uint32_t matrix_id,
+    const VectorTypeInfo* /*bias*/, uint32_t input_id, uint32_t matrix_id,
     uint32_t bias_id, bool has_bias, std::vector<uint32_t>* element_ids) {
   element_ids->assign(result.packed_length, 0);
 
