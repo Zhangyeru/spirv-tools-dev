@@ -90,6 +90,9 @@ class HwLowerToStandardPass : public Pass {
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
+  bool TryLowerDirectMatrixMulAddPackedVec4(Instruction* inst, bool* handled);
+  bool TryLowerDirectVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias,
+                                               bool* handled);
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
@@ -163,6 +166,25 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t output_pointer_id, uint32_t output_pointer_type_id,
       const std::vector<Operand>& output_memory_operands);
+  uint32_t BuildDirectVectorMatmulFunctionPackedVec4(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+      uint32_t input_pointer_id, uint32_t input_pointer_type_id,
+      const std::vector<Operand>& input_memory_operands,
+      uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
+      uint32_t matrix_shape_id, uint32_t matrix_offset_id,
+      const std::vector<Operand>& matrix_memory_operands,
+      uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
+      const std::vector<Operand>& bias_memory_operands);
+  uint32_t BuildDirectMatmulFunctionPackedVec4(
+      const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c,
+      uint32_t a_pointer_id, uint32_t a_pointer_type_id, uint32_t a_shape_id,
+      uint32_t a_offset_id, const std::vector<Operand>& a_memory_operands,
+      uint32_t b_pointer_id, uint32_t b_pointer_type_id, uint32_t b_shape_id,
+      uint32_t b_offset_id, const std::vector<Operand>& b_memory_operands,
+      uint32_t c_pointer_id, uint32_t c_pointer_type_id, uint32_t c_shape_id,
+      uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands);
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
                                           uint32_t offset_id, uint32_t cols,
