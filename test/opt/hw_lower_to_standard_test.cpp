@@ -3027,6 +3027,323 @@ OpFunctionEnd
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
+TEST_F(HwLowerToStandardTest, DirectMatmulWithConstantB) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%float_2 = OpConstant %float 2
+%float_3 = OpConstant %float 3
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%const_b = OpConstantComposite %mat4x4
+  %float_1 %float_0 %float_0 %float_0
+  %float_0 %float_1 %float_0 %float_0
+  %float_0 %float_0 %float_1 %float_0
+  %float_0 %float_0 %float_0 %float_1
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%abuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %abuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat4x4 %abase %shape %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat4x4 %cbase %shape %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat4x4 %a %const_b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  // Direct path should be used: the matmul function has no parameters
+  // (the constant is accessed via OpAccessChain inside the function)
+  EXPECT_GE(CountSubstring(disassembly, "OpTypeFunction %_arr_v4float_uint_4"),
+            1u);
+  // Should have FMA operations
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  // Should have nested loops (row, col, k)
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 3u);
+  // Should have OpAccessChain to access the constant matrix
+  EXPECT_GT(CountSubstring(disassembly, "OpAccessChain"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, DirectMatmulWithConstantA) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%const_a = OpConstantComposite %mat4x4
+  %float_1 %float_0 %float_0 %float_0
+  %float_0 %float_1 %float_0 %float_0
+  %float_0 %float_0 %float_1 %float_0
+  %float_0 %float_0 %float_0 %float_1
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%bbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%b = OpCooperativeMatrixLoadHW %mat4x4 %bbase %shape %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat4x4 %cbase %shape %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat4x4 %const_a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  // Direct path should be used: the matmul function has no parameters
+  // (the constant is accessed via OpAccessChain inside the function)
+  EXPECT_GE(CountSubstring(disassembly, "OpTypeFunction %_arr_v4float_uint_4"),
+            1u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 3u);
+  // Should have OpAccessChain to access the constant matrix
+  EXPECT_GT(CountSubstring(disassembly, "OpAccessChain"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, DirectMatmulWithConstantC) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%const_c = OpConstantComposite %mat4x4
+  %float_0 %float_0 %float_0 %float_0
+  %float_0 %float_0 %float_0 %float_0
+  %float_0 %float_0 %float_0 %float_0
+  %float_0 %float_0 %float_0 %float_0
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%abuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat4x4 %abase %shape %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat4x4 %bbase %shape %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat4x4 %a %b %const_c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  // Direct path should be used: the matmul function has no parameters
+  // (the constant is accessed via OpAccessChain inside the function)
+  EXPECT_GE(CountSubstring(disassembly, "OpTypeFunction %_arr_v4float_uint_4"),
+            1u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 3u);
+  // Should have OpAccessChain to access the constant matrix
+  EXPECT_GT(CountSubstring(disassembly, "OpAccessChain"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, DirectVectorMatmulWithConstantMatrix) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_8 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%mat8x4 = OpTypeCooperativeMatrixHW %float %uint_8 %uint_4
+%const_w = OpConstantComposite %mat8x4
+  %float_1 %float_0 %float_0 %float_0
+  %float_0 %float_1 %float_0 %float_0
+  %float_0 %float_0 %float_1 %float_0
+  %float_0 %float_0 %float_0 %float_1
+  %float_1 %float_0 %float_0 %float_0
+  %float_0 %float_1 %float_0 %float_0
+  %float_0 %float_0 %float_1 %float_0
+  %float_0 %float_0 %float_0 %float_1
+%const_bias = OpConstantComposite %vec4 %float_0 %float_0 %float_0 %float_0
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%xbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%xbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %xbuf %int_0
+%x = OpCooperativeVectorLoadHW %vec8 %xbase %int_0
+%y = OpCooperativeVectorMatrixMulAddHW %vec4 %x %const_w %const_bias
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  // Direct path should be used: the matmul function has no parameters
+  // (the constant is accessed via OpAccessChain inside the function)
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  // Should have nested loops
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 2u);
+  // Should have OpAccessChain to access the constant
+  EXPECT_GT(CountSubstring(disassembly, "OpAccessChain"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, DirectVectorMatmulWithConstantInput) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%float_1 = OpConstant %float 1
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_8 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%mat8x4 = OpTypeCooperativeMatrixHW %float %uint_8 %uint_4
+%const_x = OpConstantComposite %vec8
+  %float_1 %float_1 %float_1 %float_1 %float_1 %float_1 %float_1 %float_1
+%const_bias = OpConstantComposite %vec4 %float_0 %float_0 %float_0 %float_0
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%wbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%wbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %wbuf %int_0
+%w = OpCooperativeMatrixLoadHW %mat8x4 %wbase %shape %offset %int_0
+%y = OpCooperativeVectorMatrixMulAddHW %vec4 %const_x %w %const_bias
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  // Direct path should be used: the matmul function has no parameters
+  // (the constant is accessed via OpAccessChain inside the function)
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  // Should have nested loops
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 2u);
+  // Should have OpAccessChain to access the constant
+  EXPECT_GT(CountSubstring(disassembly, "OpAccessChain"), 0u);
+}
+
 TEST_F(HwLowerToStandardTest, FailsForUnsupportedMatrixReduce) {
   const std::string text = R"(
 ; CHECK: OpCooperativeMatrixReduceHW is not supported

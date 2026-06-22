@@ -188,9 +188,11 @@ class HwLowerToStandardPass : public Pass {
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
       uint32_t input_pointer_id, uint32_t input_pointer_type_id,
       const std::vector<Operand>& input_memory_operands,
+      uint32_t input_constant_id, bool input_is_value,
       uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
       uint32_t matrix_shape_id, uint32_t matrix_offset_id,
       const std::vector<Operand>& matrix_memory_operands,
+      uint32_t matrix_constant_id, bool matrix_is_value,
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
       const std::vector<Operand>& bias_memory_operands,
       uint32_t bias_constant_id, bool bias_is_value);
@@ -199,10 +201,13 @@ class HwLowerToStandardPass : public Pass {
       const MatrixTypeInfo& b, const MatrixTypeInfo& c,
       uint32_t a_pointer_id, uint32_t a_pointer_type_id, uint32_t a_shape_id,
       uint32_t a_offset_id, const std::vector<Operand>& a_memory_operands,
+      uint32_t a_constant_id, bool a_is_value,
       uint32_t b_pointer_id, uint32_t b_pointer_type_id, uint32_t b_shape_id,
       uint32_t b_offset_id, const std::vector<Operand>& b_memory_operands,
+      uint32_t b_constant_id, bool b_is_value,
       uint32_t c_pointer_id, uint32_t c_pointer_type_id, uint32_t c_shape_id,
-      uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands);
+      uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands,
+      uint32_t c_constant_id, bool c_is_value);
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
                                           uint32_t offset_id, uint32_t cols,
@@ -362,6 +367,8 @@ class HwLowerToStandardPass : public Pass {
   void RebuildAsFunctionCall(Instruction* inst, uint32_t type_id,
                              uint32_t function_id,
                              const std::vector<uint32_t>& argument_ids);
+  uint32_t GetOrCreateModuleConstantFromCompositeConstruct(
+      Instruction* composite_construct);
   void ReportError(const Instruction* inst, const std::string& message) const;
 
   std::unordered_map<uint32_t, MatrixTypeInfo> matrix_types_;
