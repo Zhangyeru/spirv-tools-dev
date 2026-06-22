@@ -435,6 +435,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       switch (inst->opcode()) {
         case spv::Op::OpUndef:
         case spv::Op::OpConstantNull:
+        case spv::Op::OpConstantComposite:
         case spv::Op::OpVariable:
         case spv::Op::OpLoad:
         case spv::Op::OpStore:
@@ -571,6 +572,9 @@ bool HwLowerToStandardPass::LowerHwInstructions(
       case spv::Op::OpCompositeConstruct:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
+      case spv::Op::OpConstantComposite:
+        if (IsHwType(inst->type_id())) worklist.push_back(inst);
+        break;
       case spv::Op::OpCompositeExtract:
         worklist.push_back(inst);
         break;
@@ -615,6 +619,9 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         break;
       case spv::Op::OpCompositeConstruct:
         ok = LowerCompositeConstruct(inst);
+        break;
+      case spv::Op::OpConstantComposite:
+        ok = LowerConstantComposite(inst);
         break;
       case spv::Op::OpCompositeExtract:
         ok = LowerCompositeExtract(inst);
@@ -1866,9 +1873,33 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   DirectMatrixLoadCandidate direct_matrix;
   DirectVectorLoadCandidate direct_bias;
   if (!resolve_vector_load(input_inst, &direct_input) ||
-      !resolve_matrix_load(matrix_inst, &direct_matrix) ||
-      (has_bias && !resolve_vector_load(bias_inst, &direct_bias))) {
+      !resolve_matrix_load(matrix_inst, &direct_matrix)) {
     return true;
+  }
+
+  bool bias_is_value = false;
+  if (has_bias) {
+    if (resolve_vector_load(bias_inst, &direct_bias)) {
+      // Bias comes from a buffer load (existing path)
+      bias_is_value = false;
+    } else {
+      // Try to trace back to find the actual source
+      std::vector<Instruction*> bias_chain;
+      Instruction* bias_source = TraceFunctionValueSource(bias_inst, inst, &bias_chain);
+      if (bias_source &&
+          (bias_source->opcode() == spv::Op::OpConstantComposite ||
+           bias_source->opcode() == spv::Op::OpConstantNull ||
+           bias_source->opcode() == spv::Op::OpUndef ||
+           bias_source->opcode() == spv::Op::OpCompositeConstruct)) {
+        // Bias is a value (constant composite, composite construct, null, undef)
+        bias_is_value = true;
+        // Use the traced source as the bias instruction
+        bias_inst = bias_source;
+      } else {
+        // Unknown bias source; cannot handle in direct path
+        return true;
+      }
+    }
   }
 
   std::vector<Instruction*> kill_list;
@@ -1880,7 +1911,7 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   for (Instruction* kill : direct_matrix.chain) add_kill(kill);
   add_kill(direct_input.source_load);
   add_kill(direct_matrix.source_load);
-  if (has_bias) {
+  if (has_bias && !bias_is_value) {
     for (Instruction* kill : direct_bias.chain) add_kill(kill);
     add_kill(direct_bias.source_load);
   }
@@ -1891,12 +1922,19 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       direct_input.pointer_type_id, direct_input.memory_operands,
       direct_matrix.pointer_id, direct_matrix.pointer_type_id,
       direct_matrix.shape_id, direct_matrix.offset_id,
-      direct_matrix.memory_operands, has_bias ? direct_bias.pointer_id : 0,
-      has_bias ? direct_bias.pointer_type_id : 0,
-      has_bias ? direct_bias.memory_operands : std::vector<Operand>{});
+      direct_matrix.memory_operands,
+      (has_bias && !bias_is_value) ? direct_bias.pointer_id : 0,
+      (has_bias && !bias_is_value) ? direct_bias.pointer_type_id : 0,
+      (has_bias && !bias_is_value) ? direct_bias.memory_operands
+                                   : std::vector<Operand>{},
+      bias_is_value);
   if (function_id == 0) return false;
 
-  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, {});
+  std::vector<uint32_t> call_args;
+  if (has_bias && bias_is_value) {
+    call_args.push_back(bias_inst->result_id());
+  }
+  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, call_args);
   for (Instruction* kill : kill_list) {
     if (!kill->IsNop()) context()->KillInst(kill);
   }
@@ -2139,6 +2177,124 @@ bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
     element_ids[pack] = vec->result_id();
   }
   RebuildAsCompositeConstruct(inst, vector->lowered_type_id, element_ids);
+  return true;
+}
+
+bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
+  const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
+  const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+  if (!matrix && !vector) {
+    ReportError(inst, "invalid HW OpConstantComposite result type");
+    return false;
+  }
+
+  const uint32_t component_type_id =
+      matrix ? matrix->component_type_id : vector->component_type_id;
+  const uint32_t expected_operands =
+      matrix ? matrix->rows * matrix->cols : vector->length;
+
+  std::vector<uint32_t> scalar_ids;
+  auto append_scalar_constants =
+      [this, component_type_id](Instruction* operand,
+                                std::vector<uint32_t>* out) {
+        if (!operand || !out) return false;
+        if (operand->type_id() == component_type_id) {
+          out->push_back(operand->result_id());
+          return true;
+        }
+        if (operand->opcode() != spv::Op::OpConstantComposite) {
+          return false;
+        }
+        for (uint32_t i = 0; i < operand->NumInOperands(); ++i) {
+          Instruction* nested =
+              get_def_use_mgr()->GetDef(operand->GetSingleWordInOperand(i));
+          if (!nested || nested->type_id() != component_type_id) {
+            return false;
+          }
+          out->push_back(nested->result_id());
+        }
+        return true;
+      };
+
+  for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+    Instruction* operand =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(i));
+    if (!append_scalar_constants(operand, &scalar_ids)) {
+      ReportError(inst, "unsupported HW OpConstantComposite operand");
+      return false;
+    }
+  }
+
+  if (scalar_ids.size() == 1 && expected_operands > 1) {
+    scalar_ids.resize(expected_operands, scalar_ids[0]);
+  }
+  if (scalar_ids.size() != expected_operands) {
+    ReportError(inst, "HW OpConstantComposite operand count is invalid");
+    return false;
+  }
+
+  if ((matrix && !IsPackedVec4(*matrix)) || (vector && !IsPackedVec4(*vector))) {
+    std::vector<Operand> operands;
+    operands.reserve(scalar_ids.size());
+    for (uint32_t id : scalar_ids) operands.push_back(IdOperand(id));
+    inst->SetResultType(matrix ? matrix->lowered_type_id
+                               : vector->lowered_type_id);
+    inst->SetInOperands(std::move(operands));
+    context()->UpdateDefUse(inst);
+    return true;
+  }
+
+  Instruction* insert_after = nullptr;
+  for (Instruction& candidate : get_module()->types_values()) {
+    const uint32_t candidate_id = candidate.result_id();
+    if (candidate_id == 0) continue;
+    if (std::find(scalar_ids.begin(), scalar_ids.end(), candidate_id) !=
+        scalar_ids.end()) {
+      insert_after = &candidate;
+    }
+  }
+  if (!insert_after) {
+    ReportError(inst, "invalid HW OpConstantComposite constituent");
+    return false;
+  }
+
+  std::vector<uint32_t> element_ids;
+  if (matrix) {
+    element_ids.resize(matrix->rows * matrix->packed_cols, 0);
+    for (uint32_t row = 0; row < matrix->rows; ++row) {
+      for (uint32_t col_pack = 0; col_pack < matrix->packed_cols; ++col_pack) {
+        std::vector<uint32_t> lane_ids;
+        lane_ids.reserve(kPackedVec4Width);
+        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+          lane_ids.push_back(scalar_ids[MatrixFlatIndex(
+              *matrix, row, col_pack * kPackedVec4Width + lane)]);
+        }
+        const uint32_t element_id = GetOrCreateCompositeConstant(
+            matrix->packed_vec4_type_id, lane_ids, &insert_after);
+        if (element_id == 0) return false;
+        element_ids[MatrixPackedIndex(*matrix, row, col_pack)] = element_id;
+      }
+    }
+  } else {
+    element_ids.resize(vector->packed_length, 0);
+    for (uint32_t pack = 0; pack < vector->packed_length; ++pack) {
+      std::vector<uint32_t> lane_ids;
+      lane_ids.reserve(kPackedVec4Width);
+      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+        lane_ids.push_back(scalar_ids[pack * kPackedVec4Width + lane]);
+      }
+      element_ids[pack] = GetOrCreateCompositeConstant(
+          vector->packed_vec4_type_id, lane_ids, &insert_after);
+      if (element_ids[pack] == 0) return false;
+    }
+  }
+
+  std::vector<Operand> operands;
+  operands.reserve(element_ids.size());
+  for (uint32_t id : element_ids) operands.push_back(IdOperand(id));
+  inst->SetResultType(matrix ? matrix->lowered_type_id : vector->lowered_type_id);
+  inst->SetInOperands(std::move(operands));
+  context()->UpdateDefUse(inst);
   return true;
 }
 
@@ -2470,6 +2626,39 @@ uint32_t HwLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
   context()->AddGlobalValue(
       MakeUnique<Instruction>(context(), spv::Op::OpConstantNull, type_id,
                               result_id, std::initializer_list<Operand>{}));
+  return result_id;
+}
+
+uint32_t HwLowerToStandardPass::GetOrCreateCompositeConstant(
+    uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
+    Instruction** insert_after) {
+  for (Instruction& inst : get_module()->types_values()) {
+    if (inst.opcode() != spv::Op::OpConstantComposite ||
+        inst.type_id() != type_id ||
+        inst.NumInOperands() != constituent_ids.size()) {
+      continue;
+    }
+    bool matches = true;
+    for (uint32_t i = 0; i < constituent_ids.size(); ++i) {
+      if (inst.GetSingleWordInOperand(i) != constituent_ids[i]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return inst.result_id();
+  }
+
+  const uint32_t result_id = TakeNextId();
+  if (result_id == 0) return 0;
+  std::vector<Operand> operands;
+  operands.reserve(constituent_ids.size());
+  for (uint32_t id : constituent_ids) operands.push_back(IdOperand(id));
+  Instruction* added = AddTypeOrGlobalAfter(
+      context(), insert_after ? *insert_after : nullptr,
+      MakeUnique<Instruction>(context(), spv::Op::OpConstantComposite, type_id,
+                              result_id, operands));
+  if (!added) return 0;
+  if (insert_after) *insert_after = added;
   return result_id;
 }
 
@@ -3972,7 +4161,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     uint32_t matrix_shape_id, uint32_t matrix_offset_id,
     const std::vector<Operand>& matrix_memory_operands,
     uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
-    const std::vector<Operand>& bias_memory_operands) {
+    const std::vector<Operand>& bias_memory_operands,
+    bool bias_is_value) {
   if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
       input.length != matrix.rows || result.length != matrix.cols ||
       (has_bias && (!bias || !IsPackedVec4(*bias)))) {
@@ -3981,7 +4171,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   if (input_pointer_id == 0 || input_pointer_type_id == 0 ||
       matrix_pointer_id == 0 || matrix_pointer_type_id == 0 ||
       matrix_shape_id == 0 || matrix_offset_id == 0 ||
-      (has_bias && (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
+      (has_bias && !bias_is_value &&
+       (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
     return 0;
   }
 
@@ -3992,13 +4183,18 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
       matrix_pointer_id, matrix_pointer_type_id, matrix.component_type_id,
       matrix.packed_vec4_type_id, matrix_memory_operands);
   const uint32_t bias_load_function_id =
-      has_bias ? GetOrCreatePackedLoadChunkFunction(
-                     bias_pointer_id, bias_pointer_type_id,
-                     bias->component_type_id, bias->packed_vec4_type_id,
-                     bias_memory_operands)
-               : 0;
+      (has_bias && !bias_is_value)
+          ? GetOrCreatePackedLoadChunkFunction(
+                bias_pointer_id, bias_pointer_type_id,
+                bias->component_type_id, bias->packed_vec4_type_id,
+                bias_memory_operands)
+          : 0;
+  std::vector<uint32_t> param_type_ids;
+  if (has_bias && bias_is_value) {
+    param_type_ids.push_back(bias->lowered_type_id);
+  }
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(result.lowered_type_id, {});
+      GetOrCreateFunctionType(result.lowered_type_id, param_type_ids);
   const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
       result.packed_vec4_type_id, spv::StorageClass::Function);
   const uint32_t lowered_function_ptr_type_id = GetOrCreatePointerType(
@@ -4017,12 +4213,13 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   const uint32_t matrix_cols_id = GetOrCreateUIntConstant(matrix.cols);
   const uint32_t zero4_id = GetOrCreateZero(result.packed_vec4_type_id);
   if (input_load_function_id == 0 || matrix_load_function_id == 0 ||
-      (has_bias && bias_load_function_id == 0) || function_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || lowered_function_ptr_type_id == 0 ||
-      uint_type_id == 0 || uint_function_ptr_type_id == 0 ||
-      bool_type_id == 0 || zero_uint_id == 0 || one_uint_id == 0 ||
-      four_uint_id == 0 || result_packed_length_id == 0 ||
-      input_packed_length_id == 0 || matrix_cols_id == 0 || zero4_id == 0) {
+      (has_bias && !bias_is_value && bias_load_function_id == 0) ||
+      function_type_id == 0 || vec4_function_ptr_type_id == 0 ||
+      lowered_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      uint_function_ptr_type_id == 0 || bool_type_id == 0 ||
+      zero_uint_id == 0 || one_uint_id == 0 || four_uint_id == 0 ||
+      result_packed_length_id == 0 || input_packed_length_id == 0 ||
+      matrix_cols_id == 0 || zero4_id == 0) {
     return 0;
   }
 
@@ -4035,6 +4232,15 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   function_start->AddOperand(IdOperand(function_type_id));
   std::unique_ptr<Function> function =
       MakeUnique<Function>(std::move(function_start));
+
+  uint32_t bias_param_id = 0;
+  if (has_bias && bias_is_value) {
+    bias_param_id = TakeNextId();
+    if (bias_param_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, bias->lowered_type_id,
+        bias_param_id, std::initializer_list<Operand>{}));
+  }
 
   const uint32_t entry_label_id = TakeNextId();
   const uint32_t out_header_label_id = TakeNextId();
@@ -4097,6 +4303,19 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   for (Instruction* acc_var : acc_vars) {
     if (!acc_var) return 0;
   }
+
+  Instruction* bias_var = nullptr;
+  if (has_bias && bias_is_value) {
+    const uint32_t bias_function_ptr_type_id = GetOrCreatePointerType(
+        bias->lowered_type_id, spv::StorageClass::Function);
+    if (bias_function_ptr_type_id == 0) return 0;
+    bias_var = entry_builder.AddVariable(
+        bias_function_ptr_type_id,
+        static_cast<uint32_t>(spv::StorageClass::Function));
+    if (!bias_var) return 0;
+    if (!entry_builder.AddStore(bias_var->result_id(), bias_param_id)) return 0;
+  }
+
   if (!entry_builder.AddStore(out_pack_var->result_id(), zero_uint_id) ||
       !entry_builder.AddBranch(out_header_label_id)) {
     return 0;
@@ -4229,18 +4448,33 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
       result.packed_vec4_type_id, lane_ids);
   if (!result_vec) return 0;
   if (has_bias) {
-    Instruction* bias_base = k_merge_builder.AddBinaryOp(
-        uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(),
-        four_uint_id);
-    if (!bias_base) return 0;
-    Instruction* bias_vec = k_merge_builder.AddFunctionCall(
-        bias->packed_vec4_type_id, bias_load_function_id,
-        {bias_base->result_id()});
-    if (!bias_vec) return 0;
+    uint32_t bias_vec_id = 0;
+    if (bias_is_value) {
+      // Extract bias pack from the function parameter via local variable
+      Instruction* bias_vec_ptr = k_merge_builder.AddAccessChain(
+          vec4_function_ptr_type_id, bias_var->result_id(),
+          {out_pack_load->result_id()});
+      if (!bias_vec_ptr) return 0;
+      Instruction* bias_vec = k_merge_builder.AddLoad(
+          bias->packed_vec4_type_id, bias_vec_ptr->result_id());
+      if (!bias_vec) return 0;
+      bias_vec_id = bias_vec->result_id();
+    } else {
+      // Load bias pack from buffer via load helper function
+      Instruction* bias_base = k_merge_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(),
+          four_uint_id);
+      if (!bias_base) return 0;
+      Instruction* bias_vec = k_merge_builder.AddFunctionCall(
+          bias->packed_vec4_type_id, bias_load_function_id,
+          {bias_base->result_id()});
+      if (!bias_vec) return 0;
+      bias_vec_id = bias_vec->result_id();
+    }
     result_vec = k_merge_builder.AddBinaryOp(result.packed_vec4_type_id,
                                              spv::Op::OpFAdd,
                                              result_vec->result_id(),
-                                             bias_vec->result_id());
+                                             bias_vec_id);
     if (!result_vec) return 0;
   }
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(

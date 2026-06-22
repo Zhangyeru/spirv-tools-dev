@@ -2148,13 +2148,17 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
 
   const auto storage_class =
       pointer_type->GetOperandAs<spv::StorageClass>(1u);
+  const bool allow_uniform =
+      inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW;
   if (storage_class != spv::StorageClass::Workgroup &&
       storage_class != spv::StorageClass::StorageBuffer &&
-      storage_class != spv::StorageClass::PhysicalStorageBuffer) {
+      storage_class != spv::StorageClass::PhysicalStorageBuffer &&
+      (!allow_uniform || storage_class != spv::StorageClass::Uniform)) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opname << " storage class for pointer type <id> "
            << _.getIdName(pointer_type_id)
-           << " is not Workgroup or StorageBuffer.";
+           << (allow_uniform ? " is not Workgroup, Uniform, or StorageBuffer."
+                             : " is not Workgroup or StorageBuffer.");
   }
 
   const auto pointee_id = pointer_type->GetOperandAs<uint32_t>(2);
@@ -2590,14 +2594,17 @@ spv_result_t ValidateCooperativeVectorPointer(ValidationState_t& _,
   const auto storage_class_index = 1u;
   const auto storage_class =
       pointer_type->GetOperandAs<spv::StorageClass>(storage_class_index);
-
+  const bool allow_uniform =
+      inst->opcode() == spv::Op::OpCooperativeVectorLoadHW;
   if (storage_class != spv::StorageClass::Workgroup &&
       storage_class != spv::StorageClass::StorageBuffer &&
-      storage_class != spv::StorageClass::PhysicalStorageBuffer) {
+      storage_class != spv::StorageClass::PhysicalStorageBuffer &&
+      (!allow_uniform || storage_class != spv::StorageClass::Uniform)) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opname << " storage class for pointer type <id> "
            << _.getIdName(pointer_type_id)
-           << " is not Workgroup or StorageBuffer.";
+           << (allow_uniform ? " is not Workgroup, Uniform, or StorageBuffer."
+                             : " is not Workgroup or StorageBuffer.");
   }
 
   const auto pointee_id = pointer_type->GetOperandAs<uint32_t>(2);

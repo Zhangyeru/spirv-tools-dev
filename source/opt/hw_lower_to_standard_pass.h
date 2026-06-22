@@ -97,6 +97,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
+  bool LowerConstantComposite(Instruction* inst);
   bool LowerCompositeConstruct(Instruction* inst);
   bool LowerCompositeExtract(Instruction* inst);
   bool LowerNullOrUndef(Instruction* inst);
@@ -120,6 +121,9 @@ class HwLowerToStandardPass : public Pass {
                                         Instruction** insert_after);
   uint32_t GetOrCreateConstant(uint32_t type_id, uint32_t value);
   uint32_t GetOrCreateZero(uint32_t type_id);
+  uint32_t GetOrCreateCompositeConstant(
+      uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
+      Instruction** insert_after);
   uint32_t BuildPairComponentAsUInt(InstructionBuilder* builder,
                                     Instruction* user, uint32_t pair_id,
                                     uint32_t component_index);
@@ -188,7 +192,8 @@ class HwLowerToStandardPass : public Pass {
       uint32_t matrix_shape_id, uint32_t matrix_offset_id,
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
-      const std::vector<Operand>& bias_memory_operands);
+      const std::vector<Operand>& bias_memory_operands,
+      bool bias_is_value = false);
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c,

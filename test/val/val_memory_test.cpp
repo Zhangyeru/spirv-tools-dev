@@ -8573,6 +8573,125 @@ TEST_F(ValidateMemory, CoopVecHWMatMulResultColumnMismatchFail) {
               HasSubstr("CooperativeVectorMatrixMulHW result number of "
                         "components 100 does not match matrix column count 20"));
 }
+
+TEST_F(ValidateMemory, CoopMatHWLoadFromUniformSuccess) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%f32 = OpTypeFloat 32
+%shape_type = OpTypeVector %u32 2
+%shape = OpConstantComposite %shape_type %u32_4 %u32_4
+%offset = OpConstantComposite %shape_type %u32_0 %u32_0
+%mat = OpTypeCooperativeMatrixHW %f32 %u32_4 %u32_4
+%arr = OpTypeArray %f32 %u32_4
+%Buf = OpTypeStruct %arr
+%ptr_uniform_buf = OpTypePointer Uniform %Buf
+%ptr_uniform_arr = OpTypePointer Uniform %arr
+%buf = OpVariable %ptr_uniform_buf Uniform
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_uniform_arr %buf %i32_0
+%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %i32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopVecHWLoadFromUniformSuccess) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_8 = OpConstant %u32 8
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%f32 = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %f32 %u32_8
+%arr = OpTypeArray %f32 %u32_8
+%Buf = OpTypeStruct %arr
+%ptr_uniform_buf = OpTypePointer Uniform %Buf
+%ptr_uniform_arr = OpTypePointer Uniform %arr
+%buf = OpVariable %ptr_uniform_buf Uniform
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_uniform_arr %buf %i32_0
+%value = OpCooperativeVectorLoadHW %vec %base %i32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopMatHWStoreToUniformStillFails) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%f32 = OpTypeFloat 32
+%shape_type = OpTypeVector %u32 2
+%shape = OpConstantComposite %shape_type %u32_4 %u32_4
+%offset = OpConstantComposite %shape_type %u32_0 %u32_0
+%mat = OpTypeCooperativeMatrixHW %f32 %u32_4 %u32_4
+%arr = OpTypeArray %f32 %u32_4
+%Buf = OpTypeStruct %arr
+%ptr_uniform_buf = OpTypePointer Uniform %Buf
+%ptr_uniform_arr = OpTypePointer Uniform %arr
+%buf = OpVariable %ptr_uniform_buf Uniform
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_uniform_arr %buf %i32_0
+%value = OpUndef %mat
+OpCooperativeMatrixStoreHW %base %value %shape %offset %i32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("is not Workgroup or StorageBuffer"));
+}
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
