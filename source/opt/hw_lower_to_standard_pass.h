@@ -90,6 +90,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
+  bool TryLowerFusedMatrixMatmulStore(Instruction* inst, bool* handled);
   bool TryLowerDirectMatrixMulAddPackedVec4(Instruction* inst, bool* handled);
   bool TryLowerDirectVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias,
                                                bool* handled);
@@ -165,6 +166,18 @@ class HwLowerToStandardPass : public Pass {
       uint32_t matrix_shape_id, uint32_t matrix_offset_id,
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t output_pointer_id, uint32_t output_pointer_type_id,
+      const std::vector<Operand>& output_memory_operands);
+  uint32_t BuildFusedMatrixMatmulStoreFunctionPackedVec4(
+      const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c,
+      uint32_t a_pointer_id, uint32_t a_pointer_type_id, uint32_t a_shape_id,
+      uint32_t a_offset_id, const std::vector<Operand>& a_memory_operands,
+      uint32_t b_pointer_id, uint32_t b_pointer_type_id, uint32_t b_shape_id,
+      uint32_t b_offset_id, const std::vector<Operand>& b_memory_operands,
+      uint32_t c_pointer_id, uint32_t c_pointer_type_id, uint32_t c_shape_id,
+      uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands,
+      uint32_t output_pointer_id, uint32_t output_pointer_type_id,
+      uint32_t output_shape_id, uint32_t output_offset_id,
       const std::vector<Operand>& output_memory_operands);
   uint32_t BuildDirectVectorMatmulFunctionPackedVec4(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
