@@ -956,6 +956,7 @@ OpDecorate %Buf Block
 %vec4 = OpTypeCooperativeVectorHW %float %uint_4
 %vec8 = OpTypeCooperativeVectorHW %float %uint_8
 %mat8x4 = OpTypeCooperativeMatrixHW %float %uint_8 %uint_4
+%bias = OpConstantComposite %vec4 %float_n3q %float_n2q %float_n1q %float_0
 %_runtimearr_float = OpTypeRuntimeArray %float
 %Buf = OpTypeStruct %_runtimearr_float
 %_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
@@ -970,7 +971,6 @@ OpDecorate %Buf Block
 %wbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %wbuf %int_0
 %x = OpCooperativeVectorLoadHW %vec8 %xbase %int_0
 %w = OpCooperativeMatrixLoadHW %mat8x4 %wbase %shape %offset %int_0
-%bias = OpCompositeConstruct %vec4 %float_n3q %float_n2q %float_n1q %float_0
 %y = OpCooperativeVectorMatrixMulAddHW %vec4 %x %w %bias
 OpReturn
 OpFunctionEnd

@@ -1889,14 +1889,14 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       if (bias_source &&
           (bias_source->opcode() == spv::Op::OpConstantComposite ||
            bias_source->opcode() == spv::Op::OpConstantNull ||
-           bias_source->opcode() == spv::Op::OpUndef ||
-           bias_source->opcode() == spv::Op::OpCompositeConstruct)) {
-        // Bias is a value (constant composite, composite construct, null, undef)
+           bias_source->opcode() == spv::Op::OpUndef)) {
+        // Bias is a module-level constant (can be accessed from any function)
         bias_is_value = true;
         // Use the traced source as the bias instruction
         bias_inst = bias_source;
       } else {
-        // Unknown bias source; cannot handle in direct path
+        // Unknown bias source or function-scope value (e.g. OpCompositeConstruct);
+        // cannot handle in direct path
         return true;
       }
     }
@@ -1927,14 +1927,10 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       (has_bias && !bias_is_value) ? direct_bias.pointer_type_id : 0,
       (has_bias && !bias_is_value) ? direct_bias.memory_operands
                                    : std::vector<Operand>{},
-      bias_is_value);
+      bias_is_value ? bias_inst->result_id() : 0, bias_is_value);
   if (function_id == 0) return false;
 
-  std::vector<uint32_t> call_args;
-  if (has_bias && bias_is_value) {
-    call_args.push_back(bias_inst->result_id());
-  }
-  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, call_args);
+  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, {});
   for (Instruction* kill : kill_list) {
     if (!kill->IsNop()) context()->KillInst(kill);
   }
@@ -2244,12 +2240,20 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     return true;
   }
 
+  // Find insertion point that is after both the scalar constants AND the
+  // packed_vec4_type_id (which may have been created after the scalars).
+  // Track which appears last in the module order.
   Instruction* insert_after = nullptr;
+  const uint32_t packed_vec4_type_id =
+      matrix ? matrix->packed_vec4_type_id : vector->packed_vec4_type_id;
   for (Instruction& candidate : get_module()->types_values()) {
     const uint32_t candidate_id = candidate.result_id();
     if (candidate_id == 0) continue;
-    if (std::find(scalar_ids.begin(), scalar_ids.end(), candidate_id) !=
-        scalar_ids.end()) {
+    // Update insert_after whenever we see a scalar or the packed vec4 type.
+    // Since we iterate in module order, the last match will be the later one.
+    if (candidate_id == packed_vec4_type_id ||
+        std::find(scalar_ids.begin(), scalar_ids.end(), candidate_id) !=
+            scalar_ids.end()) {
       insert_after = &candidate;
     }
   }
@@ -4162,7 +4166,7 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     const std::vector<Operand>& matrix_memory_operands,
     uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
     const std::vector<Operand>& bias_memory_operands,
-    bool bias_is_value) {
+    uint32_t bias_constant_id, bool bias_is_value) {
   if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
       input.length != matrix.rows || result.length != matrix.cols ||
       (has_bias && (!bias || !IsPackedVec4(*bias)))) {
@@ -4172,7 +4176,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
       matrix_pointer_id == 0 || matrix_pointer_type_id == 0 ||
       matrix_shape_id == 0 || matrix_offset_id == 0 ||
       (has_bias && !bias_is_value &&
-       (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
+       (bias_pointer_id == 0 || bias_pointer_type_id == 0)) ||
+      (has_bias && bias_is_value && bias_constant_id == 0)) {
     return 0;
   }
 
@@ -4189,12 +4194,9 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
                 bias->component_type_id, bias->packed_vec4_type_id,
                 bias_memory_operands)
           : 0;
-  std::vector<uint32_t> param_type_ids;
-  if (has_bias && bias_is_value) {
-    param_type_ids.push_back(bias->lowered_type_id);
-  }
+  // Function always takes 0 parameters - constants are accessed directly
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(result.lowered_type_id, param_type_ids);
+      GetOrCreateFunctionType(result.lowered_type_id, {});
   const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
       result.packed_vec4_type_id, spv::StorageClass::Function);
   const uint32_t lowered_function_ptr_type_id = GetOrCreatePointerType(
@@ -4232,15 +4234,6 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   function_start->AddOperand(IdOperand(function_type_id));
   std::unique_ptr<Function> function =
       MakeUnique<Function>(std::move(function_start));
-
-  uint32_t bias_param_id = 0;
-  if (has_bias && bias_is_value) {
-    bias_param_id = TakeNextId();
-    if (bias_param_id == 0) return 0;
-    function->AddParameter(MakeUnique<Instruction>(
-        context(), spv::Op::OpFunctionParameter, bias->lowered_type_id,
-        bias_param_id, std::initializer_list<Operand>{}));
-  }
 
   const uint32_t entry_label_id = TakeNextId();
   const uint32_t out_header_label_id = TakeNextId();
@@ -4313,7 +4306,7 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
         bias_function_ptr_type_id,
         static_cast<uint32_t>(spv::StorageClass::Function));
     if (!bias_var) return 0;
-    if (!entry_builder.AddStore(bias_var->result_id(), bias_param_id)) return 0;
+    if (!entry_builder.AddStore(bias_var->result_id(), bias_constant_id)) return 0;
   }
 
   if (!entry_builder.AddStore(out_pack_var->result_id(), zero_uint_id) ||

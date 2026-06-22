@@ -193,7 +193,7 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
       const std::vector<Operand>& bias_memory_operands,
-      bool bias_is_value = false);
+      uint32_t bias_constant_id, bool bias_is_value);
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c,
