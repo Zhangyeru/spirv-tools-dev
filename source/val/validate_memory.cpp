@@ -76,13 +76,6 @@ bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
   return IsScalarOrVectorNumericArrayType(_, element_type_id);
 }
 
-bool IsFloat2Type(ValidationState_t& _, uint32_t type_id) {
-  const auto* type = _.FindDef(type_id);
-  return type && type->opcode() == spv::Op::OpTypeVector &&
-         type->word(3) == 2 && _.IsFloatScalarType(type->word(2)) &&
-         _.GetBitWidth(type->word(2)) == 32;
-}
-
 bool IsInt2Type(ValidationState_t& _, uint32_t type_id) {
   const auto* type = _.FindDef(type_id);
   return type && type->opcode() == spv::Op::OpTypeVector &&
