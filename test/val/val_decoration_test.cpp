@@ -7305,7 +7305,7 @@ TEST_F(ValidateDecorations, ComponentDecoration64Vec2BadVulkan) {
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr(
               "Sequence of components starting with 2 "
-              "and ending with 6 gets larger than 3"));
+              "and ending with 5 gets larger than 3"));
 }
 
 TEST_F(ValidateDecorations, ComponentDecoration64VecWideBadVulkan) {
