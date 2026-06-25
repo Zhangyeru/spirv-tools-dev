@@ -8692,6 +8692,103 @@ OpFunctionEnd
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("is not Workgroup or StorageBuffer"));
 }
+
+std::string GenTensorMapShader(bool with_extension, const std::string& main_body) {
+  return std::string(R"(
+OpCapability Shader
+)") +
+         (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
+         R"(OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %dst %tm
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%uint = OpTypeInt 32 0
+%uint_16 = OpConstant %uint 16
+%int_0 = OpConstant %int 0
+%array = OpTypeArray %int %uint_16
+%array_ptr = OpTypePointer Workgroup %array
+%dst = OpVariable %array_ptr Workgroup
+%tensor_map = OpTypeTensorMap 1
+%tensor_map_ptr = OpTypePointer UniformConstant %tensor_map
+%tm = OpVariable %tensor_map_ptr UniformConstant
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body + R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+std::string GenCpAsyncBarrierShader(bool with_extension,
+                                    const std::string& main_body) {
+  return std::string(R"(
+OpCapability Shader
+)") +
+         (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
+         R"(OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%int_1 = OpConstant %int 1
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body + R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateMemory, TensorMapRequiresHWNeuralExtension) {
+  const std::string spirv = GenTensorMapShader(false, "");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpTypeTensorMap"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_F(ValidateMemory, CpAsyncTensorWithExtensionValid) {
+  const std::string spirv = GenTensorMapShader(true, R"(
+%tm_value = OpLoad %tensor_map %tm
+OpCpAsyncTensorGlobalShared 1 %dst %tm_value %int_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CpAsyncCommitWaitRequiresHWNeuralExtension) {
+  const std::string spirv = GenCpAsyncBarrierShader(false, R"(
+OpCpAsyncCommitGroup
+OpCpAsyncWaitGroup 0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpCpAsyncCommitGroup"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_F(ValidateMemory, BarrierArriveWaitRequiresHWNeuralExtension) {
+  const std::string spirv = GenCpAsyncBarrierShader(false, R"(
+OpBarrierArrive %int_0 %int_1
+OpBarrierWait %int_0 %int_1
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpBarrierArrive"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
 }  // namespace
 }  // namespace val
 }  // namespace spvtools
