@@ -5241,6 +5241,58 @@ OpFunctionEnd
   EXPECT_EQ(SPV_SUCCESS, ValidateInstructions());
 }
 
+TEST_F(ValidateCFG, SelectionControlRelregRequiresHwNeuralExtension) {
+  const std::string text = R"(
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%main = OpFunction %void None %3
+%4 = OpLabel
+OpSelectionMerge %merge Relreg
+OpBranchConditional %true %then %merge
+%then = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+  )";
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_ERROR_MISSING_EXTENSION, ValidateInstructions());
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_F(ValidateCFG, SelectionControlRelregWithHwNeuralExtension) {
+  const std::string text = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%main = OpFunction %void None %3
+%4 = OpLabel
+OpSelectionMerge %merge Relreg
+OpBranchConditional %true %then %merge
+%then = OpLabel
+OpBranch %merge
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions());
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

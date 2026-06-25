@@ -598,6 +598,7 @@ INSTANTIATE_TEST_SUITE_P(
                 CASE0(SELECTION_CONTROL, SelectionControlMask::MaskNone),
                 CASE0(SELECTION_CONTROL, SelectionControlMask::Flatten),
                 CASE0(SELECTION_CONTROL, SelectionControlMask::DontFlatten),
+                CASE0(SELECTION_CONTROL, SelectionControlMask::Relreg),
             })));
 
 // See SPIR-V Section 3.23 Loop Control

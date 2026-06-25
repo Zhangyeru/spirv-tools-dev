@@ -351,7 +351,9 @@ INSTANTIATE_TEST_SUITE_P(
                 "OpSelectionMerge %1 None\n",
                 "OpSelectionMerge %1 Flatten\n",
                 "OpSelectionMerge %1 DontFlatten\n",
+                "OpSelectionMerge %1 Relreg\n",
                 "OpSelectionMerge %1 Flatten|DontFlatten\n",
+                "OpSelectionMerge %1 Flatten|Relreg\n",
             })));
 
 INSTANTIATE_TEST_SUITE_P(
@@ -471,6 +473,8 @@ TEST_F(MaskSorting, MasksAreSortedFromLSBToMSB) {
   EXPECT_THAT(
       EncodeAndDecodeSuccessfully("OpSelectionMerge %1 DontFlatten|Flatten"),
       Eq("OpSelectionMerge %1 Flatten|DontFlatten\n"));
+  EXPECT_THAT(EncodeAndDecodeSuccessfully("OpSelectionMerge %1 Relreg|Flatten"),
+              Eq("OpSelectionMerge %1 Flatten|Relreg\n"));
   EXPECT_THAT(EncodeAndDecodeSuccessfully(
                   "%2 = OpFunction %1 DontInline|Const|Pure|Inline %3"),
               Eq("%2 = OpFunction %1 Inline|DontInline|Pure|Const %3\n"));
