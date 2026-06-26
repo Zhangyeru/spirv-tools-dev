@@ -620,7 +620,7 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
                          {spv::Op::OpTypeImage, spv::Op::OpTypeSampler,
                           spv::Op::OpTypeSampledImage,
                           spv::Op::OpTypeAccelerationStructureKHR,
-                          spv::Op::OpTypeTensorMap})) {
+                          spv::Op::OpTypeTensorMapHW})) {
         return _.diag(SPV_ERROR_INVALID_ID, inst)
                << _.VkErrorID(4655) << "UniformConstant OpVariable <id> "
                << _.getIdName(inst->id()) << " has illegal type.\n"
@@ -628,7 +628,7 @@ spv_result_t ValidateVariable(ValidationState_t& _, const Instruction* inst) {
                << "are used only as handles to refer to opaque resources. Such "
                << "variables must be typed as OpTypeImage, OpTypeSampler, "
                << "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-               << "OpTypeTensorMap, or an array of one of these types.";
+               << "OpTypeTensorMapHW, or an array of one of these types.";
       }
     }
 
@@ -3137,10 +3137,10 @@ spv_result_t ValidateCpAsyncTensorGlobalShared(ValidationState_t& _,
 
   const auto tensor_map_type = _.FindDef(tensor_map->type_id());
   if (!tensor_map_type ||
-      tensor_map_type->opcode() != spv::Op::OpTypeTensorMap) {
+      tensor_map_type->opcode() != spv::Op::OpTypeTensorMapHW) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opcode_name << " TensorMap <id> "
-           << _.getIdName(tensor_map_id) << " must be OpTypeTensorMap.";
+           << _.getIdName(tensor_map_id) << " must be OpTypeTensorMapHW.";
   }
 
   const auto coord = _.FindDef(coord_id);
@@ -3345,7 +3345,7 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
       if (auto error = ValidateCooperativeVectorMatrixMulHW(_, inst))
         return error;
       break;
-    case spv::Op::OpCpAsyncTensorGlobalShared:
+    case spv::Op::OpCpAsyncTensorGlobalSharedHW:
       if (auto error = ValidateCpAsyncTensorGlobalShared(_, inst)) return error;
       break;
     case spv::Op::OpPtrEqual:

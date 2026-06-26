@@ -147,8 +147,8 @@ spv_result_t BarriersPass(ValidationState_t& _, const Instruction* inst) {
       break;
     }
 
-    case spv::Op::OpBarrierArrive:
-    case spv::Op::OpBarrierWait: {
+    case spv::Op::OpBarrierArriveHW:
+    case spv::Op::OpBarrierWaitHW: {
       if (auto error = ValidateBarrierIdOrCount(_, inst, 0, "Id")) {
         return error;
       }

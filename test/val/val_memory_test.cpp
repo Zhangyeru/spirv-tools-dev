@@ -73,7 +73,7 @@ OpFunctionEnd
                 "are used only as handles to refer to opaque resources. Such "
                 "variables must be typed as OpTypeImage, OpTypeSampler, "
                 "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-                "OpTypeTensorMap, or an array of one of these types."));
+                "OpTypeTensorMapHW, or an array of one of these types."));
 }
 
 TEST_F(ValidateMemory, VulkanUniformConstantOnOpaqueResourceGood) {
@@ -127,7 +127,7 @@ OpFunctionEnd
                 "are used only as handles to refer to opaque resources. Such "
                 "variables must be typed as OpTypeImage, OpTypeSampler, "
                 "OpTypeSampledImage, OpTypeAccelerationStructureKHR, "
-                "OpTypeTensorMap, or an array of one of these types."));
+                "OpTypeTensorMapHW, or an array of one of these types."));
 }
 
 TEST_F(ValidateMemory, VulkanUniformConstantOnOpaqueResourceArrayGood) {
@@ -8592,7 +8592,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %array = OpTypeArray %int %uint_16
 %array_ptr = OpTypePointer Workgroup %array
 %dst = OpVariable %array_ptr Workgroup
-%tensor_map = OpTypeTensorMap 1
+%tensor_map = OpTypeTensorMapHW 1
 %tensor_map_ptr = OpTypePointer UniformConstant %tensor_map
 %tm = OpVariable %tensor_map_ptr UniformConstant
 
@@ -8633,14 +8633,14 @@ TEST_F(ValidateMemory, TensorMapRequiresHWNeuralExtension) {
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpTypeTensorMap"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpTypeTensorMapHW"));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
 }
 
 TEST_F(ValidateMemory, CpAsyncTensorWithExtensionValid) {
   const std::string spirv = GenTensorMapShader(true, R"(
 %tm_value = OpLoad %tensor_map %tm
-OpCpAsyncTensorGlobalShared 1 %dst %tm_value %int_0
+OpCpAsyncTensorGlobalSharedHW 1 %dst %tm_value %int_0
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
@@ -8649,25 +8649,25 @@ OpCpAsyncTensorGlobalShared 1 %dst %tm_value %int_0
 
 TEST_F(ValidateMemory, CpAsyncCommitWaitRequiresHWNeuralExtension) {
   const std::string spirv = GenCpAsyncBarrierShader(false, R"(
-OpCpAsyncCommitGroup
-OpCpAsyncWaitGroup 0
+OpCpAsyncCommitGroupHW
+OpCpAsyncWaitGroupHW 0
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpCpAsyncCommitGroup"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpCpAsyncCommitGroupHW"));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
 }
 
 TEST_F(ValidateMemory, BarrierArriveWaitRequiresHWNeuralExtension) {
   const std::string spirv = GenCpAsyncBarrierShader(false, R"(
-OpBarrierArrive %int_0 %int_1
-OpBarrierWait %int_0 %int_1
+OpBarrierArriveHW %int_0 %int_1
+OpBarrierWaitHW %int_0 %int_1
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpBarrierArrive"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("OpBarrierArriveHW"));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
 }
 }  // namespace

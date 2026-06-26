@@ -947,7 +947,7 @@ spv_result_t ValidateTypeTensorMap(ValidationState_t& _,
   const auto dim = inst->GetOperandAs<uint32_t>(dim_index);
   if (dim < 1 || dim > 4) {
     return _.diag(SPV_ERROR_INVALID_VALUE, inst)
-           << "OpTypeTensorMap Dim must be between 1 and 4.";
+           << "OpTypeTensorMapHW Dim must be between 1 and 4.";
   }
 
   return SPV_SUCCESS;
@@ -1015,7 +1015,7 @@ spv_result_t TypePass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpTypeTensorViewNV:
       if (auto error = ValidateTypeTensorViewNV(_, inst)) return error;
       break;
-    case spv::Op::OpTypeTensorMap:
+    case spv::Op::OpTypeTensorMapHW:
       if (auto error = ValidateTypeTensorMap(_, inst)) return error;
       break;
     default:
