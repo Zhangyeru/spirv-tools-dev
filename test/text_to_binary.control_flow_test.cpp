@@ -56,15 +56,16 @@ INSTANTIATE_TEST_SUITE_P(TextToBinarySelectionMerge, OpSelectionMergeTest,
                             CASE(MaskNone, "None"),
                             CASE(Flatten, "Flatten"),
                             CASE(DontFlatten, "DontFlatten"),
+                            CASE(Relreg, "Relreg"),
                         }));
 #undef CASE
 // clang-format on
 
 TEST_F(OpSelectionMergeTest, CombinedSelectionControlMask) {
-  const std::string input = "OpSelectionMerge %1 Flatten|DontFlatten";
+  const std::string input = "OpSelectionMerge %1 Flatten|Relreg";
   const uint32_t expected_mask =
       uint32_t(spv::SelectionControlMask::Flatten |
-               spv::SelectionControlMask::DontFlatten);
+               spv::SelectionControlMask::Relreg);
   EXPECT_THAT(
       CompiledInstructions(input),
       Eq(MakeInstruction(spv::Op::OpSelectionMerge, {1, expected_mask})));
@@ -72,8 +73,8 @@ TEST_F(OpSelectionMergeTest, CombinedSelectionControlMask) {
 
 TEST_F(OpSelectionMergeTest, WrongSelectionControl) {
   // Case sensitive: "flatten" != "Flatten" and thus wrong.
-  EXPECT_THAT(CompileFailure("OpSelectionMerge %1 flatten|DontFlatten"),
-              Eq("Invalid selection control operand 'flatten|DontFlatten'."));
+  EXPECT_THAT(CompileFailure("OpSelectionMerge %1 flatten|Relreg"),
+              Eq("Invalid selection control operand 'flatten|Relreg'."));
 }
 
 // Test OpLoopMerge

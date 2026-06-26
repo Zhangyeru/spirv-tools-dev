@@ -395,7 +395,7 @@ int32_t spvOpcodeGeneratesType(spv::Op op) {
     case spv::Op::OpTypeNodePayloadArrayAMDX:
     case spv::Op::OpTypeTensorLayoutNV:
     case spv::Op::OpTypeTensorViewNV:
-    case spv::Op::OpTypeTensorMap:
+    case spv::Op::OpTypeTensorMapHW:
       return true;
     default:
       // In particular, OpTypeForwardPointer does not generate a type,
@@ -542,7 +542,7 @@ bool spvOpcodeIsBaseOpaqueType(spv::Op opcode) {
     case spv::Op::OpTypeForwardPointer:
     case spv::Op::OpTypePipeStorage:
     case spv::Op::OpTypeNamedBarrier:
-    case spv::Op::OpTypeTensorMap:
+    case spv::Op::OpTypeTensorMapHW:
       return true;
     default:
       return false;

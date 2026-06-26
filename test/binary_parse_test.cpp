@@ -1187,8 +1187,8 @@ INSTANTIATE_TEST_SUITE_P(
          "Invalid loop control operand: 1027 has invalid mask component 1024"},
         {"%2 = OpImageFetch %1 %image %coord !32770",
          "Invalid image operand: 32770 has invalid mask component 32768"},
-        {"OpSelectionMerge %1 !7",
-         "Invalid selection control operand: 7 has invalid mask component 4"},
+        {"OpSelectionMerge %1 !15",
+         "Invalid selection control operand: 15 has invalid mask component 8"},
     }));
 
 }  // namespace
