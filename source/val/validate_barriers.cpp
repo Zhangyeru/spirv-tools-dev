@@ -27,17 +27,14 @@
 namespace spvtools {
 namespace val {
 
-spv_result_t ValidateBarrierIdOrCount(ValidationState_t& _,
-                                      const Instruction* inst,
-                                      uint32_t operand_index,
-                                      const char* operand_name) {
-  const auto operand_id = inst->GetOperandAs<uint32_t>(operand_index);
-  const auto type_id = _.GetOperandTypeId(inst, operand_index);
+spv_result_t ValidateBarrierId(ValidationState_t& _, const Instruction* inst) {
+  const auto operand_id = inst->GetOperandAs<uint32_t>(0);
+  const auto type_id = _.GetOperandTypeId(inst, 0);
   const auto opcode_name = spvOpcodeString(inst->opcode());
 
   if (!_.IsIntScalarType(type_id) || _.GetBitWidth(type_id) != 32) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << opcode_name << " " << operand_name << " <id> "
+           << opcode_name << " Id <id> "
            << _.getIdName(operand_id)
            << " must be a 32-bit integer scalar.";
   }
@@ -45,7 +42,31 @@ spv_result_t ValidateBarrierIdOrCount(ValidationState_t& _,
   int64_t value = 0;
   if (_.EvalConstantValInt64(operand_id, &value) && value < 0) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << opcode_name << " " << operand_name << " must be non-negative.";
+           << opcode_name << " Id must be non-negative.";
+  }
+
+  return SPV_SUCCESS;
+}
+
+spv_result_t ValidateBarrierCount(ValidationState_t& _,
+                                  const Instruction* inst) {
+  const auto operand_id = inst->GetOperandAs<uint32_t>(1);
+  const auto* operand_inst = _.FindDef(operand_id);
+  const auto type_id = _.GetOperandTypeId(inst, 1);
+  const auto opcode_name = spvOpcodeString(inst->opcode());
+
+  if (!operand_inst || !_.IsIntScalarType(type_id) || _.GetBitWidth(type_id) != 32 ||
+      (operand_inst->opcode() != spv::Op::OpConstant &&
+       operand_inst->opcode() != spv::Op::OpConstantNull)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " N <id> " << _.getIdName(operand_id)
+           << " must be a 32-bit integer compile-time constant.";
+  }
+
+  int64_t value = 0;
+  if (_.EvalConstantValInt64(operand_id, &value) && value < 0) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name << " N must be non-negative.";
   }
 
   return SPV_SUCCESS;
@@ -149,10 +170,10 @@ spv_result_t BarriersPass(ValidationState_t& _, const Instruction* inst) {
 
     case spv::Op::OpBarrierArriveHW:
     case spv::Op::OpBarrierWaitHW: {
-      if (auto error = ValidateBarrierIdOrCount(_, inst, 0, "Id")) {
+      if (auto error = ValidateBarrierId(_, inst)) {
         return error;
       }
-      if (auto error = ValidateBarrierIdOrCount(_, inst, 1, "N")) {
+      if (auto error = ValidateBarrierCount(_, inst)) {
         return error;
       }
       break;

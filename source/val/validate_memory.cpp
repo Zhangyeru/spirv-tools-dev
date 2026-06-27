@@ -83,6 +83,30 @@ bool IsInt2Type(ValidationState_t& _, uint32_t type_id) {
          _.GetBitWidth(type->word(2)) == 32;
 }
 
+spv_result_t ValidateCpAsyncWaitGroupCount(ValidationState_t& _,
+                                           const Instruction* inst) {
+  const auto count_id = inst->GetOperandAs<uint32_t>(0);
+  const auto* count_inst = _.FindDef(count_id);
+  const auto type_id = _.GetOperandTypeId(inst, 0);
+
+  if (!count_inst || !_.IsIntScalarType(type_id) || _.GetBitWidth(type_id) != 32 ||
+      (count_inst->opcode() != spv::Op::OpConstant &&
+       count_inst->opcode() != spv::Op::OpConstantNull)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << spvOpcodeString(inst->opcode()) << " N <id> "
+           << _.getIdName(count_id)
+           << " must be a 32-bit integer compile-time constant.";
+  }
+
+  int64_t value = 0;
+  if (_.EvalConstantValInt64(count_id, &value) && value < 0) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << spvOpcodeString(inst->opcode()) << " N must be non-negative.";
+  }
+
+  return SPV_SUCCESS;
+}
+
 // Returns true if the two instructions represent structs that, as far as the
 // validator can tell, have the exact same data layout.
 bool AreLayoutCompatibleStructs(ValidationState_t& _, const Instruction* type1,
@@ -3347,6 +3371,9 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
       break;
     case spv::Op::OpCpAsyncTensorGlobalSharedHW:
       if (auto error = ValidateCpAsyncTensorGlobalShared(_, inst)) return error;
+      break;
+    case spv::Op::OpCpAsyncWaitGroupHW:
+      if (auto error = ValidateCpAsyncWaitGroupCount(_, inst)) return error;
       break;
     case spv::Op::OpPtrEqual:
     case spv::Op::OpPtrNotEqual:
