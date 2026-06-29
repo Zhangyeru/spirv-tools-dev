@@ -132,6 +132,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   if (!has_hw) return Status::SuccessWithoutChange;
 
   if (!CollectHwTypes()) return Status::Failure;
+  if (!EliminateHwFunctionVariables()) return Status::Failure;
   if (!LegalizeModule()) return Status::Failure;
   if (!PrepareMatmulPatternFunctions()) return Status::Failure;
 
@@ -261,6 +262,182 @@ bool HwLowerToStandardPass::CollectHwTypes() {
     if (info.lowered_type_id == 0) return false;
     vector_types_[info.type_id] = info;
     lowered_types_[info.type_id] = info.lowered_type_id;
+  }
+
+  return true;
+}
+
+bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
+  // Collect all function variables whose pointee type contains HW types.
+  std::vector<Instruction*> hw_vars;
+  get_module()->ForEachInst([this, &hw_vars](Instruction* inst) {
+    if (inst->opcode() == spv::Op::OpVariable &&
+        inst->GetSingleWordInOperand(0) ==
+            static_cast<uint32_t>(spv::StorageClass::Function) &&
+        TypeContainsHw(inst->type_id())) {
+      hw_vars.push_back(inst);
+    }
+  });
+  if (hw_vars.empty()) return true;
+
+  // For each variable, collect stores and loads in program order.
+  // For each load that follows a store, record the replacement.
+  std::unordered_map<uint32_t, uint32_t> load_replacements;
+  std::unordered_set<Instruction*> elim_loads;
+  std::unordered_set<Instruction*> elim_stores;
+
+  auto is_ignorable_user = [](Instruction* user) {
+    return user && (user->opcode() == spv::Op::OpName ||
+                    user->opcode() == spv::Op::OpMemberName ||
+                    user->IsDecoration() || user->IsNonSemanticInstruction() ||
+                    user->IsDebugLineInst());
+  };
+
+  for (Instruction* var : hw_vars) {
+    const uint32_t var_id = var->result_id();
+
+    // Walk the block in program order, tracking the last stored value.
+    // Every load from this variable is replaced with the most recent store.
+    std::vector<Instruction*> var_stores;
+    std::vector<Instruction*> var_loads;
+    BasicBlock* block = nullptr;
+
+    get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
+      BasicBlock* user_block = context()->get_instr_block(user);
+      if (!user_block) return;
+      if (!block) block = user_block;
+      if (user->opcode() == spv::Op::OpStore &&
+          user->GetSingleWordInOperand(0) == var_id) {
+        var_stores.push_back(user);
+      } else if (user->opcode() == spv::Op::OpLoad &&
+                 user->GetSingleWordInOperand(0) == var_id) {
+        var_loads.push_back(user);
+      }
+    });
+
+    if (var_stores.empty() || var_loads.empty() || !block) continue;
+
+    // Walk block in order: track the last stored value and record
+    // replacements for each load.
+    uint32_t last_stored_value = 0;
+    for (Instruction& inst : *block) {
+      if (inst.opcode() == spv::Op::OpStore &&
+          inst.NumInOperands() >= 2 &&
+          inst.GetSingleWordInOperand(0) == var_id) {
+        last_stored_value = inst.GetSingleWordInOperand(1);
+      } else if (inst.opcode() == spv::Op::OpLoad &&
+                 inst.NumInOperands() >= 1 &&
+                 inst.GetSingleWordInOperand(0) == var_id &&
+                 last_stored_value != 0) {
+        load_replacements[inst.result_id()] = last_stored_value;
+        elim_loads.insert(&inst);
+      }
+    }
+  }
+
+  if (load_replacements.empty()) return true;
+
+  // Resolve chains: a replaced load's ID may appear as a stored value for
+  // another variable.  Follow chains to their final (non-load) value.
+  std::unordered_map<uint32_t, uint32_t> final_replacements;
+  for (const auto& pair : load_replacements) {
+    uint32_t current = pair.second;
+    std::unordered_set<uint32_t> visited;
+    visited.insert(pair.first);
+    while (load_replacements.count(current) && !visited.count(current)) {
+      visited.insert(current);
+      current = load_replacements[current];
+    }
+    final_replacements[pair.first] = current;
+  }
+
+  // Apply all replacements.
+  for (const auto& pair : final_replacements) {
+    context()->ReplaceAllUsesWith(pair.first, pair.second);
+  }
+
+  // Kill eliminated loads.
+  for (Instruction* load : elim_loads) {
+    context()->KillInst(load);
+  }
+
+  // Try to eliminate stores and their variables.  A store can be killed if
+  // every user of both the store and the variable is being eliminated or is
+  // ignorable.
+  for (Instruction* var : hw_vars) {
+    const uint32_t var_id = var->result_id();
+    std::vector<Instruction*> stores;
+    get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
+      if (user->opcode() == spv::Op::OpStore &&
+          user->GetSingleWordInOperand(0) == var_id) {
+        stores.push_back(user);
+      }
+    });
+
+    bool all_safe = true;
+    for (Instruction* store : stores) {
+      if (!elim_stores.count(store)) {
+        bool store_safe = true;
+        get_def_use_mgr()->ForEachUser(store, [&](Instruction* user) {
+          if (!is_ignorable_user(user)) store_safe = false;
+        });
+        if (!store_safe) {
+          all_safe = false;
+          break;
+        }
+      }
+      // Verify all users of the stored value are handled.
+      if (store->NumInOperands() >= 2) {
+        const uint32_t stored_id = store->GetSingleWordInOperand(1);
+        Instruction* stored = get_def_use_mgr()->GetDef(stored_id);
+        if (stored) {
+          bool value_safe = true;
+          get_def_use_mgr()->ForEachUser(stored, [&](Instruction* user) {
+            if (user != store && !is_ignorable_user(user) &&
+                !elim_loads.count(user) && !elim_stores.count(user)) {
+              value_safe = false;
+            }
+          });
+          if (!value_safe) {
+            all_safe = false;
+            break;
+          }
+        }
+      }
+    }
+    if (!all_safe) continue;
+
+    // Check all users of the variable itself.
+    bool var_safe = true;
+    get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
+      if (is_ignorable_user(user)) return;
+      if (user->opcode() == spv::Op::OpStore &&
+          user->GetSingleWordInOperand(0) == var_id) {
+        return;  // Will be killed below.
+      }
+      if (user->opcode() == spv::Op::OpLoad &&
+          user->GetSingleWordInOperand(0) == var_id &&
+          elim_loads.count(user)) {
+        return;
+      }
+      var_safe = false;
+    });
+    if (!var_safe) continue;
+
+    for (Instruction* store : stores) {
+      elim_stores.insert(store);
+    }
+  }
+
+  for (Instruction* store : elim_stores) {
+    context()->KillInst(store);
+  }
+  for (Instruction* var : hw_vars) {
+    bool safe = true;
+    get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
+      if (!is_ignorable_user(user)) safe = false;
+    });
+    if (safe) context()->KillInst(var);
   }
 
   return true;
@@ -436,6 +613,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
         case spv::Op::OpUndef:
         case spv::Op::OpConstantNull:
         case spv::Op::OpConstantComposite:
+        case spv::Op::OpConstantCompositeReplicateEXT:
         case spv::Op::OpVariable:
         case spv::Op::OpLoad:
         case spv::Op::OpStore:
@@ -443,6 +621,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
         case spv::Op::OpCompositeConstruct:
         case spv::Op::OpCompositeExtract:
         case spv::Op::OpBitcast:
+        case spv::Op::OpExtInst:
           break;
         default:
           ReportError(inst, "unsupported HW cooperative value use");
@@ -573,6 +752,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpConstantComposite:
+      case spv::Op::OpConstantCompositeReplicateEXT:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeExtract:
@@ -584,6 +764,10 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         break;
       case spv::Op::OpBitcast:
         if (TypeContainsHw(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpExtInst:
+        if (GetVectorType(inst->type_id()) != nullptr)
+          worklist.push_back(inst);
         break;
       default:
         break;
@@ -621,6 +805,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         ok = LowerCompositeConstruct(inst);
         break;
       case spv::Op::OpConstantComposite:
+      case spv::Op::OpConstantCompositeReplicateEXT:
         ok = LowerConstantComposite(inst);
         break;
       case spv::Op::OpCompositeExtract:
@@ -632,6 +817,9 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         break;
       case spv::Op::OpBitcast:
         ok = LowerHwBitcast(inst);
+        break;
+      case spv::Op::OpExtInst:
+        ok = LowerExtInstOnCooperativeVector(inst);
         break;
       default:
         break;
@@ -1533,6 +1721,48 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
+  auto add_dead_function_store_users =
+      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
+          Instruction* value) {
+        if (!value || value->result_id() == 0) return false;
+        bool ok = true;
+        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+          if (!ok || !user || user == inst || is_ignorable_user(user) ||
+              kill_set.find(user) != kill_set.end()) {
+            return;
+          }
+          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
+              user->GetSingleWordInOperand(1) != value->result_id()) {
+            ok = false;
+            return;
+          }
+          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+          if (!IsFunctionPointer(pointer_id)) {
+            ok = false;
+            return;
+          }
+          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+          if (!pointer) {
+            ok = false;
+            return;
+          }
+          bool only_dead_users = true;
+          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+            if (pointer_user == user || is_ignorable_user(pointer_user) ||
+                kill_set.find(pointer_user) != kill_set.end()) {
+              return;
+            }
+            only_dead_users = false;
+          });
+          if (!only_dead_users) {
+            ok = false;
+            return;
+          }
+          add_kill(user);
+          add_kill(pointer);
+        });
+        return ok;
+      };
   add_kill(inst);
   for (Instruction* kill : object_chain) add_kill(kill);
   for (Instruction* kill : a_chain) add_kill(kill);
@@ -1542,6 +1772,11 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
   add_kill(a_load);
   add_kill(b_load);
   add_kill(c_load);
+  if (!add_dead_function_store_users(a_load) ||
+      !add_dead_function_store_users(b_load) ||
+      !add_dead_function_store_users(c_load)) {
+    return true;
+  }
 
   for (Instruction* kill : kill_list) {
     if (!kill) continue;
@@ -1658,13 +1893,14 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
                             kHwMatrixLoadMemoryOperandsInIdx);
   };
 
-  auto users_are_closed = [this, inst](const std::vector<Instruction*>& kills) {
-    auto is_ignorable_user = [](Instruction* user) {
-      return user && (user->opcode() == spv::Op::OpName ||
-                      user->opcode() == spv::Op::OpMemberName ||
-                      user->IsDecoration() || user->IsNonSemanticInstruction() ||
-                      user->IsDebugLineInst());
-    };
+  auto is_ignorable_user = [](Instruction* user) {
+    return user && (user->opcode() == spv::Op::OpName ||
+                    user->opcode() == spv::Op::OpMemberName ||
+                    user->IsDecoration() || user->IsNonSemanticInstruction() ||
+                    user->IsDebugLineInst());
+  };
+  auto users_are_closed = [this, inst, &is_ignorable_user](
+                              const std::vector<Instruction*>& kills) {
     std::unordered_set<Instruction*> allowed(kills.begin(), kills.end());
     allowed.insert(inst);
     for (Instruction* kill : kills) {
@@ -1796,18 +2032,63 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
+  auto add_dead_function_store_users =
+      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
+          Instruction* value) {
+        if (!value || value->result_id() == 0) return false;
+        bool ok = true;
+        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+          if (!ok || !user || user == inst || is_ignorable_user(user) ||
+              kill_set.find(user) != kill_set.end()) {
+            return;
+          }
+          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
+              user->GetSingleWordInOperand(1) != value->result_id()) {
+            ok = false;
+            return;
+          }
+          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+          if (!IsFunctionPointer(pointer_id)) {
+            ok = false;
+            return;
+          }
+          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+          if (!pointer) {
+            ok = false;
+            return;
+          }
+          bool only_dead_users = true;
+          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+            if (pointer_user == user || is_ignorable_user(pointer_user) ||
+                kill_set.find(pointer_user) != kill_set.end()) {
+              return;
+            }
+            only_dead_users = false;
+          });
+          if (!only_dead_users) {
+            ok = false;
+            return;
+          }
+          add_kill(user);
+          add_kill(pointer);
+        });
+        return ok;
+      };
   // Only add kills for non-constant operands
   if (!a_is_value) {
     for (Instruction* kill : direct_a.chain) add_kill(kill);
     add_kill(direct_a.source_load);
+    if (!add_dead_function_store_users(direct_a.source_load)) return true;
   }
   if (!b_is_value) {
     for (Instruction* kill : direct_b.chain) add_kill(kill);
     add_kill(direct_b.source_load);
+    if (!add_dead_function_store_users(direct_b.source_load)) return true;
   }
   if (!c_is_value) {
     for (Instruction* kill : direct_c.chain) add_kill(kill);
     add_kill(direct_c.source_load);
+    if (!add_dead_function_store_users(direct_c.source_load)) return true;
   }
   if (!users_are_closed(kill_list)) return true;
 
@@ -1927,13 +2208,14 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
                             kHwMatrixLoadMemoryOperandsInIdx);
   };
 
-  auto users_are_closed = [this, inst](const std::vector<Instruction*>& kills) {
-    auto is_ignorable_user = [](Instruction* user) {
-      return user && (user->opcode() == spv::Op::OpName ||
-                      user->opcode() == spv::Op::OpMemberName ||
-                      user->IsDecoration() || user->IsNonSemanticInstruction() ||
-                      user->IsDebugLineInst());
-    };
+  auto is_ignorable_user = [](Instruction* user) {
+    return user && (user->opcode() == spv::Op::OpName ||
+                    user->opcode() == spv::Op::OpMemberName ||
+                    user->IsDecoration() || user->IsNonSemanticInstruction() ||
+                    user->IsDebugLineInst());
+  };
+  auto users_are_closed = [this, inst, &is_ignorable_user](
+                              const std::vector<Instruction*>& kills) {
     std::unordered_set<Instruction*> allowed(kills.begin(), kills.end());
     allowed.insert(inst);
     for (Instruction* kill : kills) {
@@ -1974,19 +2256,24 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   DirectMatrixLoadCandidate direct_matrix;
   DirectVectorLoadCandidate direct_bias;
 
-  // Resolve input: buffer load or constant
+  // Track operands passed as function parameters (hybrid direct path).
+  // Each pair: (operand_id, lowered_type_id).
+  std::vector<std::pair<uint32_t, uint32_t>> value_arguments;
+
+  // Resolve input: buffer load, constant, or parameter
   bool input_is_value = false;
   uint32_t input_constant_id = 0;
+  uint32_t input_value_id = input_inst->result_id();
   if (resolve_vector_load(input_inst, &direct_input)) {
     input_is_value = false;
   } else {
     std::vector<Instruction*> input_chain;
-    Instruction* input_source = TraceFunctionValueSource(input_inst, inst, &input_chain);
+    Instruction* input_source =
+        TraceFunctionValueSource(input_inst, inst, &input_chain);
     if (input_source &&
         input_source->opcode() == spv::Op::OpConstantComposite) {
       input_is_value = true;
       input_constant_id = input_source->result_id();
-      input_inst = input_source;
     } else if (input_source &&
                input_source->opcode() == spv::Op::OpCompositeConstruct) {
       const uint32_t const_id =
@@ -1998,23 +2285,29 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         return true;
       }
     } else {
-      return true;  // Unknown input source, bail to pattern path
+      // Cannot resolve to SSBO load or constant — pass as function parameter.
+      input_is_value = true;
+      Instruction* input_value = input_source ? input_source : input_inst;
+      if (!input_value || input_value->result_id() == 0) return true;
+      input_value_id = input_value->result_id();
+      value_arguments.push_back({input_value_id, input->lowered_type_id});
     }
   }
 
   // Resolve matrix: buffer load or constant
   bool matrix_is_value = false;
   uint32_t matrix_constant_id = 0;
+  uint32_t matrix_value_id = matrix_inst->result_id();
   if (resolve_matrix_load(matrix_inst, &direct_matrix)) {
     matrix_is_value = false;
   } else {
     std::vector<Instruction*> matrix_chain;
-    Instruction* matrix_source = TraceFunctionValueSource(matrix_inst, inst, &matrix_chain);
+    Instruction* matrix_source =
+        TraceFunctionValueSource(matrix_inst, inst, &matrix_chain);
     if (matrix_source &&
         matrix_source->opcode() == spv::Op::OpConstantComposite) {
       matrix_is_value = true;
       matrix_constant_id = matrix_source->result_id();
-      matrix_inst = matrix_source;
     } else if (matrix_source &&
                matrix_source->opcode() == spv::Op::OpCompositeConstruct) {
       const uint32_t const_id =
@@ -2026,11 +2319,18 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         return true;
       }
     } else {
-      return true;  // Unknown matrix source, bail to pattern path
+      // Cannot resolve to SSBO load or constant — pass as function parameter.
+      matrix_is_value = true;
+      Instruction* matrix_value = matrix_source ? matrix_source : matrix_inst;
+      if (!matrix_value || matrix_value->result_id() == 0) return true;
+      matrix_value_id = matrix_value->result_id();
+      value_arguments.push_back({matrix_value_id, matrix->lowered_type_id});
     }
   }
 
   bool bias_is_value = false;
+  uint32_t bias_constant_id = 0;
+  uint32_t bias_value_id = bias_inst ? bias_inst->result_id() : 0;
   if (has_bias) {
     if (resolve_vector_load(bias_inst, &direct_bias)) {
       // Bias comes from a buffer load (existing path)
@@ -2038,26 +2338,29 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
     } else {
       // Try to trace back to find the actual source
       std::vector<Instruction*> bias_chain;
-      Instruction* bias_source = TraceFunctionValueSource(bias_inst, inst, &bias_chain);
+      Instruction* bias_source =
+          TraceFunctionValueSource(bias_inst, inst, &bias_chain);
       if (bias_source &&
           bias_source->opcode() == spv::Op::OpConstantComposite) {
-        // Bias is a module-level constant (can be accessed from any function)
         bias_is_value = true;
-        // Use the traced source as the bias instruction
-        bias_inst = bias_source;
+        bias_constant_id = bias_source->result_id();
       } else if (bias_source &&
                  bias_source->opcode() == spv::Op::OpCompositeConstruct) {
         const uint32_t const_id =
             GetOrCreateModuleConstantFromCompositeConstruct(bias_source);
         if (const_id != 0) {
           bias_is_value = true;
-          bias_inst = bias_source;
+          bias_constant_id = const_id;
         } else {
           return true;
         }
       } else {
-        // Unknown bias source; cannot handle in direct path
-        return true;
+        // Cannot resolve to SSBO load or constant — pass as function parameter.
+        bias_is_value = true;
+        Instruction* bias_value = bias_source ? bias_source : bias_inst;
+        if (!bias_value || bias_value->result_id() == 0) return true;
+        bias_value_id = bias_value->result_id();
+        value_arguments.push_back({bias_value_id, bias->lowered_type_id});
       }
     }
   }
@@ -2067,19 +2370,64 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
+  auto add_dead_function_store_users =
+      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
+          Instruction* value) {
+        if (!value || value->result_id() == 0) return false;
+        bool ok = true;
+        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+          if (!ok || !user || user == inst || is_ignorable_user(user) ||
+              kill_set.find(user) != kill_set.end()) {
+            return;
+          }
+          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
+              user->GetSingleWordInOperand(1) != value->result_id()) {
+            ok = false;
+            return;
+          }
+          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+          if (!IsFunctionPointer(pointer_id)) {
+            ok = false;
+            return;
+          }
+          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+          if (!pointer) {
+            ok = false;
+            return;
+          }
+          bool only_dead_users = true;
+          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+            if (pointer_user == user || is_ignorable_user(pointer_user) ||
+                kill_set.find(pointer_user) != kill_set.end()) {
+              return;
+            }
+            only_dead_users = false;
+          });
+          if (!only_dead_users) {
+            ok = false;
+            return;
+          }
+          add_kill(user);
+          add_kill(pointer);
+        });
+        return ok;
+      };
   // Only add input kills if not a constant
   if (!input_is_value) {
     for (Instruction* kill : direct_input.chain) add_kill(kill);
     add_kill(direct_input.source_load);
+    if (!add_dead_function_store_users(direct_input.source_load)) return true;
   }
   // Only add matrix kills if not a constant
   if (!matrix_is_value) {
     for (Instruction* kill : direct_matrix.chain) add_kill(kill);
     add_kill(direct_matrix.source_load);
+    if (!add_dead_function_store_users(direct_matrix.source_load)) return true;
   }
   if (has_bias && !bias_is_value) {
     for (Instruction* kill : direct_bias.chain) add_kill(kill);
     add_kill(direct_bias.source_load);
+    if (!add_dead_function_store_users(direct_bias.source_load)) return true;
   }
   if (!users_are_closed(kill_list)) return true;
 
@@ -2099,10 +2447,14 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       (has_bias && !bias_is_value) ? direct_bias.pointer_type_id : 0,
       (has_bias && !bias_is_value) ? direct_bias.memory_operands
                                    : std::vector<Operand>{},
-      bias_is_value ? bias_inst->result_id() : 0, bias_is_value);
+      bias_constant_id, bias_is_value,
+      value_arguments);
   if (function_id == 0) return false;
 
-  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, {});
+  std::vector<uint32_t> call_args;
+  call_args.reserve(value_arguments.size());
+  for (const auto& arg : value_arguments) call_args.push_back(arg.first);
+  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, call_args);
   for (Instruction* kill : kill_list) {
     if (!kill->IsNop()) context()->KillInst(kill);
   }
@@ -2355,6 +2707,8 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     ReportError(inst, "invalid HW OpConstantComposite result type");
     return false;
   }
+  const bool is_replicate =
+      inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT;
 
   const uint32_t component_type_id =
       matrix ? matrix->component_type_id : vector->component_type_id;
@@ -2402,6 +2756,7 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   }
 
   if ((matrix && !IsPackedVec4(*matrix)) || (vector && !IsPackedVec4(*vector))) {
+    if (is_replicate) inst->SetOpcode(spv::Op::OpConstantComposite);
     std::vector<Operand> operands;
     operands.reserve(scalar_ids.size());
     for (uint32_t id : scalar_ids) operands.push_back(IdOperand(id));
@@ -2468,6 +2823,7 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   std::vector<Operand> operands;
   operands.reserve(element_ids.size());
   for (uint32_t id : element_ids) operands.push_back(IdOperand(id));
+  if (is_replicate) inst->SetOpcode(spv::Op::OpConstantComposite);
   inst->SetResultType(matrix ? matrix->lowered_type_id : vector->lowered_type_id);
   inst->SetInOperands(std::move(operands));
   context()->UpdateDefUse(inst);
@@ -2570,6 +2926,65 @@ bool HwLowerToStandardPass::LowerHwBitcast(Instruction* inst) {
   inst->SetOpcode(spv::Op::OpCopyObject);
   inst->SetResultType(GetLoweredType(inst->type_id()));
   context()->UpdateDefUse(inst);
+  return true;
+}
+
+bool HwLowerToStandardPass::LowerExtInstOnCooperativeVector(
+    Instruction* inst) {
+  const VectorTypeInfo* info = GetVectorType(inst->type_id());
+  if (!info) return true;  // Not a cooperative vector result; nothing to do.
+
+  InstructionBuilder builder(
+      context(), inst,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+
+  const uint32_t glsl_std450_id = inst->GetSingleWordInOperand(0);
+  const uint32_t ext_opcode = inst->GetSingleWordInOperand(1);
+  const uint32_t num_ext_operands = inst->NumInOperands() - 2;
+
+  // Determine the result type for each element-wise sub-operation.
+  const uint32_t elem_type_id = IsPackedVec4(*info)
+                                     ? info->packed_vec4_type_id
+                                     : info->component_type_id;
+  const uint32_t count =
+      IsPackedVec4(*info) ? info->packed_length : info->length;
+
+  std::vector<uint32_t> result_ids;
+  result_ids.reserve(count);
+
+  for (uint32_t i = 0; i < count; ++i) {
+    std::vector<Operand> operands;
+    operands.push_back(IdOperand(glsl_std450_id));
+    operands.push_back(
+        Operand(SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER, {ext_opcode}));
+
+    for (uint32_t op = 0; op < num_ext_operands; ++op) {
+      const uint32_t operand_id = inst->GetSingleWordInOperand(2 + op);
+      const VectorTypeInfo* op_info =
+          GetVectorType(get_def_use_mgr()->GetDef(operand_id)->type_id());
+      if (op_info) {
+        // Operand is a cooperative vector — extract the element.
+        const uint32_t elem_id =
+            ExtractCompositeElement(&builder, elem_type_id, operand_id, i);
+        if (elem_id == 0) return false;
+        operands.push_back(IdOperand(elem_id));
+      } else {
+        // Operand is a scalar or regular vector — pass through unchanged.
+        operands.push_back(IdOperand(operand_id));
+      }
+    }
+
+    const uint32_t result_id = TakeNextId();
+    if (result_id == 0) return false;
+    std::unique_ptr<Instruction> ext_inst = MakeUnique<Instruction>(
+        context(), spv::Op::OpExtInst, elem_type_id, result_id,
+        std::move(operands));
+    Instruction* added = builder.AddInstruction(std::move(ext_inst));
+    if (!added) return false;
+    result_ids.push_back(added->result_id());
+  }
+
+  RebuildAsCompositeConstruct(inst, info->lowered_type_id, result_ids);
   return true;
 }
 
@@ -4340,20 +4755,19 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     uint32_t matrix_constant_id, bool matrix_is_value,
     uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
     const std::vector<Operand>& bias_memory_operands,
-    uint32_t bias_constant_id, bool bias_is_value) {
+    uint32_t bias_constant_id, bool bias_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
   if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
       input.length != matrix.rows || result.length != matrix.cols ||
       (has_bias && (!bias || !IsPackedVec4(*bias)))) {
     return 0;
   }
+  // For value operands: constant_id may be 0 if passed as function parameter.
   if ((!input_is_value && (input_pointer_id == 0 || input_pointer_type_id == 0)) ||
-      (input_is_value && input_constant_id == 0) ||
       (!matrix_is_value && (matrix_pointer_id == 0 || matrix_pointer_type_id == 0 ||
                             matrix_shape_id == 0 || matrix_offset_id == 0)) ||
-      (matrix_is_value && matrix_constant_id == 0) ||
       (has_bias && !bias_is_value &&
-       (bias_pointer_id == 0 || bias_pointer_type_id == 0)) ||
-      (has_bias && bias_is_value && bias_constant_id == 0)) {
+       (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
     return 0;
   }
 
@@ -4376,9 +4790,14 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
                 bias->component_type_id, bias->packed_vec4_type_id,
                 bias_memory_operands)
           : 0;
-  // Function always takes 0 parameters - constants are accessed directly
+  // Build function type: return type + parameter types for value operands
+  // that are passed as arguments (not constants).
+  std::vector<uint32_t> param_type_ids;
+  for (const auto& arg : value_arguments) {
+    param_type_ids.push_back(arg.second);
+  }
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(result.lowered_type_id, {});
+      GetOrCreateFunctionType(result.lowered_type_id, param_type_ids);
   const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
       result.packed_vec4_type_id, spv::StorageClass::Function);
   const uint32_t lowered_function_ptr_type_id = GetOrCreatePointerType(
@@ -4417,6 +4836,35 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   function_start->AddOperand(IdOperand(function_type_id));
   std::unique_ptr<Function> function =
       MakeUnique<Function>(std::move(function_start));
+
+  // Add function parameters for value operands passed as arguments.
+  uint32_t input_param_id = 0;
+  uint32_t matrix_param_id = 0;
+  uint32_t bias_param_id = 0;
+  {
+    size_t arg_idx = 0;
+    if (input_is_value && input_constant_id == 0) {
+      input_param_id = TakeNextId();
+      function->AddParameter(MakeUnique<Instruction>(
+          context(), spv::Op::OpFunctionParameter, input.lowered_type_id,
+          input_param_id, std::initializer_list<Operand>{}));
+      ++arg_idx;
+    }
+    if (matrix_is_value && matrix_constant_id == 0) {
+      matrix_param_id = TakeNextId();
+      function->AddParameter(MakeUnique<Instruction>(
+          context(), spv::Op::OpFunctionParameter, matrix.lowered_type_id,
+          matrix_param_id, std::initializer_list<Operand>{}));
+      ++arg_idx;
+    }
+    if (has_bias && bias_is_value && bias_constant_id == 0) {
+      bias_param_id = TakeNextId();
+      function->AddParameter(MakeUnique<Instruction>(
+          context(), spv::Op::OpFunctionParameter, bias->lowered_type_id,
+          bias_param_id, std::initializer_list<Operand>{}));
+      ++arg_idx;
+    }
+  }
 
   const uint32_t entry_label_id = TakeNextId();
   const uint32_t out_header_label_id = TakeNextId();
@@ -4523,15 +4971,23 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     if (!bias_var) return 0;
   }
 
-  // Now do all stores AFTER all variables are declared
+  // Now do all stores AFTER all variables are declared.
+  // For value operands: use constant_id if it's a module constant, or the
+  // function parameter ID if it's passed as an argument.
   if (input_is_value) {
-    if (!entry_builder.AddStore(input_var->result_id(), input_constant_id)) return 0;
+    const uint32_t store_src =
+        input_constant_id != 0 ? input_constant_id : input_param_id;
+    if (!entry_builder.AddStore(input_var->result_id(), store_src)) return 0;
   }
   if (matrix_is_value) {
-    if (!entry_builder.AddStore(matrix_var->result_id(), matrix_constant_id)) return 0;
+    const uint32_t store_src =
+        matrix_constant_id != 0 ? matrix_constant_id : matrix_param_id;
+    if (!entry_builder.AddStore(matrix_var->result_id(), store_src)) return 0;
   }
   if (has_bias && bias_is_value) {
-    if (!entry_builder.AddStore(bias_var->result_id(), bias_constant_id)) return 0;
+    const uint32_t store_src =
+        bias_constant_id != 0 ? bias_constant_id : bias_param_id;
+    if (!entry_builder.AddStore(bias_var->result_id(), store_src)) return 0;
   }
 
   if (!entry_builder.AddStore(out_pack_var->result_id(), zero_uint_id) ||

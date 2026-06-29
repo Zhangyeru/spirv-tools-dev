@@ -74,6 +74,7 @@ class HwLowerToStandardPass : public Pass {
   };
 
   bool CollectHwTypes();
+  bool EliminateHwFunctionVariables();
   bool LegalizeModule();
   bool PrepareMatmulPatternFunctions();
   bool LowerHwInstructions(std::vector<Instruction*>* to_kill);
@@ -102,6 +103,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerCompositeExtract(Instruction* inst);
   bool LowerNullOrUndef(Instruction* inst);
   bool LowerHwBitcast(Instruction* inst);
+  bool LowerExtInstOnCooperativeVector(Instruction* inst);
 
   uint32_t GetOrCreateArrayType(uint32_t component_type_id, uint32_t length,
                                 Instruction* insert_after);
@@ -195,7 +197,8 @@ class HwLowerToStandardPass : public Pass {
       uint32_t matrix_constant_id, bool matrix_is_value,
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
       const std::vector<Operand>& bias_memory_operands,
-      uint32_t bias_constant_id, bool bias_is_value);
+      uint32_t bias_constant_id, bool bias_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c,
