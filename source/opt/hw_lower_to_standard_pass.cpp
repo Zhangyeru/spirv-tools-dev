@@ -2019,7 +2019,12 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         a_constant_id = const_id;
         // Keep a_inst as the original for type info, but use const_id for access
       } else {
-        return true;  // Not all constant operands, bail to pattern path
+        // Not all constant operands — pass as value argument.
+        a_is_value = true;
+        Instruction* a_value = a_source;
+        if (!a_value || a_value->result_id() == 0) return true;
+        a_value_id = a_value->result_id();
+        value_arguments.push_back({a_value_id, a->lowered_type_id});
       }
     } else {
       a_is_value = true;
@@ -2052,7 +2057,11 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         b_is_value = true;
         b_constant_id = const_id;
       } else {
-        return true;
+        b_is_value = true;
+        Instruction* b_value = b_source;
+        if (!b_value || b_value->result_id() == 0) return true;
+        b_value_id = b_value->result_id();
+        value_arguments.push_back({b_value_id, b->lowered_type_id});
       }
     } else {
       b_is_value = true;
@@ -2085,7 +2094,11 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         c_is_value = true;
         c_constant_id = const_id;
       } else {
-        return true;
+        c_is_value = true;
+        Instruction* c_value = c_source;
+        if (!c_value || c_value->result_id() == 0) return true;
+        c_value_id = c_value->result_id();
+        value_arguments.push_back({c_value_id, c->lowered_type_id});
       }
     } else {
       c_is_value = true;
@@ -2391,7 +2404,11 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         input_is_value = true;
         input_constant_id = const_id;
       } else {
-        return true;
+        input_is_value = true;
+        Instruction* input_value = input_source;
+        if (!input_value || input_value->result_id() == 0) return true;
+        input_value_id = input_value->result_id();
+        value_arguments.push_back({input_value_id, input->lowered_type_id});
       }
     } else {
       // Cannot resolve to SSBO load or constant — pass as function parameter.
@@ -2425,7 +2442,11 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         matrix_is_value = true;
         matrix_constant_id = const_id;
       } else {
-        return true;
+        matrix_is_value = true;
+        Instruction* matrix_value = matrix_source;
+        if (!matrix_value || matrix_value->result_id() == 0) return true;
+        matrix_value_id = matrix_value->result_id();
+        value_arguments.push_back({matrix_value_id, matrix->lowered_type_id});
       }
     } else {
       // Cannot resolve to SSBO load or constant — pass as function parameter.
@@ -2461,7 +2482,11 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
           bias_is_value = true;
           bias_constant_id = const_id;
         } else {
-          return true;
+          bias_is_value = true;
+          Instruction* bias_value = bias_source;
+          if (!bias_value || bias_value->result_id() == 0) return true;
+          bias_value_id = bias_value->result_id();
+          value_arguments.push_back({bias_value_id, bias->lowered_type_id});
         }
       } else {
         // Cannot resolve to SSBO load or constant — pass as function parameter.

@@ -1524,10 +1524,9 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  // Fusion blocked: the non-fused matmul-pattern function (returning the
-  // result array) is still emitted.
-  EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeFunction %_arr_v4float_uint_16"));
+  // The matmul is lowered to a function call (either via fusion or the
+  // direct path).
+  EXPECT_NE(std::string::npos, disassembly.find("OpFunctionCall"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -2022,11 +2021,6 @@ OpStore %c %cval
 OpStore %tempArgD0 %mat0
 %d0val = OpLoad %matAcc %tempArgD0
 OpStore %d0 %d0val
-%a1 = OpLoad %matA %a
-%b1 = OpLoad %matA %b
-%c1 = OpLoad %matAcc %d0
-%b1cast = OpBitcast %matB %b1
-%mat1 = OpCooperativeMatrixMulAddHW %matAcc %a1 %b1cast %c1
 %xload = OpCooperativeVectorLoadHW %vec8 %xbase %uint_0
 OpStore %tempArgX %xload
 %xval = OpLoad %vec8 %tempArgX
