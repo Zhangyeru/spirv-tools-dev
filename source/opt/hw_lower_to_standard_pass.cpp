@@ -1523,6 +1523,48 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
+  auto add_dead_function_store_users =
+      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
+          Instruction* value) {
+        if (!value || value->result_id() == 0) return false;
+        bool ok = true;
+        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+          if (!ok || !user || user == inst || is_ignorable_user(user) ||
+              kill_set.find(user) != kill_set.end()) {
+            return;
+          }
+          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
+              user->GetSingleWordInOperand(1) != value->result_id()) {
+            ok = false;
+            return;
+          }
+          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+          if (!IsFunctionPointer(pointer_id)) {
+            ok = false;
+            return;
+          }
+          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+          if (!pointer) {
+            ok = false;
+            return;
+          }
+          bool only_dead_users = true;
+          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+            if (pointer_user == user || is_ignorable_user(pointer_user) ||
+                kill_set.find(pointer_user) != kill_set.end()) {
+              return;
+            }
+            only_dead_users = false;
+          });
+          if (!only_dead_users) {
+            ok = false;
+            return;
+          }
+          add_kill(user);
+          add_kill(pointer);
+        });
+        return ok;
+      };
   add_kill(inst);
   for (Instruction* kill : object_chain) add_kill(kill);
   for (Instruction* kill : input_chain) add_kill(kill);
@@ -1530,6 +1572,11 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   add_kill(matmul);
   add_kill(input_load);
   add_kill(matrix_load);
+  if (!add_dead_function_store_users(matmul) ||
+      !add_dead_function_store_users(input_load) ||
+      !add_dead_function_store_users(matrix_load)) {
+    return true;
+  }
 
   for (Instruction* kill : kill_list) {
     if (!kill) continue;
@@ -1772,7 +1819,8 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
   add_kill(a_load);
   add_kill(b_load);
   add_kill(c_load);
-  if (!add_dead_function_store_users(a_load) ||
+  if (!add_dead_function_store_users(matmul) ||
+      !add_dead_function_store_users(a_load) ||
       !add_dead_function_store_users(b_load) ||
       !add_dead_function_store_users(c_load)) {
     return true;
@@ -1893,13 +1941,7 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
                             kHwMatrixLoadMemoryOperandsInIdx);
   };
 
-  auto is_ignorable_user = [](Instruction* user) {
-    return user && (user->opcode() == spv::Op::OpName ||
-                    user->opcode() == spv::Op::OpMemberName ||
-                    user->IsDecoration() || user->IsNonSemanticInstruction() ||
-                    user->IsDebugLineInst());
-  };
-  auto users_are_closed = [this, inst, &is_ignorable_user](
+  auto users_are_closed = [this, inst](
                               const std::vector<Instruction*>& kills) {
     std::unordered_set<Instruction*> allowed(kills.begin(), kills.end());
     allowed.insert(inst);
@@ -1908,9 +1950,15 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
       if (kill->result_id() != 0) {
         bool only_allowed_users = true;
         get_def_use_mgr()->ForEachUser(
-            kill, [&allowed, &only_allowed_users, &is_ignorable_user](
+            kill, [this, kill, &allowed, &only_allowed_users](
                       Instruction* user) {
-              if (!is_ignorable_user(user) &&
+              if (IsFunctionPointer(kill->result_id()) &&
+                  user->opcode() == spv::Op::OpStore &&
+                  user->NumInOperands() >= 1 &&
+                  user->GetSingleWordInOperand(0) == kill->result_id()) {
+                return;
+              }
+              if (!IsIgnorableDirectUser(user) &&
                   allowed.find(user) == allowed.end()) {
                 only_allowed_users = false;
               }
@@ -1924,9 +1972,14 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         if (!pointer) return false;
         bool only_allowed_users = true;
         get_def_use_mgr()->ForEachUser(
-            pointer, [&allowed, &only_allowed_users, &is_ignorable_user](
+            pointer, [this, pointer, &allowed, &only_allowed_users](
                         Instruction* user) {
-              if (!is_ignorable_user(user) &&
+              if (user->opcode() == spv::Op::OpStore &&
+                  user->NumInOperands() >= 1 &&
+                  user->GetSingleWordInOperand(0) == pointer->result_id()) {
+                return;
+              }
+              if (!IsIgnorableDirectUser(user) &&
                   allowed.find(user) == allowed.end()) {
                 only_allowed_users = false;
               }
@@ -1940,10 +1993,12 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
   DirectMatrixLoadCandidate direct_a;
   DirectMatrixLoadCandidate direct_b;
   DirectMatrixLoadCandidate direct_c;
+  std::vector<std::pair<uint32_t, uint32_t>> value_arguments;
 
   // Resolve A: buffer load or constant
   bool a_is_value = false;
   uint32_t a_constant_id = 0;
+  uint32_t a_value_id = a_inst ? a_inst->result_id() : 0;
   if (resolve_matrix_load(a_inst, &direct_a)) {
     a_is_value = false;
   } else {
@@ -1967,13 +2022,18 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         return true;  // Not all constant operands, bail to pattern path
       }
     } else {
-      return true;  // Unknown A source, bail to pattern path
+      a_is_value = true;
+      Instruction* a_value = a_source ? a_source : a_inst;
+      if (!a_value || a_value->result_id() == 0) return true;
+      a_value_id = a_value->result_id();
+      value_arguments.push_back({a_value_id, a->lowered_type_id});
     }
   }
 
   // Resolve B: buffer load or constant
   bool b_is_value = false;
   uint32_t b_constant_id = 0;
+  uint32_t b_value_id = b_inst ? b_inst->result_id() : 0;
   if (resolve_matrix_load(b_inst, &direct_b)) {
     b_is_value = false;
   } else {
@@ -1995,13 +2055,18 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         return true;
       }
     } else {
-      return true;  // Unknown B source, bail to pattern path
+      b_is_value = true;
+      Instruction* b_value = b_source ? b_source : b_inst;
+      if (!b_value || b_value->result_id() == 0) return true;
+      b_value_id = b_value->result_id();
+      value_arguments.push_back({b_value_id, b->lowered_type_id});
     }
   }
 
   // Resolve C: buffer load or constant
   bool c_is_value = false;
   uint32_t c_constant_id = 0;
+  uint32_t c_value_id = c_inst ? c_inst->result_id() : 0;
   if (resolve_matrix_load(c_inst, &direct_c)) {
     c_is_value = false;
   } else {
@@ -2023,7 +2088,11 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
         return true;
       }
     } else {
-      return true;  // Unknown C source, bail to pattern path
+      c_is_value = true;
+      Instruction* c_value = c_source ? c_source : c_inst;
+      if (!c_value || c_value->result_id() == 0) return true;
+      c_value_id = c_value->result_id();
+      value_arguments.push_back({c_value_id, c->lowered_type_id});
     }
   }
 
@@ -2032,63 +2101,95 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
-  auto add_dead_function_store_users =
-      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
-          Instruction* value) {
-        if (!value || value->result_id() == 0) return false;
-        bool ok = true;
-        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
-          if (!ok || !user || user == inst || is_ignorable_user(user) ||
-              kill_set.find(user) != kill_set.end()) {
-            return;
-          }
-          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
-              user->GetSingleWordInOperand(1) != value->result_id()) {
-            ok = false;
-            return;
-          }
-          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
-          if (!IsFunctionPointer(pointer_id)) {
-            ok = false;
-            return;
-          }
-          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
-          if (!pointer) {
-            ok = false;
-            return;
-          }
-          bool only_dead_users = true;
-          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
-            if (pointer_user == user || is_ignorable_user(pointer_user) ||
-                kill_set.find(pointer_user) != kill_set.end()) {
-              return;
-            }
-            only_dead_users = false;
-          });
-          if (!only_dead_users) {
-            ok = false;
-            return;
-          }
-          add_kill(user);
-          add_kill(pointer);
-        });
-        return ok;
-      };
+  auto remove_kill = [&kill_list, &kill_set](Instruction* kill) {
+    if (!kill) return;
+    kill_set.erase(kill);
+    kill_list.erase(std::remove(kill_list.begin(), kill_list.end(), kill),
+                    kill_list.end());
+  };
+  auto keep_direct_chain_alive = [this, &remove_kill](
+                                     const std::vector<Instruction*>& chain) {
+    for (Instruction* chain_inst : chain) {
+      remove_kill(chain_inst);
+      if (chain_inst->opcode() != spv::Op::OpStore ||
+          chain_inst->NumInOperands() < 1) {
+        continue;
+      }
+      const uint32_t pointer_id = chain_inst->GetSingleWordInOperand(0);
+      if (!IsFunctionPointer(pointer_id)) continue;
+      remove_kill(get_def_use_mgr()->GetDef(pointer_id));
+    }
+  };
+  auto has_live_users_outside_kill = [this, inst, &kill_set](
+                                          Instruction* source_load) {
+    if (!source_load || source_load->result_id() == 0) return false;
+    bool has_live_users = false;
+    get_def_use_mgr()->ForEachUser(source_load, [&](Instruction* user) {
+      if (!user || user == inst || IsIgnorableDirectUser(user) ||
+          kill_set.find(user) != kill_set.end()) {
+        return;
+      }
+      has_live_users = true;
+    });
+    return has_live_users;
+  };
   // Only add kills for non-constant operands
   if (!a_is_value) {
     for (Instruction* kill : direct_a.chain) add_kill(kill);
     add_kill(direct_a.source_load);
-    if (!add_dead_function_store_users(direct_a.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_a.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
   }
   if (!b_is_value) {
     for (Instruction* kill : direct_b.chain) add_kill(kill);
     add_kill(direct_b.source_load);
-    if (!add_dead_function_store_users(direct_b.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_b.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
   }
   if (!c_is_value) {
     for (Instruction* kill : direct_c.chain) add_kill(kill);
     add_kill(direct_c.source_load);
-    if (!add_dead_function_store_users(direct_c.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_c.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
+  }
+  if (!a_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_a.source_load,
+                                         kill_set)) {
+    remove_kill(direct_a.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_a.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_a.chain);
+  }
+  if (!b_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_b.source_load,
+                                         kill_set)) {
+    remove_kill(direct_b.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_b.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_b.chain);
+  }
+  if (!c_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_c.source_load,
+                                         kill_set)) {
+    remove_kill(direct_c.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_c.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_c.chain);
+  }
+  if (!a_is_value && has_live_users_outside_kill(direct_a.source_load)) {
+    remove_kill(direct_a.source_load);
+  }
+  if (!b_is_value && has_live_users_outside_kill(direct_b.source_load)) {
+    remove_kill(direct_b.source_load);
+  }
+  if (!c_is_value && has_live_users_outside_kill(direct_c.source_load)) {
+    remove_kill(direct_c.source_load);
   }
   if (!users_are_closed(kill_list)) return true;
 
@@ -2111,10 +2212,13 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
       c_is_value ? 0 : direct_c.shape_id,
       c_is_value ? 0 : direct_c.offset_id,
       c_is_value ? std::vector<Operand>{} : direct_c.memory_operands,
-      c_constant_id, c_is_value);
+      c_constant_id, c_is_value, value_arguments);
   if (function_id == 0) return false;
 
-  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, {});
+  std::vector<uint32_t> call_args;
+  call_args.reserve(value_arguments.size());
+  for (const auto& arg : value_arguments) call_args.push_back(arg.first);
+  RebuildAsFunctionCall(inst, result->lowered_type_id, function_id, call_args);
   for (Instruction* kill : kill_list) {
     if (!kill->IsNop()) context()->KillInst(kill);
   }
@@ -2208,13 +2312,7 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
                             kHwMatrixLoadMemoryOperandsInIdx);
   };
 
-  auto is_ignorable_user = [](Instruction* user) {
-    return user && (user->opcode() == spv::Op::OpName ||
-                    user->opcode() == spv::Op::OpMemberName ||
-                    user->IsDecoration() || user->IsNonSemanticInstruction() ||
-                    user->IsDebugLineInst());
-  };
-  auto users_are_closed = [this, inst, &is_ignorable_user](
+  auto users_are_closed = [this, inst](
                               const std::vector<Instruction*>& kills) {
     std::unordered_set<Instruction*> allowed(kills.begin(), kills.end());
     allowed.insert(inst);
@@ -2223,9 +2321,15 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       if (kill->result_id() != 0) {
         bool only_allowed_users = true;
         get_def_use_mgr()->ForEachUser(
-            kill, [&allowed, &only_allowed_users, &is_ignorable_user](
+            kill, [this, kill, &allowed, &only_allowed_users](
                       Instruction* user) {
-              if (!is_ignorable_user(user) &&
+              if (IsFunctionPointer(kill->result_id()) &&
+                  user->opcode() == spv::Op::OpStore &&
+                  user->NumInOperands() >= 1 &&
+                  user->GetSingleWordInOperand(0) == kill->result_id()) {
+                return;
+              }
+              if (!IsIgnorableDirectUser(user) &&
                   allowed.find(user) == allowed.end()) {
                 only_allowed_users = false;
               }
@@ -2239,9 +2343,14 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         if (!pointer) return false;
         bool only_allowed_users = true;
         get_def_use_mgr()->ForEachUser(
-            pointer, [&allowed, &only_allowed_users, &is_ignorable_user](
+            pointer, [this, pointer, &allowed, &only_allowed_users](
                         Instruction* user) {
-              if (!is_ignorable_user(user) &&
+              if (user->opcode() == spv::Op::OpStore &&
+                  user->NumInOperands() >= 1 &&
+                  user->GetSingleWordInOperand(0) == pointer->result_id()) {
+                return;
+              }
+              if (!IsIgnorableDirectUser(user) &&
                   allowed.find(user) == allowed.end()) {
                 only_allowed_users = false;
               }
@@ -2370,64 +2479,98 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   auto add_kill = [&kill_list, &kill_set](Instruction* kill) {
     if (kill && kill_set.insert(kill).second) kill_list.push_back(kill);
   };
-  auto add_dead_function_store_users =
-      [this, inst, &is_ignorable_user, &add_kill, &kill_set](
-          Instruction* value) {
-        if (!value || value->result_id() == 0) return false;
-        bool ok = true;
-        get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
-          if (!ok || !user || user == inst || is_ignorable_user(user) ||
-              kill_set.find(user) != kill_set.end()) {
-            return;
-          }
-          if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
-              user->GetSingleWordInOperand(1) != value->result_id()) {
-            ok = false;
-            return;
-          }
-          const uint32_t pointer_id = user->GetSingleWordInOperand(0);
-          if (!IsFunctionPointer(pointer_id)) {
-            ok = false;
-            return;
-          }
-          Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
-          if (!pointer) {
-            ok = false;
-            return;
-          }
-          bool only_dead_users = true;
-          get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
-            if (pointer_user == user || is_ignorable_user(pointer_user) ||
-                kill_set.find(pointer_user) != kill_set.end()) {
-              return;
-            }
-            only_dead_users = false;
-          });
-          if (!only_dead_users) {
-            ok = false;
-            return;
-          }
-          add_kill(user);
-          add_kill(pointer);
-        });
-        return ok;
-      };
+  auto remove_kill = [&kill_list, &kill_set](Instruction* kill) {
+    if (!kill) return;
+    kill_set.erase(kill);
+    kill_list.erase(std::remove(kill_list.begin(), kill_list.end(), kill),
+                    kill_list.end());
+  };
+  auto keep_direct_chain_alive = [this, &remove_kill](
+                                     const std::vector<Instruction*>& chain) {
+    for (Instruction* chain_inst : chain) {
+      remove_kill(chain_inst);
+      if (chain_inst->opcode() != spv::Op::OpStore ||
+          chain_inst->NumInOperands() < 1) {
+        continue;
+      }
+      const uint32_t pointer_id = chain_inst->GetSingleWordInOperand(0);
+      if (!IsFunctionPointer(pointer_id)) continue;
+      remove_kill(get_def_use_mgr()->GetDef(pointer_id));
+    }
+  };
+  auto has_live_users_outside_kill = [this, inst, &kill_set](
+                                          Instruction* source_load) {
+    if (!source_load || source_load->result_id() == 0) return false;
+    bool has_live_users = false;
+    get_def_use_mgr()->ForEachUser(source_load, [&](Instruction* user) {
+      if (!user || user == inst || IsIgnorableDirectUser(user) ||
+          kill_set.find(user) != kill_set.end()) {
+        return;
+      }
+      has_live_users = true;
+    });
+    return has_live_users;
+  };
   // Only add input kills if not a constant
   if (!input_is_value) {
     for (Instruction* kill : direct_input.chain) add_kill(kill);
     add_kill(direct_input.source_load);
-    if (!add_dead_function_store_users(direct_input.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_input.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
   }
   // Only add matrix kills if not a constant
   if (!matrix_is_value) {
     for (Instruction* kill : direct_matrix.chain) add_kill(kill);
     add_kill(direct_matrix.source_load);
-    if (!add_dead_function_store_users(direct_matrix.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_matrix.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
   }
   if (has_bias && !bias_is_value) {
     for (Instruction* kill : direct_bias.chain) add_kill(kill);
     add_kill(direct_bias.source_load);
-    if (!add_dead_function_store_users(direct_bias.source_load)) return true;
+    if (!AddSharedDirectSourceKillsOrCheckSafe(inst, direct_bias.source_load,
+                                               &kill_list, &kill_set)) {
+      return true;
+    }
+  }
+  if (!input_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_input.source_load,
+                                         kill_set)) {
+    remove_kill(direct_input.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_input.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_input.chain);
+  }
+  if (!matrix_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_matrix.source_load,
+                                         kill_set)) {
+    remove_kill(direct_matrix.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_matrix.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_matrix.chain);
+  }
+  if (has_bias && !bias_is_value &&
+      HasLiveSafeSharedDirectSourceUsers(inst, direct_bias.source_load,
+                                         kill_set)) {
+    remove_kill(direct_bias.source_load);
+    KeepSharedDirectSourceAlive(inst, direct_bias.source_load, &kill_list,
+                                &kill_set);
+    keep_direct_chain_alive(direct_bias.chain);
+  }
+  if (!input_is_value && has_live_users_outside_kill(direct_input.source_load)) {
+    remove_kill(direct_input.source_load);
+  }
+  if (!matrix_is_value &&
+      has_live_users_outside_kill(direct_matrix.source_load)) {
+    remove_kill(direct_matrix.source_load);
+  }
+  if (has_bias && !bias_is_value &&
+      has_live_users_outside_kill(direct_bias.source_load)) {
+    remove_kill(direct_bias.source_load);
   }
   if (!users_are_closed(kill_list)) return true;
 
@@ -5261,17 +5404,15 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
     uint32_t c_pointer_id,
     uint32_t c_pointer_type_id, uint32_t c_shape_id, uint32_t c_offset_id,
     const std::vector<Operand>& c_memory_operands,
-    uint32_t c_constant_id, bool c_is_value) {
+    uint32_t c_constant_id, bool c_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
   if (!CanUsePackedVec4MatrixMulAdd(result, a, b, c)) return 0;
   if ((!a_is_value && (a_pointer_id == 0 || a_pointer_type_id == 0 ||
                        a_shape_id == 0 || a_offset_id == 0)) ||
-      (a_is_value && a_constant_id == 0) ||
       (!b_is_value && (b_pointer_id == 0 || b_pointer_type_id == 0 ||
                        b_shape_id == 0 || b_offset_id == 0)) ||
-      (b_is_value && b_constant_id == 0) ||
       (!c_is_value && (c_pointer_id == 0 || c_pointer_type_id == 0 ||
-                       c_shape_id == 0 || c_offset_id == 0)) ||
-      (c_is_value && c_constant_id == 0)) {
+                       c_shape_id == 0 || c_offset_id == 0))) {
     return 0;
   }
 
@@ -5293,8 +5434,12 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
           : GetOrCreatePackedLoadChunkFunction(
                 c_pointer_id, c_pointer_type_id, c.component_type_id,
                 c.packed_vec4_type_id, c_memory_operands);
+  std::vector<uint32_t> param_type_ids;
+  for (const auto& arg : value_arguments) {
+    param_type_ids.push_back(arg.second);
+  }
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(result.lowered_type_id, {});
+      GetOrCreateFunctionType(result.lowered_type_id, param_type_ids);
   const uint32_t lowered_function_ptr_type_id = GetOrCreatePointerType(
       result.lowered_type_id, spv::StorageClass::Function);
   const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
@@ -5335,6 +5480,31 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
   function_start->AddOperand(IdOperand(function_type_id));
   std::unique_ptr<Function> function =
       MakeUnique<Function>(std::move(function_start));
+
+  uint32_t a_param_id = 0;
+  if (a_is_value && a_constant_id == 0) {
+    a_param_id = TakeNextId();
+    if (a_param_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, a.lowered_type_id, a_param_id,
+        std::initializer_list<Operand>{}));
+  }
+  uint32_t b_param_id = 0;
+  if (b_is_value && b_constant_id == 0) {
+    b_param_id = TakeNextId();
+    if (b_param_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, b.lowered_type_id, b_param_id,
+        std::initializer_list<Operand>{}));
+  }
+  uint32_t c_param_id = 0;
+  if (c_is_value && c_constant_id == 0) {
+    c_param_id = TakeNextId();
+    if (c_param_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, c.lowered_type_id, c_param_id,
+        std::initializer_list<Operand>{}));
+  }
 
   const uint32_t entry_label_id = TakeNextId();
   const uint32_t row_header_label_id = TakeNextId();
@@ -5462,13 +5632,25 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
 
   // Now do all stores AFTER all variables are declared
   if (a_is_value) {
-    if (!entry_builder.AddStore(a_var->result_id(), a_constant_id)) return 0;
+    const uint32_t store_src = a_constant_id != 0 ? a_constant_id : a_param_id;
+    if (store_src == 0 ||
+        !entry_builder.AddStore(a_var->result_id(), store_src)) {
+      return 0;
+    }
   }
   if (b_is_value) {
-    if (!entry_builder.AddStore(b_var->result_id(), b_constant_id)) return 0;
+    const uint32_t store_src = b_constant_id != 0 ? b_constant_id : b_param_id;
+    if (store_src == 0 ||
+        !entry_builder.AddStore(b_var->result_id(), store_src)) {
+      return 0;
+    }
   }
   if (c_is_value) {
-    if (!entry_builder.AddStore(c_var->result_id(), c_constant_id)) return 0;
+    const uint32_t store_src = c_constant_id != 0 ? c_constant_id : c_param_id;
+    if (store_src == 0 ||
+        !entry_builder.AddStore(c_var->result_id(), store_src)) {
+      return 0;
+    }
   }
 
   if (!entry_builder.AddStore(row_var->result_id(), zero_uint_id) ||
@@ -7946,7 +8128,7 @@ bool HwLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
   return IsPackedVec4(result) &&
-         result.component_type_id == a.component_type_id &&
+         IsSamePackedVec4Kind(result, a) &&
          IsSamePackedVec4Kind(result, b) && IsSamePackedVec4Kind(result, c);
 }
 
@@ -8050,6 +8232,14 @@ uint32_t HwLowerToStandardPass::GetFunctionPointerOperandForLoad(
   return pointer_id;
 }
 
+bool HwLowerToStandardPass::IsIgnorableDirectUser(
+    const Instruction* user) const {
+  return user && (user->opcode() == spv::Op::OpName ||
+                  user->opcode() == spv::Op::OpMemberName ||
+                  user->IsDecoration() || user->IsNonSemanticInstruction() ||
+                  user->IsDebugLineInst());
+}
+
 bool HwLowerToStandardPass::CanMoveLoadToUse(
     Instruction* load, Instruction* use, bool function_memory,
     uint32_t first_memory_operand) const {
@@ -8058,12 +8248,280 @@ bool HwLowerToStandardPass::CanMoveLoadToUse(
   return !HasUnsafeMemoryInstructionBetween(load, use, function_memory);
 }
 
+bool HwLowerToStandardPass::IsDirectSafeSharedValueUser(
+    Instruction* current_inst, Instruction* user,
+    const std::unordered_set<Instruction*>& kill_set) const {
+  if (!user || user == current_inst || IsIgnorableDirectUser(user) ||
+      kill_set.find(user) != kill_set.end()) {
+    return true;
+  }
+  if (IsHwOpcode(user->opcode())) return true;
+  if (user->opcode() != spv::Op::OpBitcast) return false;
+
+  bool ok = true;
+  get_def_use_mgr()->ForEachUser(user, [&](Instruction* bitcast_user) {
+    if (!ok) return;
+    ok = IsDirectSafeSharedValueUser(current_inst, bitcast_user, kill_set);
+  });
+  return ok;
+}
+
+bool HwLowerToStandardPass::IsDirectSafeSharedFunctionPointerUser(
+    Instruction* current_inst, Instruction* pointer_user,
+    const std::unordered_set<Instruction*>& kill_set) const {
+  if (!pointer_user || pointer_user == current_inst ||
+      IsIgnorableDirectUser(pointer_user) ||
+      kill_set.find(pointer_user) != kill_set.end()) {
+    return true;
+  }
+  if (pointer_user->opcode() != spv::Op::OpLoad ||
+      pointer_user->NumInOperands() < 1) {
+    return false;
+  }
+
+  bool ok = true;
+  get_def_use_mgr()->ForEachUser(pointer_user, [&](Instruction* load_user) {
+    if (!ok) return;
+    ok = IsDirectSafeSharedValueUser(current_inst, load_user, kill_set);
+  });
+  return ok;
+}
+
+HwLowerToStandardPass::SharedDirectUserState
+HwLowerToStandardPass::AnalyzeSharedDirectValueUses(
+    Instruction* current_inst, Instruction* value,
+    const std::unordered_set<Instruction*>& kill_set,
+    std::unordered_set<Instruction*>* keep_alive,
+    std::unordered_set<const Instruction*>* visited_values,
+    std::unordered_set<const Instruction*>* visited_pointers) const {
+  if (!value || value->result_id() == 0 || !visited_values ||
+      !visited_pointers) {
+    return SharedDirectUserState::kUnsafe;
+  }
+  if (!visited_values->insert(value).second) {
+    return SharedDirectUserState::kNone;
+  }
+
+  SharedDirectUserState state = SharedDirectUserState::kNone;
+  get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+    if (state == SharedDirectUserState::kUnsafe || !user ||
+        user == current_inst || IsIgnorableDirectUser(user)) {
+      return;
+    }
+
+    SharedDirectUserState user_state = SharedDirectUserState::kUnsafe;
+    if (IsHwOpcode(user->opcode())) {
+      user_state = kill_set.find(user) == kill_set.end()
+                       ? SharedDirectUserState::kSafeLive
+                       : SharedDirectUserState::kNone;
+    } else if (user->opcode() == spv::Op::OpBitcast) {
+      user_state = AnalyzeSharedDirectValueUses(current_inst, user, kill_set,
+                                                keep_alive, visited_values,
+                                                visited_pointers);
+      if (user_state == SharedDirectUserState::kSafeLive && keep_alive) {
+        keep_alive->insert(user);
+      }
+    } else if (user->opcode() == spv::Op::OpStore &&
+               user->NumInOperands() >= 2 &&
+               user->GetSingleWordInOperand(1) == value->result_id()) {
+      const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+      if (IsFunctionPointer(pointer_id)) {
+        Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+        if (pointer) {
+          user_state = AnalyzeSharedDirectPointerUses(
+              current_inst, pointer, user, kill_set, keep_alive,
+              visited_values, visited_pointers);
+          if (user_state == SharedDirectUserState::kSafeLive &&
+              keep_alive) {
+            keep_alive->insert(user);
+            keep_alive->insert(pointer);
+          }
+        }
+      }
+    }
+
+    if (user_state == SharedDirectUserState::kUnsafe) {
+      state = SharedDirectUserState::kUnsafe;
+      return;
+    }
+    if (user_state == SharedDirectUserState::kSafeLive) {
+      state = SharedDirectUserState::kSafeLive;
+    }
+  });
+
+  return state;
+}
+
+HwLowerToStandardPass::SharedDirectUserState
+HwLowerToStandardPass::AnalyzeSharedDirectPointerUses(
+    Instruction* current_inst, Instruction* pointer,
+    Instruction* originating_store,
+    const std::unordered_set<Instruction*>& kill_set,
+    std::unordered_set<Instruction*>* keep_alive,
+    std::unordered_set<const Instruction*>* visited_values,
+    std::unordered_set<const Instruction*>* visited_pointers) const {
+  if (!pointer || !visited_values || !visited_pointers) {
+    return SharedDirectUserState::kUnsafe;
+  }
+  if (!visited_pointers->insert(pointer).second) {
+    return SharedDirectUserState::kNone;
+  }
+
+  SharedDirectUserState state = SharedDirectUserState::kNone;
+  get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+    if (state == SharedDirectUserState::kUnsafe || !pointer_user ||
+        pointer_user == originating_store ||
+        IsIgnorableDirectUser(pointer_user)) {
+      return;
+    }
+    if (pointer_user->opcode() == spv::Op::OpStore &&
+        pointer_user->NumInOperands() >= 1 &&
+        pointer_user->GetSingleWordInOperand(0) == pointer->result_id()) {
+      return;
+    }
+    if (pointer_user->opcode() != spv::Op::OpLoad ||
+        pointer_user->NumInOperands() < 1) {
+      state = SharedDirectUserState::kUnsafe;
+      return;
+    }
+
+    SharedDirectUserState load_state = AnalyzeSharedDirectValueUses(
+        current_inst, pointer_user, kill_set, keep_alive, visited_values,
+        visited_pointers);
+    if (load_state == SharedDirectUserState::kUnsafe) {
+      state = SharedDirectUserState::kUnsafe;
+      return;
+    }
+    if (load_state == SharedDirectUserState::kSafeLive) {
+      if (keep_alive) keep_alive->insert(pointer_user);
+      state = SharedDirectUserState::kSafeLive;
+    }
+  });
+
+  return state;
+}
+
+bool HwLowerToStandardPass::AnalyzeSharedDirectSourceUsers(
+    Instruction* current_inst, Instruction* source_load,
+    const std::unordered_set<Instruction*>& kill_set,
+    bool* has_live_shared_users,
+    std::unordered_set<Instruction*>* keep_alive) const {
+  if (has_live_shared_users) *has_live_shared_users = false;
+  if (!current_inst || !source_load || source_load->result_id() == 0) {
+    return false;
+  }
+
+  std::unordered_set<const Instruction*> visited_values;
+  std::unordered_set<const Instruction*> visited_pointers;
+  SharedDirectUserState state = AnalyzeSharedDirectValueUses(
+      current_inst, source_load, kill_set, keep_alive, &visited_values,
+      &visited_pointers);
+  if (state == SharedDirectUserState::kUnsafe) return false;
+  if (state == SharedDirectUserState::kSafeLive) {
+    if (has_live_shared_users) *has_live_shared_users = true;
+    if (keep_alive) keep_alive->insert(source_load);
+  }
+  return true;
+}
+
+bool HwLowerToStandardPass::AddSharedDirectSourceKillsOrCheckSafe(
+    Instruction* current_inst, Instruction* source_load,
+    std::vector<Instruction*>* kill_list,
+    std::unordered_set<Instruction*>* kill_set) const {
+  if (!current_inst || !source_load || source_load->result_id() == 0 ||
+      !kill_list || !kill_set) {
+    return false;
+  }
+
+  auto add_kill = [kill_list, kill_set](Instruction* kill) {
+    if (kill && kill_set->insert(kill).second) kill_list->push_back(kill);
+  };
+
+  bool has_live_shared_users = false;
+  if (!AnalyzeSharedDirectSourceUsers(current_inst, source_load, *kill_set,
+                                      &has_live_shared_users, nullptr)) {
+    return false;
+  }
+  if (has_live_shared_users) return true;
+
+  get_def_use_mgr()->ForEachUser(source_load, [&](Instruction* user) {
+    if (!user || user == current_inst || IsIgnorableDirectUser(user) ||
+        kill_set->find(user) != kill_set->end()) {
+      return;
+    }
+    if (user->opcode() != spv::Op::OpStore || user->NumInOperands() < 2 ||
+        user->GetSingleWordInOperand(1) != source_load->result_id()) {
+      return;
+    }
+    const uint32_t pointer_id = user->GetSingleWordInOperand(0);
+    if (!IsFunctionPointer(pointer_id)) return;
+    Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+    if (!pointer) return;
+    bool only_dead_users = true;
+    bool has_later_store_to_pointer = false;
+    get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+      if (pointer_user == user || IsIgnorableDirectUser(pointer_user) ||
+          kill_set->find(pointer_user) != kill_set->end()) {
+        return;
+      }
+      if (pointer_user->opcode() == spv::Op::OpStore &&
+          pointer_user->NumInOperands() >= 1 &&
+          pointer_user->GetSingleWordInOperand(0) == pointer->result_id()) {
+        has_later_store_to_pointer = true;
+        return;
+      }
+      only_dead_users = false;
+    });
+    if (!only_dead_users) return;
+    add_kill(user);
+    if (!has_later_store_to_pointer) add_kill(pointer);
+  });
+
+  return true;
+}
+
+bool HwLowerToStandardPass::HasLiveSafeSharedDirectSourceUsers(
+    Instruction* current_inst, Instruction* source_load,
+    const std::unordered_set<Instruction*>& kill_set) const {
+  bool has_live_shared_users = false;
+  if (!AnalyzeSharedDirectSourceUsers(current_inst, source_load, kill_set,
+                                      &has_live_shared_users, nullptr)) {
+    return false;
+  }
+  return has_live_shared_users;
+}
+
+void HwLowerToStandardPass::KeepSharedDirectSourceAlive(
+    Instruction* current_inst, Instruction* source_load,
+    std::vector<Instruction*>* kill_list,
+    std::unordered_set<Instruction*>* kill_set) const {
+  if (!current_inst || !source_load || !kill_list || !kill_set) return;
+
+  auto remove_from_kill = [kill_list, kill_set](Instruction* inst) {
+    kill_set->erase(inst);
+    kill_list->erase(std::remove(kill_list->begin(), kill_list->end(), inst),
+                     kill_list->end());
+  };
+
+  bool has_live_shared_users = false;
+  std::unordered_set<Instruction*> keep_alive;
+  if (!AnalyzeSharedDirectSourceUsers(current_inst, source_load, *kill_set,
+                                      &has_live_shared_users, &keep_alive) ||
+      !has_live_shared_users) {
+    return;
+  }
+  for (Instruction* inst : keep_alive) {
+    remove_from_kill(inst);
+  }
+}
+
 bool HwLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
     Instruction* start, Instruction* end, bool function_memory) const {
   if (!start || !end) return true;
   BasicBlock* start_block = context()->get_instr_block(start);
   BasicBlock* end_block = context()->get_instr_block(end);
   if (!start_block || start_block != end_block) return true;
+  const uint32_t load_pointer_id = GetMemoryPointerOperandId(start);
 
   bool after_start = false;
   for (Instruction& inst : *start_block) {
@@ -8073,7 +8531,13 @@ bool HwLowerToStandardPass::HasUnsafeMemoryInstructionBetween(
     }
     if (&inst == end) return false;
     if (!after_start) continue;
-    if (InstructionMayWriteOrOrderMemory(&inst, function_memory)) return true;
+    if (InstructionMayWriteOrOrderMemory(&inst, function_memory)) {
+      if (!function_memory &&
+          IsDisjointModuleMemoryWrite(load_pointer_id, &inst)) {
+        continue;
+      }
+      return true;
+    }
   }
   return true;
 }
@@ -8099,7 +8563,19 @@ bool HwLowerToStandardPass::InstructionMayWriteOrOrderMemory(
     case spv::Op::OpCopyMemorySized:
       return inst->NumInOperands() >= 1 &&
              pointer_write_matches(inst->GetSingleWordInOperand(0));
+    case spv::Op::OpCooperativeMatrixStoreHW:
+    case spv::Op::OpCooperativeVectorStoreHW:
+      return inst->NumInOperands() >= 1 &&
+             pointer_write_matches(inst->GetSingleWordInOperand(0));
     case spv::Op::OpFunctionCall:
+      // Function calls to lowering-generated functions (direct-path matmul/
+      // vecmatmul) only read from SSBO and are safe to move loads past.
+      if (inst->NumInOperands() >= 1 &&
+          generated_function_ids_.count(
+              inst->GetSingleWordInOperand(0))) {
+        return false;
+      }
+      return true;
     case spv::Op::OpControlBarrier:
     case spv::Op::OpMemoryBarrier:
     case spv::Op::OpImageWrite:
@@ -8107,6 +8583,80 @@ bool HwLowerToStandardPass::InstructionMayWriteOrOrderMemory(
     default:
       return false;
   }
+}
+
+uint32_t HwLowerToStandardPass::GetMemoryPointerOperandId(
+    const Instruction* inst) const {
+  if (!inst || inst->NumInOperands() < 1) return 0;
+  switch (inst->opcode()) {
+    case spv::Op::OpLoad:
+    case spv::Op::OpStore:
+    case spv::Op::OpCopyMemory:
+    case spv::Op::OpCopyMemorySized:
+    case spv::Op::OpCooperativeMatrixLoadHW:
+    case spv::Op::OpCooperativeMatrixStoreHW:
+    case spv::Op::OpCooperativeVectorLoadHW:
+    case spv::Op::OpCooperativeVectorStoreHW:
+      return inst->GetSingleWordInOperand(0);
+    default:
+      return 0;
+  }
+}
+
+uint32_t HwLowerToStandardPass::GetRootModulePointerId(uint32_t pointer_id) const {
+  if (pointer_id == 0) return 0;
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  if (!pointer) return 0;
+
+  if (pointer->opcode() == spv::Op::OpVariable &&
+      context()->get_instr_block(pointer) == nullptr) {
+    return pointer_id;
+  }
+
+  if (pointer->opcode() == spv::Op::OpLoad && pointer->NumInOperands() >= 1) {
+    const uint32_t function_pointer_id = pointer->GetSingleWordInOperand(0);
+    if (!IsFunctionPointer(function_pointer_id)) return 0;
+    Instruction* store =
+        FindLastStoreToFunctionPointer(function_pointer_id, pointer);
+    if (!store || store->NumInOperands() < 2) return 0;
+    return GetRootModulePointerId(store->GetSingleWordInOperand(1));
+  }
+
+  switch (pointer->opcode()) {
+    case spv::Op::OpAccessChain:
+    case spv::Op::OpInBoundsAccessChain:
+    case spv::Op::OpPtrAccessChain:
+    case spv::Op::OpInBoundsPtrAccessChain:
+    case spv::Op::OpCopyObject:
+    case spv::Op::OpBitcast:
+      return pointer->NumInOperands() >= 1
+                 ? GetRootModulePointerId(pointer->GetSingleWordInOperand(0))
+                 : 0;
+    default:
+      return 0;
+  }
+}
+
+bool HwLowerToStandardPass::IsDisjointModuleMemoryWrite(
+    uint32_t load_pointer_id, const Instruction* inst) const {
+  if (load_pointer_id == 0 || !inst) return false;
+
+  uint32_t storage_class = 0;
+  if (!GetPointerStorageClass(load_pointer_id, &storage_class) ||
+      storage_class == uint32_t(spv::StorageClass::Function)) {
+    return false;
+  }
+
+  const uint32_t write_pointer_id = GetMemoryPointerOperandId(inst);
+  if (write_pointer_id == 0 ||
+      !GetPointerStorageClass(write_pointer_id, &storage_class) ||
+      storage_class == uint32_t(spv::StorageClass::Function)) {
+    return false;
+  }
+
+  const uint32_t load_root_id = GetRootModulePointerId(load_pointer_id);
+  const uint32_t write_root_id = GetRootModulePointerId(write_pointer_id);
+  return load_root_id != 0 && write_root_id != 0 && load_root_id != write_root_id;
 }
 
 bool HwLowerToStandardPass::MemoryAccessOperandsAreMovable(

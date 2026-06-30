@@ -210,7 +210,8 @@ class HwLowerToStandardPass : public Pass {
       uint32_t b_constant_id, bool b_is_value,
       uint32_t c_pointer_id, uint32_t c_pointer_type_id, uint32_t c_shape_id,
       uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands,
-      uint32_t c_constant_id, bool c_is_value);
+      uint32_t c_constant_id, bool c_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
                                           uint32_t offset_id, uint32_t cols,
@@ -298,13 +299,58 @@ class HwLowerToStandardPass : public Pass {
                                             uint32_t original_pointee_type_id,
                                             uint32_t lowered_pointee_type_id,
                                             uint32_t* pointer_type_id) const;
+  bool IsIgnorableDirectUser(const Instruction* user) const;
   bool CanMoveLoadToUse(Instruction* load, Instruction* use,
                         bool function_memory,
                         uint32_t first_memory_operand) const;
+  bool IsDirectSafeSharedValueUser(
+      Instruction* current_inst, Instruction* user,
+      const std::unordered_set<Instruction*>& kill_set) const;
+  bool IsDirectSafeSharedFunctionPointerUser(
+      Instruction* current_inst, Instruction* pointer_user,
+      const std::unordered_set<Instruction*>& kill_set) const;
+  enum class SharedDirectUserState {
+    kNone,
+    kSafeLive,
+    kUnsafe,
+  };
+  SharedDirectUserState AnalyzeSharedDirectValueUses(
+      Instruction* current_inst, Instruction* value,
+      const std::unordered_set<Instruction*>& kill_set,
+      std::unordered_set<Instruction*>* keep_alive,
+      std::unordered_set<const Instruction*>* visited_values,
+      std::unordered_set<const Instruction*>* visited_pointers) const;
+  SharedDirectUserState AnalyzeSharedDirectPointerUses(
+      Instruction* current_inst, Instruction* pointer,
+      Instruction* originating_store,
+      const std::unordered_set<Instruction*>& kill_set,
+      std::unordered_set<Instruction*>* keep_alive,
+      std::unordered_set<const Instruction*>* visited_values,
+      std::unordered_set<const Instruction*>* visited_pointers) const;
+  bool AnalyzeSharedDirectSourceUsers(
+      Instruction* current_inst, Instruction* source_load,
+      const std::unordered_set<Instruction*>& kill_set,
+      bool* has_live_shared_users,
+      std::unordered_set<Instruction*>* keep_alive) const;
+  bool AddSharedDirectSourceKillsOrCheckSafe(
+      Instruction* current_inst, Instruction* source_load,
+      std::vector<Instruction*>* kill_list,
+      std::unordered_set<Instruction*>* kill_set) const;
+  bool HasLiveSafeSharedDirectSourceUsers(
+      Instruction* current_inst, Instruction* source_load,
+      const std::unordered_set<Instruction*>& kill_set) const;
+  void KeepSharedDirectSourceAlive(
+      Instruction* current_inst, Instruction* source_load,
+      std::vector<Instruction*>* kill_list,
+      std::unordered_set<Instruction*>* kill_set) const;
   bool HasUnsafeMemoryInstructionBetween(Instruction* start, Instruction* end,
                                          bool function_memory) const;
   bool InstructionMayWriteOrOrderMemory(const Instruction* inst,
                                         bool function_memory) const;
+  uint32_t GetMemoryPointerOperandId(const Instruction* inst) const;
+  uint32_t GetRootModulePointerId(uint32_t pointer_id) const;
+  bool IsDisjointModuleMemoryWrite(uint32_t load_pointer_id,
+                                   const Instruction* inst) const;
   bool MemoryAccessOperandsAreMovable(const Instruction* inst,
                                       uint32_t first_in_operand) const;
   bool GetPointerStorageClass(uint32_t pointer_id,
