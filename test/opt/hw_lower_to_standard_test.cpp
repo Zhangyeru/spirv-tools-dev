@@ -144,6 +144,455 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
 }
 
+TEST_F(HwLowerToStandardTest, LowersPackedVectorFConvert) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%vec8h = OpTypeCooperativeVectorHW %half %uint_8
+%vec8f = OpTypeCooperativeVectorHW %float %uint_8
+%x = OpUndef %vec8h
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpFConvert %vec8f %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersVectorUConvertScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Int16
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%ushort = OpTypeInt 16 0
+%uvec8h = OpTypeCooperativeVectorHW %ushort %uint_8
+%uvec8 = OpTypeCooperativeVectorHW %uint %uint_8
+%x = OpUndef %uvec8h
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpUConvert %uvec8 %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpUConvert %uint"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %uint 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersPackedVectorFAdd) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%a = OpUndef %vec8
+%b = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%c = OpFAdd %vec8 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersPackedVectorTimesScalar) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%float_2 = OpConstant %float 2
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%x = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpVectorTimesScalar %vec8 %x %float_2
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFMul %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersVectorIMulScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%vec8 = OpTypeCooperativeVectorHW %int %uint_8
+%a = OpUndef %vec8
+%b = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpIMul %vec8 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpIMul %int"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersVectorConvertFToSWithPackedInput) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%fvec8 = OpTypeCooperativeVectorHW %float %uint_8
+%ivec8 = OpTypeCooperativeVectorHW %int %uint_8
+%x = OpUndef %fvec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpConvertFToS %ivec8 %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersVectorSNegateScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%vec8 = OpTypeCooperativeVectorHW %int %uint_8
+%x = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpSNegate %vec8 %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpSNegate %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMatrixIAdd) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%mat2x5 = OpTypeCooperativeMatrixHW %int %uint_2 %uint_5
+%a = OpUndef %mat2x5
+%b = OpUndef %mat2x5
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%c = OpIAdd %mat2x5 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(10u, CountSubstring(disassembly, "OpIAdd %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersPackedMatrixFConvert) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%mat2x8h = OpTypeCooperativeMatrixHW %half %uint_2 %uint_8
+%mat2x8f = OpTypeCooperativeMatrixHW %float %uint_2 %uint_8
+%x = OpUndef %mat2x8h
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpFConvert %mat2x8f %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMatrixConvertFToSScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%float = OpTypeFloat 32
+%int = OpTypeInt 32 1
+%mat2x5f = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%mat2x5i = OpTypeCooperativeMatrixHW %int %uint_2 %uint_5
+%x = OpUndef %mat2x5f
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpConvertFToS %mat2x5i %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(10u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersPackedMatrixFAdd) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%mat2x8 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_8
+%a = OpUndef %mat2x8
+%b = OpUndef %mat2x8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%c = OpFAdd %mat2x8 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMatrixTimesScalarScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%float = OpTypeFloat 32
+%float_2 = OpConstant %float 2
+%mat2x5 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%x = OpUndef %mat2x5
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpMatrixTimesScalar %mat2x5 %x %float_2
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpMatrixTimesScalar"));
+  EXPECT_EQ(10u, CountSubstring(disassembly, "OpFMul %float"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMatrixIMulScalarFallback) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%mat2x8 = OpTypeCooperativeMatrixHW %int %uint_2 %uint_8
+%a = OpUndef %mat2x8
+%b = OpUndef %mat2x8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpIMul %mat2x8 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(16u, CountSubstring(disassembly, "OpIMul %int"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, ForceScalarModeLowersVectorFAddToScalar) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%a = OpUndef %vec8
+%b = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%c = OpFAdd %vec8 %a %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpFAdd %float"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+}
+
 TEST_F(HwLowerToStandardTest, LowersMatmul4x4x4F32Tiled) {
   const std::string text = R"(
 ; CHECK-NOT: HW

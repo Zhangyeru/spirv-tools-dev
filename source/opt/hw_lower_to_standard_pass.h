@@ -73,6 +73,13 @@ class HwLowerToStandardPass : public Pass {
     uint32_t packed_length = 0;
   };
 
+  struct ValueLayout {
+    uint32_t component_type_id = 0;
+    uint32_t piece_type_id = 0;
+    uint32_t piece_count = 0;
+    bool packed_vec4 = false;
+  };
+
   bool CollectHwTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();
@@ -103,6 +110,9 @@ class HwLowerToStandardPass : public Pass {
   bool LowerCompositeExtract(Instruction* inst);
   bool LowerNullOrUndef(Instruction* inst);
   bool LowerHwBitcast(Instruction* inst);
+  bool LowerHwConversion(Instruction* inst);
+  bool LowerHwArithmetic(Instruction* inst);
+  bool LowerHwScale(Instruction* inst);
   bool LowerExtInstOnCooperativeVector(Instruction* inst);
 
   uint32_t GetOrCreateArrayType(uint32_t component_type_id, uint32_t length,
@@ -237,6 +247,25 @@ class HwLowerToStandardPass : public Pass {
   uint32_t ExtractMatrixScalar(InstructionBuilder* builder,
                                const MatrixTypeInfo& info, uint32_t matrix_id,
                                uint32_t row, uint32_t col);
+  bool DescribeVectorValue(uint32_t value_id, uint32_t expected_length,
+                           ValueLayout* layout) const;
+  bool DescribeMatrixValue(uint32_t value_id, uint32_t expected_rows,
+                           uint32_t expected_cols,
+                           ValueLayout* layout) const;
+  uint32_t ExtractValuePiece(InstructionBuilder* builder,
+                             const ValueLayout& layout, uint32_t value_id,
+                             uint32_t piece_index);
+  uint32_t ExtractVectorValueScalar(InstructionBuilder* builder,
+                                    const ValueLayout& layout,
+                                    uint32_t value_id, uint32_t index);
+  uint32_t ExtractMatrixValueScalar(InstructionBuilder* builder,
+                                    const ValueLayout& layout,
+                                    uint32_t value_id, uint32_t cols,
+                                    uint32_t row, uint32_t col);
+  bool RebuildVectorFromScalars(Instruction* inst, const VectorTypeInfo& info,
+                                const std::vector<uint32_t>& scalar_ids);
+  bool RebuildMatrixFromScalars(Instruction* inst, const MatrixTypeInfo& info,
+                                const std::vector<uint32_t>& scalar_ids);
   uint32_t BuildMatrixRowVector(InstructionBuilder* builder,
                                 const MatrixTypeInfo& info, uint32_t matrix_id,
                                 uint32_t row, uint32_t col_start,
@@ -246,6 +275,7 @@ class HwLowerToStandardPass : public Pass {
                                    uint32_t matrix_id, uint32_t row_start,
                                    uint32_t col, uint32_t vec4_type_id);
   uint32_t BuildVectorTimesScalar(InstructionBuilder* builder,
+                                  spv::Op scale_opcode,
                                   uint32_t vec4_type_id, uint32_t vector_id,
                                   uint32_t scalar_id);
   uint32_t BuildScalarSplat(InstructionBuilder* builder, uint32_t vec4_type_id,
