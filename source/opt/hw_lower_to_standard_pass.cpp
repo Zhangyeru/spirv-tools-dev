@@ -170,6 +170,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   matrix_types_.clear();
   vector_types_.clear();
   lowered_types_.clear();
+  original_hw_value_types_.clear();
   packed_load_chunk_functions_.clear();
   packed_store_chunk_functions_.clear();
   tile_weight_functions_.clear();
@@ -177,6 +178,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   matmul_pattern_functions_.clear();
   matmul_pattern_function_ids_.clear();
   generated_function_ids_.clear();
+  read_only_generated_function_ids_.clear();
 
   bool has_hw = false;
   get_module()->ForEachInst([this, &has_hw](Instruction* inst) {
@@ -185,6 +187,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   if (!has_hw) return Status::SuccessWithoutChange;
 
   if (!CollectHwTypes()) return Status::Failure;
+  RecordOriginalHwValueTypes();
   if (!EliminateHwFunctionVariables()) return Status::Failure;
   if (!LegalizeModule()) return Status::Failure;
   if (!PrepareMatmulPatternFunctions()) return Status::Failure;
@@ -324,6 +327,14 @@ bool HwLowerToStandardPass::CollectHwTypes() {
   }
 
   return true;
+}
+
+void HwLowerToStandardPass::RecordOriginalHwValueTypes() {
+  get_module()->ForEachInst([this](Instruction* inst) {
+    if (inst->result_id() != 0 && IsHwType(inst->type_id())) {
+      original_hw_value_types_[inst->result_id()] = inst->type_id();
+    }
+  });
 }
 
 bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
@@ -580,9 +591,9 @@ bool HwLowerToStandardPass::LegalizeModule() {
             get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
         Instruction* c_inst =
             get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(2));
-        a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-        b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-        c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+        a = GetMatrixTypeForValue(a_inst);
+        b = GetMatrixTypeForValue(b_inst);
+        c = GetMatrixTypeForValue(c_inst);
       }
       if (!result || !a || !b || !c) {
         ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
@@ -633,8 +644,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
               : nullptr;
       const VectorTypeInfo* input =
           input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
-      const MatrixTypeInfo* matrix =
-          matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
+      const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
       const bool has_bias =
           inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW;
       const VectorTypeInfo* bias = nullptr;
@@ -762,12 +772,9 @@ bool HwLowerToStandardPass::PrepareMatmulPatternFunctions() {
         inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
     Instruction* c_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
-    const MatrixTypeInfo* a =
-        a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-    const MatrixTypeInfo* b =
-        b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-    const MatrixTypeInfo* c =
-        c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+    const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+    const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+    const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
     if (!result || !a || !b || !c) {
       ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
       return false;
@@ -991,10 +998,12 @@ bool HwLowerToStandardPass::CleanupHwDeclarations(
       context()->RemoveCapability(spv::Capability::CooperativeVectorHW);
   modified |= RemoveExtensionByName("SPV_AZD_neural_matrix");
   modified |= RemoveExtensionByName("SPV_AZD_cooperative_vector");
-  modified |= RemoveExtensionByName("SPV_HW_neural_shader");
   modified |= RemoveSourceExtensionByName("GL_AZD_neural_matrix");
   modified |= RemoveSourceExtensionByName("GL_AZD_cooperative_vector");
-  modified |= RemoveSourceExtensionByName("GL_HW_neural_shader");
+  if (!ModuleRequiresHwNeuralShaderExtension()) {
+    modified |= RemoveExtensionByName("SPV_HW_neural_shader");
+    modified |= RemoveSourceExtensionByName("GL_HW_neural_shader");
+  }
   (void)modified;
   return true;
 }
@@ -1117,8 +1126,7 @@ bool HwLowerToStandardPass::LowerMatrixStore(
 
   Instruction* object = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx));
-  const MatrixTypeInfo* info =
-      object ? GetMatrixType(object->type_id()) : nullptr;
+  const MatrixTypeInfo* info = GetMatrixTypeForValue(object);
   if (!info) {
     ReportError(inst, "invalid HW matrix store object");
     return false;
@@ -1223,9 +1231,9 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
       inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
-  const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c) {
     ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
@@ -1245,9 +1253,9 @@ bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
       inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
-  const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c) {
     ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
@@ -1277,9 +1285,9 @@ bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(
       inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
-  const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c) {
     ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
     return false;
@@ -1588,7 +1596,7 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
 
   const VectorTypeInfo* result = GetVectorType(matmul->type_id());
   const VectorTypeInfo* input = GetVectorType(input_load->type_id());
-  const MatrixTypeInfo* matrix = GetMatrixType(matrix_load->type_id());
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_load);
   if (!result || !input || !matrix ||
       !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, nullptr)) {
     return true;
@@ -1793,10 +1801,10 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
     return true;
   }
 
-  const MatrixTypeInfo* result = GetMatrixType(matmul->type_id());
-  const MatrixTypeInfo* a = GetMatrixType(a_load->type_id());
-  const MatrixTypeInfo* b = GetMatrixType(b_load->type_id());
-  const MatrixTypeInfo* c = GetMatrixType(c_load->type_id());
+  const MatrixTypeInfo* result = GetMatrixTypeForValue(matmul);
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_load);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_load);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_load);
   if (!result || !a || !b || !c ||
       !CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)) {
     return true;
@@ -2019,9 +2027,9 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
       inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
   Instruction* c_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
-  const MatrixTypeInfo* a = a_inst ? GetMatrixType(a_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* b = b_inst ? GetMatrixType(b_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* c = c_inst ? GetMatrixType(c_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c || !CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)) {
     return true;
   }
@@ -2375,8 +2383,7 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* matrix =
-      matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
@@ -2759,8 +2766,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* matrix =
-      matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
@@ -2788,8 +2794,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* matrix =
-      matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
@@ -2828,8 +2833,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
   const VectorTypeInfo* input =
       input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
-  const MatrixTypeInfo* matrix =
-      matrix_inst ? GetMatrixType(matrix_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
@@ -3124,7 +3128,7 @@ bool HwLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
       get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
   if (!object) return true;
 
-  const MatrixTypeInfo* matrix = GetMatrixType(object->type_id());
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(object);
   const VectorTypeInfo* vector = GetVectorType(object->type_id());
   if (!matrix && !vector) return true;
 
@@ -5007,7 +5011,8 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
   function->AddBasicBlock(std::move(k_merge_block));
   function->AddBasicBlock(std::move(out_continue_block));
   function->AddBasicBlock(std::move(out_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/true);
   return function_id;
 }
 
@@ -5415,7 +5420,8 @@ uint32_t HwLowerToStandardPass::BuildFusedMatrixMatmulStoreFunctionPackedVec4(
   function->AddBasicBlock(std::move(col_merge_block));
   function->AddBasicBlock(std::move(row_continue_block));
   function->AddBasicBlock(std::move(row_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/true);
   return function_id;
 }
 
@@ -5920,7 +5926,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   function->AddBasicBlock(std::move(k_merge_block));
   function->AddBasicBlock(std::move(out_continue_block));
   function->AddBasicBlock(std::move(out_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
   return function_id;
 }
 
@@ -6524,7 +6531,8 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
   function->AddBasicBlock(std::move(col_merge_block));
   function->AddBasicBlock(std::move(row_continue_block));
   function->AddBasicBlock(std::move(row_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
   return function_id;
 }
 
@@ -6737,7 +6745,7 @@ bool HwLowerToStandardPass::DescribeMatrixValue(uint32_t value_id,
   Instruction* value = get_def_use_mgr()->GetDef(value_id);
   if (!value) return false;
 
-  if (const MatrixTypeInfo* info = GetMatrixType(value->type_id())) {
+  if (const MatrixTypeInfo* info = GetMatrixTypeForValue(value)) {
     if (info->rows != expected_rows || info->cols != expected_cols) {
       return false;
     }
@@ -7143,7 +7151,8 @@ bool HwLowerToStandardPass::BuildMatmulPatternPackedVec4(
 }
 
 void HwLowerToStandardPass::AddGeneratedFunction(
-    std::unique_ptr<Function> function, uint32_t function_id) {
+    std::unique_ptr<Function> function, uint32_t function_id,
+    bool may_write_memory) {
   if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse)) {
     auto* def_use_mgr = context()->get_def_use_mgr();
     function->ForEachInst([def_use_mgr](Instruction* inst) {
@@ -7165,6 +7174,9 @@ void HwLowerToStandardPass::AddGeneratedFunction(
 
   context()->AddFunction(std::move(function));
   generated_function_ids_.insert(function_id);
+  if (!may_write_memory) {
+    read_only_generated_function_ids_.insert(function_id);
+  }
 }
 
 std::string HwLowerToStandardPass::MemoryOperandsKey(
@@ -7289,7 +7301,8 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
       MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                               std::initializer_list<Operand>{}));
   function->AddBasicBlock(std::move(entry_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
 
   packed_load_chunk_functions_[key] = function_id;
   return function_id;
@@ -7370,7 +7383,8 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
       MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                               std::initializer_list<Operand>{}));
   function->AddBasicBlock(std::move(entry_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/true);
 
   packed_store_chunk_functions_[key] = function_id;
   return function_id;
@@ -7477,7 +7491,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
       MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                               std::initializer_list<Operand>{}));
   function->AddBasicBlock(std::move(block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
 
   tile_weight_functions_[key] = function_id;
   return function_id;
@@ -7596,7 +7611,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
       MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                               std::initializer_list<Operand>{}));
   function->AddBasicBlock(std::move(block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
 
   matmul_tile_weight_functions_[key] = function_id;
   return function_id;
@@ -7681,7 +7697,8 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
         MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                                 std::initializer_list<Operand>{}));
     function->AddBasicBlock(std::move(block));
-    AddGeneratedFunction(std::move(function), function_id);
+    AddGeneratedFunction(std::move(function), function_id,
+                         /*may_write_memory=*/false);
 
     vector_matmul_pattern_functions_[key] = function_id;
     return function_id;
@@ -7980,7 +7997,8 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
   function->AddBasicBlock(std::move(k_merge_block));
   function->AddBasicBlock(std::move(out_continue_block));
   function->AddBasicBlock(std::move(out_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
 
   vector_matmul_pattern_functions_[key] = function_id;
   return function_id;
@@ -8315,7 +8333,8 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   function->AddBasicBlock(std::move(k_merge_block));
   function->AddBasicBlock(std::move(out_continue_block));
   function->AddBasicBlock(std::move(out_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
 
   vector_matmul_pattern_functions_[key] = function_id;
   return function_id;
@@ -8382,7 +8401,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
         MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
                                 std::initializer_list<Operand>{}));
     function->AddBasicBlock(std::move(entry_block));
-    AddGeneratedFunction(std::move(function), function_id);
+    AddGeneratedFunction(std::move(function), function_id,
+                         /*may_write_memory=*/false);
     matmul_pattern_functions_[key] = function_id;
     matmul_pattern_function_ids_.insert(function_id);
     return function_id;
@@ -8747,7 +8767,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
   function->AddBasicBlock(std::move(col_merge_block));
   function->AddBasicBlock(std::move(row_continue_block));
   function->AddBasicBlock(std::move(row_merge_block));
-  AddGeneratedFunction(std::move(function), function_id);
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
   matmul_pattern_functions_[key] = function_id;
   matmul_pattern_function_ids_.insert(function_id);
   return function_id;
@@ -8947,11 +8968,18 @@ const HwLowerToStandardPass::MatrixTypeInfo*
 HwLowerToStandardPass::GetMatrixType(uint32_t type_id) const {
   auto it = matrix_types_.find(type_id);
   if (it != matrix_types_.end()) return &it->second;
-  for (const auto& id_and_info : matrix_types_) {
-    if (id_and_info.second.lowered_type_id == type_id)
-      return &id_and_info.second;
-  }
   return nullptr;
+}
+
+const HwLowerToStandardPass::MatrixTypeInfo*
+HwLowerToStandardPass::GetMatrixTypeForValue(
+    const Instruction* value) const {
+  if (!value) return nullptr;
+  auto original = original_hw_value_types_.find(value->result_id());
+  if (original != original_hw_value_types_.end()) {
+    return GetMatrixType(original->second);
+  }
+  return GetMatrixType(value->type_id());
 }
 
 const HwLowerToStandardPass::VectorTypeInfo*
@@ -9326,10 +9354,9 @@ bool HwLowerToStandardPass::InstructionMayWriteOrOrderMemory(
       return inst->NumInOperands() >= 1 &&
              pointer_write_matches(inst->GetSingleWordInOperand(0));
     case spv::Op::OpFunctionCall:
-      // Function calls to lowering-generated functions (direct-path matmul/
-      // vecmatmul) only read from SSBO and are safe to move loads past.
+      // Local helper writes cannot alias memory in the calling function.
       if (inst->NumInOperands() >= 1 &&
-          generated_function_ids_.count(
+          read_only_generated_function_ids_.count(
               inst->GetSingleWordInOperand(0))) {
         return false;
       }
@@ -9629,16 +9656,45 @@ bool HwLowerToStandardPass::IsHwCapabilityOrExtension(
   if (inst->opcode() == spv::Op::OpExtension) {
     const std::string extension = inst->GetInOperand(0).AsString();
     return extension == "SPV_AZD_neural_matrix" ||
-           extension == "SPV_AZD_cooperative_vector" ||
-           extension == "SPV_HW_neural_shader";
+           extension == "SPV_AZD_cooperative_vector";
   }
   if (inst->opcode() == spv::Op::OpSourceExtension) {
     const std::string extension = inst->GetInOperand(0).AsString();
     return extension == "GL_AZD_neural_matrix" ||
-           extension == "GL_AZD_cooperative_vector" ||
-           extension == "GL_HW_neural_shader";
+           extension == "GL_AZD_cooperative_vector";
   }
   return false;
+}
+
+bool HwLowerToStandardPass::RequiresHwNeuralShaderExtension(
+    const Instruction* inst) const {
+  if (!inst) return false;
+  switch (inst->opcode()) {
+    case spv::Op::OpTypeTensorMapHW:
+    case spv::Op::OpCpAsyncTensorGlobalSharedHW:
+    case spv::Op::OpCpAsyncCommitGroupHW:
+    case spv::Op::OpCpAsyncWaitGroupHW:
+    case spv::Op::OpBarrierArriveHW:
+    case spv::Op::OpBarrierWaitHW:
+    case spv::Op::OpShuffleIndexHW:
+    case spv::Op::OpBytePermuteHW:
+    case spv::Op::OpShuffleFillDownHW:
+      return true;
+    case spv::Op::OpSelectionMerge:
+      return inst->NumInOperands() >= 2 &&
+             (inst->GetSingleWordInOperand(1) &
+              uint32_t(spv::SelectionControlMask::Relreg)) != 0;
+    default:
+      return false;
+  }
+}
+
+bool HwLowerToStandardPass::ModuleRequiresHwNeuralShaderExtension() const {
+  bool required = false;
+  get_module()->ForEachInst([this, &required](Instruction* inst) {
+    if (!required) required = RequiresHwNeuralShaderExtension(inst);
+  });
+  return required;
 }
 
 bool HwLowerToStandardPass::RemoveExtensionByName(const char* extension_name) {

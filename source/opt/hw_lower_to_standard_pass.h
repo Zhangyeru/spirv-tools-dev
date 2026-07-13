@@ -81,6 +81,7 @@ class HwLowerToStandardPass : public Pass {
   };
 
   bool CollectHwTypes();
+  void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();
   bool PrepareMatmulPatternFunctions();
@@ -299,7 +300,7 @@ class HwLowerToStandardPass : public Pass {
                                     uint32_t b_id, uint32_t c_id,
                                     std::vector<uint32_t>* element_ids);
   void AddGeneratedFunction(std::unique_ptr<Function> function,
-                            uint32_t function_id);
+                            uint32_t function_id, bool may_write_memory);
   std::string MemoryOperandsKey(
       const std::vector<Operand>& memory_operands) const;
   uint32_t GetOrCreateFunctionType(uint32_t return_type_id,
@@ -427,6 +428,8 @@ class HwLowerToStandardPass : public Pass {
   uint32_t GetOrCreateGLSLStd450Import();
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
+  const MatrixTypeInfo* GetMatrixTypeForValue(
+      const Instruction* value) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
   uint32_t GetLoweredType(uint32_t type_id) const;
   uint32_t GetPointerTypeId(uint32_t pointer_id) const;
@@ -439,6 +442,8 @@ class HwLowerToStandardPass : public Pass {
   bool HasHwTypeReference(const Instruction* inst) const;
   bool IsHwOpcode(spv::Op opcode) const;
   bool IsHwCapabilityOrExtension(const Instruction* inst) const;
+  bool RequiresHwNeuralShaderExtension(const Instruction* inst) const;
+  bool ModuleRequiresHwNeuralShaderExtension() const;
   bool RemoveExtensionByName(const char* extension_name);
   bool RemoveSourceExtensionByName(const char* extension_name);
   void RebuildAsCompositeConstruct(Instruction* inst, uint32_t type_id,
@@ -453,6 +458,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_map<uint32_t, MatrixTypeInfo> matrix_types_;
   std::unordered_map<uint32_t, VectorTypeInfo> vector_types_;
   std::unordered_map<uint32_t, uint32_t> lowered_types_;
+  std::unordered_map<uint32_t, uint32_t> original_hw_value_types_;
   std::unordered_map<std::string, uint32_t> packed_load_chunk_functions_;
   std::unordered_map<std::string, uint32_t> packed_store_chunk_functions_;
   std::unordered_map<std::string, uint32_t> tile_weight_functions_;
@@ -461,6 +467,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_map<std::string, uint32_t> matmul_pattern_functions_;
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;
   std::unordered_set<uint32_t> generated_function_ids_;
+  std::unordered_set<uint32_t> read_only_generated_function_ids_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
 };
 
