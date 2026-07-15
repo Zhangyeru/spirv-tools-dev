@@ -187,7 +187,9 @@ spv_result_t LogicalsPass(ValidationState_t& _, const Instruction* inst) {
 
           case spv::Op::OpTypeBool:
           case spv::Op::OpTypeInt:
-          case spv::Op::OpTypeFloat: {
+          case spv::Op::OpTypeFloat:
+          case spv::Op::OpTypeCooperativeMatrixHW:
+          case spv::Op::OpTypeCooperativeVectorHW: {
             break;
           }
 

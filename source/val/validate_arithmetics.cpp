@@ -260,7 +260,7 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (opcode == spv::Op::OpIMul &&
+        } else if ((supportsCoopMat || opcode == spv::Op::OpIMul) &&
                    _.IsCooperativeMatrixHWType(result_type)) {
           if (!_.IsCooperativeMatrixHWType(type_id) ||
               !_.IsIntCooperativeMatrixHWType(type_id)) {

@@ -7569,6 +7569,83 @@ TEST_F(ValidateExtInst, OpExtInstRequiresNonSemanticBefore16) {
                 "DebugTypeFunction %uint_0 %12\n"));
 }
 
+std::string GenerateHwCoopVecIntegerExtInstCode(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeVectorNV
+OpExtension "SPV_HW_neural_shader"
+OpExtension "SPV_NV_cooperative_vector"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%s32 = OpTypeInt 32 1
+%c4 = OpConstant %u32 4
+%c8 = OpConstant %u32 8
+%hw_u4 = OpTypeCooperativeVectorHW %u32 %c4
+%hw_u8 = OpTypeCooperativeVectorHW %u32 %c8
+%nv_u4 = OpTypeCooperativeVectorNV %u32 %c4
+%hw_s4 = OpTypeCooperativeVectorHW %s32 %c4
+%nv_s4 = OpTypeCooperativeVectorNV %s32 %c4
+%hw_u4_value = OpUndef %hw_u4
+%hw_u8_value = OpUndef %hw_u8
+%nv_u4_value = OpUndef %nv_u4
+%hw_s4_value = OpUndef %hw_s4
+%nv_s4_value = OpUndef %nv_s4
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateExtInst, HwCoopVecIntegerMinRejectsMismatchedLength) {
+  const std::string body = R"(
+%bad = OpExtInst %hw_u4 %glsl UMin %hw_u4_value %hw_u8_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecIntegerExtInstCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected number of components to be identical"));
+}
+
+TEST_F(ValidateExtInst, HwCoopVecIntegerClampRejectsNvOperand) {
+  const std::string body = R"(
+%bad = OpExtInst %hw_s4 %glsl SClamp %hw_s4_value %nv_s4_value %hw_s4_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecIntegerExtInstCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("expected all operands to be int scalars or vectors"));
+}
+
+TEST_F(ValidateExtInst, HwCoopVecIntegerMinMaxClampMatchingLengthSuccess) {
+  const std::string body = R"(
+%umin = OpExtInst %hw_u4 %glsl UMin %hw_u4_value %hw_u4_value
+%umax = OpExtInst %hw_u4 %glsl UMax %hw_u4_value %hw_u4_value
+%uclamp = OpExtInst %hw_u4 %glsl UClamp %hw_u4_value %hw_u4_value %hw_u4_value
+%smin = OpExtInst %hw_s4 %glsl SMin %hw_s4_value %hw_s4_value
+%smax = OpExtInst %hw_s4 %glsl SMax %hw_s4_value %hw_s4_value
+%sclamp = OpExtInst %hw_s4 %glsl SClamp %hw_s4_value %hw_s4_value %hw_s4_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecIntegerExtInstCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

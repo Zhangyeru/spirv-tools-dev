@@ -104,9 +104,16 @@ Options (in lexicographical order):)",
   printf(R"(
   --hw-lower-to-standard[=pack|scalar]
                Lowers supported HW cooperative matrix/vector ops and types to
-               ordinary SPIR-V arrays and removes HW declarations. Defaults
-               to pack, which uses packed vec4 arrays for 4-wide f16/f32 types
-               and scalar arrays otherwise. Use scalar to force scalar arrays.)");
+               ordinary SPIR-V arrays while retaining other HW extension
+               features. Defaults to pack, which uses packed vec4 arrays for
+               f16/f32 types and scalar arrays otherwise. Use scalar to force
+               scalar arrays.)");
+  printf(R"(
+  --hw-lower-to-standard-extension-free[=pack|scalar]
+               Lowers supported HW cooperative matrix/vector ops and types and
+               requires that no HW extension feature remain. Fails if an HW
+               feature has no equivalent lowering. The pack and scalar modes
+               behave as for --hw-lower-to-standard.)");
   printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help

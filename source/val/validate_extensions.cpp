@@ -1196,21 +1196,29 @@ spv_result_t ValidateExtInst(ValidationState_t& _, const Instruction* inst) {
 
         const uint32_t result_type_bit_width = _.GetBitWidth(result_type);
         const uint32_t result_type_dimension = _.GetDimension(result_type);
+        const bool result_is_coopvec_hw =
+            _.IsCooperativeVectorHWType(result_type);
 
         for (uint32_t operand_index = 4; operand_index < num_operands;
              ++operand_index) {
           const uint32_t operand_type = _.GetOperandTypeId(inst, operand_index);
           if (!operand_type ||
-              (!_.IsIntScalarOrVectorType(operand_type) &&
-               !(supportsCoopVec &&
-                 (_.IsIntCooperativeVectorNVType(operand_type) ||
-                  _.IsIntCooperativeVectorHWType(operand_type))))) {
+              (result_is_coopvec_hw
+                   ? !_.IsIntCooperativeVectorHWType(operand_type)
+                   : (!_.IsIntScalarOrVectorType(operand_type) &&
+                      !(supportsCoopVec &&
+                        (_.IsIntCooperativeVectorNVType(operand_type) ||
+                         _.IsIntCooperativeVectorHWType(operand_type)))))) {
             return _.diag(SPV_ERROR_INVALID_DATA, inst)
                    << ext_inst_name() << ": "
                    << "expected all operands to be int scalars or vectors";
           }
 
-          if (result_type_dimension != _.GetDimension(operand_type)) {
+          if (result_is_coopvec_hw) {
+            spv_result_t ret = _.CooperativeVectorDimensionsMatch(
+                inst, result_type, operand_type);
+            if (ret != SPV_SUCCESS) return ret;
+          } else if (result_type_dimension != _.GetDimension(operand_type)) {
             return _.diag(SPV_ERROR_INVALID_DATA, inst)
                    << ext_inst_name() << ": "
                    << "expected all operands to have the same dimension as "

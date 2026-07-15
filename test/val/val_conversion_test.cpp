@@ -2453,6 +2453,78 @@ OpFunctionEnd)";
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("Expected number of components to be identical"));
 }
+
+std::string GenerateHwCooperativeBitcastCode(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Int16
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u16 = OpTypeInt 16 0
+%u32 = OpTypeInt 32 0
+%s32 = OpTypeInt 32 1
+%c2 = OpConstant %u32 2
+%c4 = OpConstant %u32 4
+%u16vec = OpTypeCooperativeVectorHW %u16 %c4
+%u32vec = OpTypeCooperativeVectorHW %u32 %c4
+%s32vec = OpTypeCooperativeVectorHW %s32 %c4
+%u16mat = OpTypeCooperativeMatrixHW %u16 %c2 %c4
+%u32mat = OpTypeCooperativeMatrixHW %u32 %c2 %c4
+%u16vec_value = OpUndef %u16vec
+%u32vec_value = OpUndef %u32vec
+%u16mat_value = OpUndef %u16mat
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateConversion, HwCoopVecBitcastRejectsComponentWidthMismatch) {
+  const std::string body = R"(
+%bad = OpBitcast %u32vec %u16vec_value
+)";
+
+  CompileSuccessfully(GenerateHwCooperativeBitcastCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected input to have the same component bit width "
+                        "as Result Type"));
+}
+
+TEST_F(ValidateConversion, HwCoopMatBitcastRejectsComponentWidthMismatch) {
+  const std::string body = R"(
+%bad = OpBitcast %u32mat %u16mat_value
+)";
+
+  CompileSuccessfully(GenerateHwCooperativeBitcastCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected input to have the same component bit width "
+                        "as Result Type"));
+}
+
+TEST_F(ValidateConversion, HwCoopVecBitcastMatchingComponentWidthSuccess) {
+  const std::string body = R"(
+%good = OpBitcast %s32vec %u32vec_value
+)";
+
+  CompileSuccessfully(GenerateHwCooperativeBitcastCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

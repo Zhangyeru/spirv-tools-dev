@@ -128,8 +128,45 @@ spv_result_t GetExtractInsertValueType(ValidationState_t& _,
       case spv::Op::OpTypeCooperativeVectorNV:
       case spv::Op::OpTypeCooperativeVectorHW:
       case spv::Op::OpTypeCooperativeMatrixKHR:
-      case spv::Op::OpTypeCooperativeMatrixNV:
+      case spv::Op::OpTypeCooperativeMatrixNV: {
+        *member_type = type_inst->word(2);
+        break;
+      }
       case spv::Op::OpTypeCooperativeMatrixHW: {
+        // Unlike the other cooperative matrix types, an HW matrix is indexed
+        // directly by a row and a column.  It has no separately declared row
+        // vector type for the first index to produce, so consume both indices
+        // while the matrix type is still available.
+        if (word_index + 1 >= num_words) {
+          return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                 << "Expected row and column indices when indexing an "
+                    "OpTypeCooperativeMatrixHW";
+        }
+
+        const uint32_t row_index = component_index;
+        const uint32_t column_index = inst->word(++word_index);
+        const uint32_t dimension_ids[] = {type_inst->word(3),
+                                          type_inst->word(4)};
+        const uint32_t indices[] = {row_index, column_index};
+        const char* dimension_names[] = {"row", "column"};
+        for (uint32_t i = 0; i < 2; ++i) {
+          const Instruction* dimension = _.FindDef(dimension_ids[i]);
+          assert(dimension);
+          if (spvOpcodeIsSpecConstant(dimension->opcode())) {
+            continue;
+          }
+          uint64_t size = 0;
+          if (!_.EvalConstantValUint64(dimension_ids[i], &size)) {
+            assert(0 && "Cooperative matrix dimension is corrupt");
+          }
+          if (indices[i] >= size) {
+            return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                   << "Cooperative matrix " << dimension_names[i]
+                   << " access is out of bounds, " << dimension_names[i]
+                   << " count is " << size << ", but access index is "
+                   << indices[i];
+          }
+        }
         *member_type = type_inst->word(2);
         break;
       }

@@ -26,8 +26,10 @@ namespace {
 
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::Values;
 
 using ValidateArithmetics = spvtest::ValidateBase<bool>;
+using ValidateHwCoopMatIntegerArithmetic = spvtest::ValidateBase<std::string>;
 
 std::string GenerateCode(const std::string& main_body) {
   const std::string prefix =
@@ -2010,6 +2012,95 @@ TEST_F(ValidateArithmetics, CoopVecDimNotConstantInt) {
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("OpTypeCooperativeVectorNV component count <id> "
                         "'19[%float_1]' is not a constant integer type"));
+}
+
+std::string GenerateHwCoopMatArithmeticCode(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%f32 = OpTypeFloat 32
+%u32 = OpTypeInt 32 0
+%s32 = OpTypeInt 32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%smat = OpTypeCooperativeMatrixHW %s32 %c2 %c3
+%smat_other_shape = OpTypeCooperativeMatrixHW %s32 %c2 %c4
+%umat = OpTypeCooperativeMatrixHW %u32 %c2 %c3
+%umat_other_shape = OpTypeCooperativeMatrixHW %u32 %c2 %c4
+%fmat = OpTypeCooperativeMatrixHW %f32 %c2 %c3
+%svec = OpTypeCooperativeVectorHW %s32 %c3
+%smat_value = OpUndef %smat
+%smat_other_shape_value = OpUndef %smat_other_shape
+%umat_value = OpUndef %umat
+%umat_other_shape_value = OpUndef %umat_other_shape
+%fmat_value = OpUndef %fmat
+%svec_value = OpUndef %svec
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_P(ValidateHwCoopMatIntegerArithmetic, RejectsMismatchedShape) {
+  const bool is_unsigned = GetParam() == "UDiv";
+  const bool is_unary = GetParam() == "SNegate";
+  const std::string type = is_unsigned ? "%umat" : "%smat";
+  const std::string value = is_unsigned ? "%umat_value" : "%smat_value";
+  const std::string other_shape =
+      is_unsigned ? "%umat_other_shape_value" : "%smat_other_shape_value";
+  const std::string instruction = "%bad = Op" + GetParam() + " " + type + " " +
+                                  other_shape + (is_unary ? "" : " " + value) +
+                                  "\n";
+
+  CompileSuccessfully(GenerateHwCoopMatArithmeticCode(instruction).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected columns of Matrix type and Result Type to "
+                        "be identical"));
+}
+
+INSTANTIATE_TEST_SUITE_P(AllSupportedOpcodes,
+                         ValidateHwCoopMatIntegerArithmetic,
+                         Values("IAdd", "ISub", "IMul", "SDiv", "UDiv",
+                                "SNegate"));
+
+TEST_F(ValidateArithmetics, HwCoopMatIntegerRejectsDifferentHwTypeKind) {
+  const std::string body = R"(
+%bad = OpIAdd %smat %svec_value %smat_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatArithmeticCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected arithmetic operands to be of Result Type"));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatIntegerRejectsFloatOperand) {
+  const std::string body = R"(
+%bad = OpIAdd %smat %fmat_value %smat_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatArithmeticCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected arithmetic operands to be of Result Type"));
 }
 
 }  // namespace

@@ -319,15 +319,18 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   //
   // Both Pass::name() and Pass::desc() should be static class members so they
   // can be invoked without creating a pass instance.
-  if (pass_name == "hw-lower-to-standard") {
+  if (pass_name == "hw-lower-to-standard" ||
+      pass_name == "hw-lower-to-standard-extension-free") {
+    const auto completeness = pass_name == "hw-lower-to-standard-extension-free"
+                                  ? HwLoweringCompleteness::kExtensionFree
+                                  : HwLoweringCompleteness::kCooperativeOnly;
     if (pass_args.empty() || pass_args == "pack") {
-      RegisterPass(CreateHwLowerToStandardPass());
+      RegisterPass(CreateHwLowerToStandardPass(false, completeness));
     } else if (pass_args == "scalar") {
-      RegisterPass(CreateHwLowerToStandardPass(true));
+      RegisterPass(CreateHwLowerToStandardPass(true, completeness));
     } else {
-      Errorf(consumer(), nullptr, {},
-             "Invalid argument for --hw-lower-to-standard: %s",
-             pass_args.c_str());
+      Errorf(consumer(), nullptr, {}, "Invalid argument for --%s: %s",
+             pass_name.c_str(), pass_args.c_str());
       return false;
     }
   } else if (pass_name == "strip-debug") {
@@ -1108,16 +1111,27 @@ Optimizer::PassToken CreateAmdExtToKhrPass() {
 }
 
 Optimizer::PassToken CreateHwLowerToStandardPass() {
-  return CreateHwLowerToStandardPass(false);
+  return CreateHwLowerToStandardPass(false,
+                                     HwLoweringCompleteness::kCooperativeOnly);
 }
 
 Optimizer::PassToken CreateHwLowerToStandardPass(bool force_scalar_lowering) {
+  return CreateHwLowerToStandardPass(force_scalar_lowering,
+                                     HwLoweringCompleteness::kCooperativeOnly);
+}
+
+Optimizer::PassToken CreateHwLowerToStandardPass(
+    bool force_scalar_lowering, HwLoweringCompleteness completeness) {
   const auto mode =
       force_scalar_lowering
           ? opt::HwLowerToStandardPass::LoweringMode::kForceScalar
           : opt::HwLowerToStandardPass::LoweringMode::kPreferPackedVec4;
+  const auto completeness_mode =
+      completeness == HwLoweringCompleteness::kExtensionFree
+          ? opt::HwLowerToStandardPass::CompletenessMode::kExtensionFree
+          : opt::HwLowerToStandardPass::CompletenessMode::kCooperativeOnly;
   return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::HwLowerToStandardPass>(mode));
+      MakeUnique<opt::HwLowerToStandardPass>(mode, completeness_mode));
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

@@ -32,6 +32,16 @@ class Pass;
 struct DescriptorSetAndBinding;
 }  // namespace opt
 
+// Controls how completely the HW lowering pass removes HW extension features.
+enum class HwLoweringCompleteness {
+  // Lower cooperative matrix/vector types and operations while allowing other
+  // HW extension features to remain in the module.
+  kCooperativeOnly,
+  // Require all HW extension features to be removed. The pass fails when it
+  // encounters an HW feature for which no equivalent lowering is available.
+  kExtensionFree,
+};
+
 // C++ interface for SPIR-V optimization functionalities. It wraps the context
 // (including target environment and the corresponding SPIR-V grammar) and
 // provides methods for registering optimization passes and optimizing.
@@ -842,9 +852,12 @@ Optimizer::PassToken CreateAmdExtToKhrPass();
 
 // Creates an HW cooperative matrix/vector lowering pass.
 // This pass lowers supported HW cooperative types and operations to ordinary
-// SPIR-V arrays and removes HW capabilities/extensions.
+// SPIR-V arrays. The no-argument and bool-only overloads use cooperative-only
+// completeness.
 Optimizer::PassToken CreateHwLowerToStandardPass();
 Optimizer::PassToken CreateHwLowerToStandardPass(bool force_scalar_lowering);
+Optimizer::PassToken CreateHwLowerToStandardPass(
+    bool force_scalar_lowering, HwLoweringCompleteness completeness);
 
 // Replaces the internal version of GLSLstd450 InterpolateAt* extended
 // instructions with the externally valid version. The internal version allows

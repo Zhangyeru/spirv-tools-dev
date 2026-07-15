@@ -26,8 +26,10 @@ namespace {
 
 using ::testing::HasSubstr;
 using ::testing::Not;
+using ::testing::Values;
 
 using ValidateBitwise = spvtest::ValidateBase<bool>;
+using ValidateHwCoopVecBitwise = spvtest::ValidateBase<std::string>;
 
 std::string GenerateShaderCode(
     const std::string& body,
@@ -675,6 +677,93 @@ OpFunctionEnd
       getDiagnosticString(),
       HasSubstr(
           "Expected int scalar or vector type for Base operand: BitCount"));
+}
+
+std::string GenerateHwCoopVecBitwiseCode(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeVectorNV
+OpExtension "SPV_HW_neural_shader"
+OpExtension "SPV_NV_cooperative_vector"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%c4 = OpConstant %u32 4
+%c8 = OpConstant %u32 8
+%hw4 = OpTypeCooperativeVectorHW %u32 %c4
+%hw8 = OpTypeCooperativeVectorHW %u32 %c8
+%nv4 = OpTypeCooperativeVectorNV %u32 %c4
+%hw4_value = OpUndef %hw4
+%hw8_value = OpUndef %hw8
+%nv4_value = OpUndef %nv4
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_P(ValidateHwCoopVecBitwise, RejectsMismatchedLength) {
+  const bool is_not = GetParam() == "Not";
+  const std::string instruction = "%bad = Op" + GetParam() +
+                                  " %hw4 %hw8_value" +
+                                  (is_not ? "" : " %hw4_value") + "\n";
+
+  CompileSuccessfully(GenerateHwCoopVecBitwiseCode(instruction).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected number of components to be identical"));
+}
+
+INSTANTIATE_TEST_SUITE_P(AllSupportedOpcodes, ValidateHwCoopVecBitwise,
+                         Values("ShiftRightLogical", "ShiftRightArithmetic",
+                                "ShiftLeftLogical", "BitwiseOr", "BitwiseXor",
+                                "BitwiseAnd", "Not"));
+
+TEST_F(ValidateBitwise, HwCoopVecShiftRejectsNvShiftOperand) {
+  const std::string body = R"(
+%bad = OpShiftLeftLogical %hw4 %hw4_value %nv4_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecBitwiseCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected Shift to be int scalar or vector"));
+}
+
+TEST_F(ValidateBitwise, HwCoopVecBitwiseRejectsNvOperand) {
+  const std::string body = R"(
+%bad = OpBitwiseAnd %hw4 %nv4_value %hw4_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecBitwiseCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Expected int scalar or vector as operand"));
+}
+
+TEST_F(ValidateBitwise, HwCoopVecMatchingTypesAndLengthsSuccess) {
+  const std::string body = R"(
+%shift = OpShiftLeftLogical %hw4 %hw4_value %hw4_value
+%and = OpBitwiseAnd %hw4 %hw4_value %hw4_value
+%not = OpNot %hw4 %hw4_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopVecBitwiseCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
 }  // namespace

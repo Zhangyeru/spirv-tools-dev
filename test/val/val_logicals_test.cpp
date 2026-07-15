@@ -714,6 +714,41 @@ TEST_F(ValidateLogicals, OpSelectWrongRightObject) {
               HasSubstr("Expected both objects to be of Result Type: Select"));
 }
 
+TEST_F(ValidateLogicals, OpSelectCooperativeMatrixAndVectorHWGood) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%mat = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%vec = OpTypeCooperativeVectorHW %float %uint_5
+%mat_a = OpUndef %mat
+%mat_b = OpUndef %mat
+%vec_a = OpUndef %vec
+%vec_b = OpUndef %vec
+%main = OpFunction %void None %func
+%entry = OpLabel
+%mat_selected = OpSelect %mat %true %mat_a %mat_b
+%vec_selected = OpSelect %vec %true %vec_a %vec_b
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str());
+  ASSERT_EQ(SPV_SUCCESS, ValidateInstructions());
+}
+
 TEST_F(ValidateLogicals, OpSelectArrayV13Bad) {
   const std::string body = R"(
 %val1 = OpSelect %arr_u32_2 %true %nul_arr_u32_2 %arr_u32_2_1_2

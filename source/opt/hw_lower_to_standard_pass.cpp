@@ -139,6 +139,13 @@ bool IsHwArithmeticOpcode(spv::Op opcode) {
     case spv::Op::OpSDiv:
     case spv::Op::OpUDiv:
     case spv::Op::OpSNegate:
+    case spv::Op::OpShiftRightLogical:
+    case spv::Op::OpShiftRightArithmetic:
+    case spv::Op::OpShiftLeftLogical:
+    case spv::Op::OpBitwiseOr:
+    case spv::Op::OpBitwiseXor:
+    case spv::Op::OpBitwiseAnd:
+    case spv::Op::OpNot:
       return true;
     default:
       return false;
@@ -148,6 +155,64 @@ bool IsHwArithmeticOpcode(spv::Op opcode) {
 bool IsHwScaleOpcode(spv::Op opcode) {
   return opcode == spv::Op::OpVectorTimesScalar ||
          opcode == spv::Op::OpMatrixTimesScalar;
+}
+
+// Authoritative core-opcode use closure for cooperative values.  Opcodes in
+// the arithmetic/conversion/scale families are classified by their semantic
+// helpers above; this list contains only structural operations whose lowering
+// is either dedicated or completed by recursive type replacement.
+bool IsCoreOpcodeAllowedOnHwValue(spv::Op opcode) {
+  if (IsHwConversionOpcode(opcode) || IsHwArithmeticOpcode(opcode) ||
+      IsHwScaleOpcode(opcode)) {
+    return true;
+  }
+  switch (opcode) {
+    case spv::Op::OpUndef:
+    case spv::Op::OpConstantNull:
+    case spv::Op::OpConstantComposite:
+    case spv::Op::OpSpecConstantComposite:
+    case spv::Op::OpConstantCompositeReplicateEXT:
+    case spv::Op::OpVariable:
+    case spv::Op::OpLoad:
+    case spv::Op::OpStore:
+    case spv::Op::OpCopyMemory:
+    case spv::Op::OpCopyMemorySized:
+    case spv::Op::OpCopyObject:
+    case spv::Op::OpCopyLogical:
+    case spv::Op::OpCompositeConstruct:
+    case spv::Op::OpCompositeExtract:
+    case spv::Op::OpCompositeInsert:
+    case spv::Op::OpVectorExtractDynamic:
+    case spv::Op::OpVectorInsertDynamic:
+    case spv::Op::OpPhi:
+    case spv::Op::OpSelect:
+    case spv::Op::OpFunction:
+    case spv::Op::OpFunctionParameter:
+    case spv::Op::OpFunctionCall:
+    case spv::Op::OpReturnValue:
+    case spv::Op::OpAccessChain:
+    case spv::Op::OpInBoundsAccessChain:
+    case spv::Op::OpPtrAccessChain:
+    case spv::Op::OpInBoundsPtrAccessChain:
+    case spv::Op::OpBitcast:
+    case spv::Op::OpExtInst:
+    case spv::Op::OpTypeArray:
+    case spv::Op::OpTypeRuntimeArray:
+    case spv::Op::OpTypeStruct:
+    case spv::Op::OpTypePointer:
+    case spv::Op::OpTypeForwardPointer:
+    case spv::Op::OpTypeFunction:
+    case spv::Op::OpLifetimeStart:
+    case spv::Op::OpLifetimeStop:
+    case spv::Op::OpArrayLength:
+    case spv::Op::OpSizeOf:
+    case spv::Op::OpPtrEqual:
+    case spv::Op::OpPtrNotEqual:
+    case spv::Op::OpPtrDiff:
+      return true;
+    default:
+      return false;
+  }
 }
 
 bool IsNumericScalarType(const Instruction* type) {
@@ -182,9 +247,18 @@ Pass::Status HwLowerToStandardPass::Process() {
 
   bool has_hw = false;
   get_module()->ForEachInst([this, &has_hw](Instruction* inst) {
-    has_hw |= IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst);
+    has_hw |=
+        completeness_mode_ == CompletenessMode::kExtensionFree
+            ? (IsAnyHwOpcode(inst->opcode()) ||
+               IsAnyHwCapabilityOrExtension(inst) || HasHwOperand(inst))
+            : (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst));
   });
   if (!has_hw) return Status::SuccessWithoutChange;
+
+  if (completeness_mode_ == CompletenessMode::kExtensionFree &&
+      !PreflightExtensionFreeMode()) {
+    return Status::Failure;
+  }
 
   if (!CollectHwTypes()) return Status::Failure;
   RecordOriginalHwValueTypes();
@@ -201,6 +275,31 @@ Pass::Status HwLowerToStandardPass::Process() {
   context()->InvalidateAnalyses(IRContext::kAnalysisTypes |
                                 IRContext::kAnalysisConstants);
   return Status::SuccessWithChange;
+}
+
+bool HwLowerToStandardPass::PreflightExtensionFreeMode() const {
+  bool ok = true;
+  get_module()->ForEachInst([this, &ok](Instruction* inst) {
+    if (!ok) return;
+
+    // Cooperative matrix/vector instructions are handled by this pass.  The
+    // remaining SPV_HW_neural_shader instructions intentionally have no
+    // guessed fallback: strict mode must reject them before mutating the IR.
+    if (IsAnyHwOpcode(inst->opcode()) && !IsHwOpcode(inst->opcode())) {
+      ReportError(inst,
+                  "extension-free HW lowering has no equivalent lowering for "
+                  "this HW opcode");
+      ok = false;
+      return;
+    }
+    if (HasHwOperand(inst)) {
+      ReportError(inst,
+                  "extension-free HW lowering has no equivalent lowering for "
+                  "this HW operand");
+      ok = false;
+    }
+  });
+  return ok;
 }
 
 bool HwLowerToStandardPass::CollectHwTypes() {
@@ -222,6 +321,19 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       MatrixTypeInfo info;
       info.type_id = inst->result_id();
       info.component_type_id = inst->GetSingleWordInOperand(0);
+      Instruction* rows_def =
+          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
+      Instruction* cols_def =
+          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(2));
+      if ((rows_def && (rows_def->opcode() == spv::Op::OpSpecConstant ||
+                        rows_def->opcode() == spv::Op::OpSpecConstantOp)) ||
+          (cols_def && (cols_def->opcode() == spv::Op::OpSpecConstant ||
+                        cols_def->opcode() == spv::Op::OpSpecConstantOp))) {
+        ReportError(inst,
+                    "HW cooperative matrix specialization-constant shape is "
+                    "not supported");
+        return false;
+      }
       if (!GetConstantU32(inst->GetSingleWordInOperand(1), &info.rows) ||
           !GetConstantU32(inst->GetSingleWordInOperand(2), &info.cols)) {
         ReportError(inst,
@@ -282,6 +394,15 @@ bool HwLowerToStandardPass::CollectHwTypes() {
     VectorTypeInfo info;
     info.type_id = inst->result_id();
     info.component_type_id = inst->GetSingleWordInOperand(0);
+    Instruction* length_def =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
+    if (length_def && (length_def->opcode() == spv::Op::OpSpecConstant ||
+                       length_def->opcode() == spv::Op::OpSpecConstantOp)) {
+      ReportError(inst,
+                  "HW cooperative vector specialization-constant shape is "
+                  "not supported");
+      return false;
+    }
     if (!GetConstantU32(inst->GetSingleWordInOperand(1), &info.length)) {
       ReportError(inst, "HW cooperative vector length must be constant");
       return false;
@@ -371,11 +492,16 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
     std::vector<Instruction*> var_stores;
     std::vector<Instruction*> var_loads;
     BasicBlock* block = nullptr;
+    bool spans_multiple_blocks = false;
 
     get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
       BasicBlock* user_block = context()->get_instr_block(user);
       if (!user_block) return;
-      if (!block) block = user_block;
+      if (!block) {
+        block = user_block;
+      } else if (block != user_block) {
+        spans_multiple_blocks = true;
+      }
       if (user->opcode() == spv::Op::OpStore &&
           user->GetSingleWordInOperand(0) == var_id) {
         var_stores.push_back(user);
@@ -385,7 +511,14 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
       }
     });
 
-    if (var_stores.empty() || var_loads.empty() || !block) continue;
+    // This local forwarding is intentionally limited to one basic block.
+    // Across blocks (especially loop headers/backedges), program order is not
+    // dominance order and replacing a load with the textually preceding store
+    // would break loop-carried cooperative values.
+    if (var_stores.empty() || var_loads.empty() || !block ||
+        spans_multiple_blocks) {
+      continue;
+    }
 
     // Walk block in order: track the last stored value and record
     // replacements for each load.
@@ -531,52 +664,27 @@ bool HwLowerToStandardPass::LegalizeModule() {
       }
     }
 
-    if (inst->opcode() == spv::Op::OpTypeFunction) {
-      for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
-        if (TypeContainsHw(inst->GetSingleWordInOperand(i))) {
-          ReportError(inst,
-                      "HW cooperative values across function boundaries are "
-                      "not supported");
-          ok = false;
-          return;
-        }
-      }
-    }
-
-    if (inst->opcode() == spv::Op::OpFunction &&
-        TypeContainsHw(inst->type_id())) {
-      ReportError(inst, "HW cooperative function return is not supported");
-      ok = false;
-      return;
-    }
-
-    if (inst->opcode() == spv::Op::OpFunctionParameter &&
-        TypeContainsHw(inst->type_id())) {
-      ReportError(inst, "HW cooperative function parameter is not supported");
-      ok = false;
-      return;
-    }
-
-    if (inst->opcode() == spv::Op::OpReturnValue && inst->NumInOperands() > 0) {
-      Instruction* object =
-          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-      if (object && TypeContainsHw(object->type_id())) {
-        ReportError(inst, "HW cooperative function return is not supported");
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixReduceHW) {
+      const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
+      Instruction* matrix =
+          inst->NumInOperands() >= 1
+              ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
+              : nullptr;
+      const MatrixTypeInfo* input = GetMatrixTypeForValue(matrix);
+      uint32_t reduce_axis = 0;
+      uint32_t combine_op = 0;
+      if (!result || !input || result->rows != input->rows ||
+          result->cols != input->cols ||
+          result->component_type_id != input->component_type_id ||
+          inst->NumInOperands() != 3 ||
+          !GetConstantU32(inst->GetSingleWordInOperand(1), &reduce_axis) ||
+          reduce_axis > 1 ||
+          !GetConstantU32(inst->GetSingleWordInOperand(2), &combine_op) ||
+          combine_op > 2) {
+        ReportError(inst, "invalid OpCooperativeMatrixReduceHW");
         ok = false;
         return;
       }
-    }
-
-    if (inst->opcode() == spv::Op::OpPhi && TypeContainsHw(inst->type_id())) {
-      ReportError(inst, "HW cooperative OpPhi is not supported");
-      ok = false;
-      return;
-    }
-
-    if (inst->opcode() == spv::Op::OpCooperativeMatrixReduceHW) {
-      ReportError(inst, "OpCooperativeMatrixReduceHW is not supported");
-      ok = false;
-      return;
     }
 
     if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
@@ -695,56 +803,45 @@ bool HwLowerToStandardPass::LegalizeModule() {
       }
       Instruction* object =
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-      if (!object || GetLoweredType(inst->type_id()) == 0 ||
-          GetLoweredType(object->type_id()) == 0 ||
-          GetLoweredType(inst->type_id()) !=
-              GetLoweredType(object->type_id())) {
+      const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+      const MatrixTypeInfo* input_matrix =
+          object ? GetMatrixType(object->type_id()) : nullptr;
+      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+      const VectorTypeInfo* input_vector =
+          object ? GetVectorType(object->type_id()) : nullptr;
+      auto component_bit_width = [this](uint32_t type_id) -> uint32_t {
+        Instruction* type = get_def_use_mgr()->GetDef(type_id);
+        return type && type->NumInOperands() >= 1
+                   ? type->GetSingleWordInOperand(0)
+                   : 0;
+      };
+      const bool matching_matrix =
+          result_matrix && input_matrix &&
+          result_matrix->rows == input_matrix->rows &&
+          result_matrix->cols == input_matrix->cols &&
+          component_bit_width(result_matrix->component_type_id) ==
+              component_bit_width(input_matrix->component_type_id);
+      const bool matching_vector =
+          result_vector && input_vector &&
+          result_vector->length == input_vector->length &&
+          component_bit_width(result_vector->component_type_id) ==
+              component_bit_width(input_vector->component_type_id);
+      if (!object || (!matching_matrix && !matching_vector)) {
         ReportError(inst, "unsupported HW OpBitcast");
         ok = false;
         return;
       }
     }
 
-    if (!IsHwOpcode(inst->opcode()) && TypeContainsHw(inst->type_id())) {
-      switch (inst->opcode()) {
-        case spv::Op::OpUndef:
-        case spv::Op::OpConstantNull:
-        case spv::Op::OpConstantComposite:
-        case spv::Op::OpConstantCompositeReplicateEXT:
-        case spv::Op::OpVariable:
-        case spv::Op::OpLoad:
-        case spv::Op::OpStore:
-        case spv::Op::OpCopyObject:
-        case spv::Op::OpCompositeConstruct:
-        case spv::Op::OpCompositeExtract:
-        case spv::Op::OpBitcast:
-        case spv::Op::OpExtInst:
-        case spv::Op::OpConvertFToU:
-        case spv::Op::OpConvertFToS:
-        case spv::Op::OpConvertSToF:
-        case spv::Op::OpConvertUToF:
-        case spv::Op::OpUConvert:
-        case spv::Op::OpSConvert:
-        case spv::Op::OpFConvert:
-        case spv::Op::OpFAdd:
-        case spv::Op::OpFSub:
-        case spv::Op::OpFMul:
-        case spv::Op::OpFDiv:
-        case spv::Op::OpFNegate:
-        case spv::Op::OpIAdd:
-        case spv::Op::OpISub:
-        case spv::Op::OpIMul:
-        case spv::Op::OpSDiv:
-        case spv::Op::OpUDiv:
-        case spv::Op::OpSNegate:
-        case spv::Op::OpVectorTimesScalar:
-        case spv::Op::OpMatrixTimesScalar:
-          break;
-        default:
-          ReportError(inst, "unsupported HW cooperative value use");
-          ok = false;
-          return;
-      }
+    const bool metadata_use =
+        inst->opcode() == spv::Op::OpName ||
+        inst->opcode() == spv::Op::OpMemberName || inst->IsDecoration() ||
+        inst->IsNonSemanticInstruction() || inst->IsDebugLineInst();
+    if (!IsHwOpcode(inst->opcode()) && InstructionTouchesHw(inst) &&
+        !metadata_use && !IsCoreOpcodeAllowedOnHwValue(inst->opcode())) {
+      ReportError(inst, "unsupported HW cooperative value use");
+      ok = false;
+      return;
     }
   });
 
@@ -856,6 +953,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
       case spv::Op::OpCooperativeMatrixStoreHW:
       case spv::Op::OpCooperativeMatrixMulAddHW:
       case spv::Op::OpCooperativeMatrixLengthHW:
+      case spv::Op::OpCooperativeMatrixReduceHW:
       case spv::Op::OpCooperativeVectorLoadHW:
       case spv::Op::OpCooperativeVectorStoreHW:
       case spv::Op::OpCooperativeVectorMatrixMulHW:
@@ -866,12 +964,42 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpConstantComposite:
+      case spv::Op::OpSpecConstantComposite:
       case spv::Op::OpConstantCompositeReplicateEXT:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeExtract:
         worklist.push_back(inst);
         break;
+      case spv::Op::OpCompositeInsert:
+        if (TypeContainsHw(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpSelect:
+        if (IsHwType(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpVectorExtractDynamic: {
+        Instruction* object =
+            inst->NumInOperands() >= 1
+                ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
+                : nullptr;
+        if (object && GetVectorType(object->type_id()))
+          worklist.push_back(inst);
+        break;
+      }
+      case spv::Op::OpVectorInsertDynamic:
+        if (GetVectorType(inst->type_id())) worklist.push_back(inst);
+        break;
+      case spv::Op::OpAccessChain:
+      case spv::Op::OpInBoundsAccessChain:
+      case spv::Op::OpPtrAccessChain:
+      case spv::Op::OpInBoundsPtrAccessChain: {
+        Instruction* base =
+            inst->NumInOperands() >= 1
+                ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
+                : nullptr;
+        if (base && TypeContainsHw(base->type_id())) worklist.push_back(inst);
+        break;
+      }
       case spv::Op::OpConstantNull:
       case spv::Op::OpUndef:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
@@ -909,6 +1037,9 @@ bool HwLowerToStandardPass::LowerHwInstructions(
       case spv::Op::OpCooperativeMatrixLengthHW:
         ok = LowerMatrixLength(inst, to_kill);
         break;
+      case spv::Op::OpCooperativeMatrixReduceHW:
+        ok = LowerMatrixReduce(inst);
+        break;
       case spv::Op::OpCooperativeVectorLoadHW:
         ok = LowerVectorLoad(inst);
         break;
@@ -925,11 +1056,30 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         ok = LowerCompositeConstruct(inst);
         break;
       case spv::Op::OpConstantComposite:
+      case spv::Op::OpSpecConstantComposite:
       case spv::Op::OpConstantCompositeReplicateEXT:
         ok = LowerConstantComposite(inst);
         break;
       case spv::Op::OpCompositeExtract:
         ok = LowerCompositeExtract(inst);
+        break;
+      case spv::Op::OpCompositeInsert:
+        ok = LowerCompositeInsert(inst);
+        break;
+      case spv::Op::OpSelect:
+        ok = LowerSelect(inst);
+        break;
+      case spv::Op::OpVectorExtractDynamic:
+        ok = LowerVectorExtractDynamic(inst);
+        break;
+      case spv::Op::OpVectorInsertDynamic:
+        ok = LowerVectorInsertDynamic(inst);
+        break;
+      case spv::Op::OpAccessChain:
+      case spv::Op::OpInBoundsAccessChain:
+      case spv::Op::OpPtrAccessChain:
+      case spv::Op::OpInBoundsPtrAccessChain:
+        ok = LowerAccessChain(inst);
         break;
       case spv::Op::OpConstantNull:
       case spv::Op::OpUndef:
@@ -1012,8 +1162,12 @@ bool HwLowerToStandardPass::FinalHwCheck() const {
   bool ok = true;
   get_module()->ForEachInst([this, &ok](Instruction* inst) {
     if (!ok) return;
-    if (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst) ||
-        HasHwTypeReference(inst)) {
+    const bool has_forbidden_hw =
+        completeness_mode_ == CompletenessMode::kExtensionFree
+            ? (IsAnyHwOpcode(inst->opcode()) ||
+               IsAnyHwCapabilityOrExtension(inst) || HasHwOperand(inst))
+            : (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst));
+    if (has_forbidden_hw || HasHwTypeReference(inst)) {
       ReportError(inst, "HW lowering left HW op/type/capability/extension");
       ok = false;
     }
@@ -1408,6 +1562,71 @@ bool HwLowerToStandardPass::LowerMatrixLength(
   context()->ReplaceAllUsesWith(inst->result_id(), length_id);
   to_kill->push_back(inst);
   return true;
+}
+
+bool HwLowerToStandardPass::LowerMatrixReduce(Instruction* inst) {
+  if (!inst || inst->NumInOperands() != 3) {
+    ReportError(inst, "invalid OpCooperativeMatrixReduceHW");
+    return false;
+  }
+
+  const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
+  Instruction* input =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  const MatrixTypeInfo* source = GetMatrixTypeForValue(input);
+  uint32_t reduce_axis = 0;
+  uint32_t combine_op = 0;
+  if (!result || !source || !input || result->rows != source->rows ||
+      result->cols != source->cols ||
+      result->component_type_id != source->component_type_id ||
+      !GetConstantU32(inst->GetSingleWordInOperand(1), &reduce_axis) ||
+      reduce_axis > 1 ||
+      !GetConstantU32(inst->GetSingleWordInOperand(2), &combine_op) ||
+      combine_op > 2) {
+    ReportError(inst, "invalid OpCooperativeMatrixReduceHW");
+    return false;
+  }
+
+  InstructionBuilder builder(
+      context(), inst,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  std::vector<uint32_t> scalar_ids(result->rows * result->cols, 0);
+
+  if (reduce_axis == 0) {
+    for (uint32_t row = 0; row < result->rows; ++row) {
+      uint32_t reduced =
+          ExtractMatrixScalar(&builder, *source, input->result_id(), row, 0);
+      if (reduced == 0) return false;
+      for (uint32_t col = 1; col < result->cols; ++col) {
+        const uint32_t value = ExtractMatrixScalar(
+            &builder, *source, input->result_id(), row, col);
+        reduced = BuildReduceCombine(&builder, result->component_type_id,
+                                     combine_op, reduced, value);
+        if (reduced == 0) return false;
+      }
+      for (uint32_t col = 0; col < result->cols; ++col) {
+        scalar_ids[MatrixFlatIndex(*result, row, col)] = reduced;
+      }
+    }
+  } else {
+    for (uint32_t col = 0; col < result->cols; ++col) {
+      uint32_t reduced =
+          ExtractMatrixScalar(&builder, *source, input->result_id(), 0, col);
+      if (reduced == 0) return false;
+      for (uint32_t row = 1; row < result->rows; ++row) {
+        const uint32_t value = ExtractMatrixScalar(
+            &builder, *source, input->result_id(), row, col);
+        reduced = BuildReduceCombine(&builder, result->component_type_id,
+                                     combine_op, reduced, value);
+        if (reduced == 0) return false;
+      }
+      for (uint32_t row = 0; row < result->rows; ++row) {
+        scalar_ids[MatrixFlatIndex(*result, row, col)] = reduced;
+      }
+    }
+  }
+
+  return RebuildMatrixFromScalars(inst, *result, scalar_ids);
 }
 
 bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
@@ -2923,73 +3142,75 @@ bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
     return false;
   }
 
-  if (matrix && !IsPackedVec4(*matrix)) {
-    inst->SetResultType(matrix->lowered_type_id);
-    context()->UpdateDefUse(inst);
-    return true;
-  }
-  if (vector && !IsPackedVec4(*vector)) {
-    inst->SetResultType(vector->lowered_type_id);
-    context()->UpdateDefUse(inst);
-    return true;
-  }
-
   InstructionBuilder builder(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  std::vector<uint32_t> element_ids;
+  std::vector<uint32_t> scalar_ids;
 
   if (matrix) {
     const uint32_t expected_operands = matrix->rows * matrix->cols;
-    if (inst->NumInOperands() != expected_operands) {
+    if (inst->NumInOperands() == 1) {
+      Instruction* scalar =
+          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+      if (!scalar || scalar->type_id() != matrix->component_type_id) {
+        ReportError(inst,
+                    "HW matrix OpCompositeConstruct constituent is invalid");
+        return false;
+      }
+      scalar_ids.assign(expected_operands, scalar->result_id());
+    } else if (inst->NumInOperands() == expected_operands) {
+      scalar_ids.reserve(expected_operands);
+      for (uint32_t i = 0; i < expected_operands; ++i) {
+        Instruction* scalar =
+            get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(i));
+        if (!scalar || scalar->type_id() != matrix->component_type_id) {
+          ReportError(inst,
+                      "HW matrix OpCompositeConstruct constituent is invalid");
+          return false;
+        }
+        scalar_ids.push_back(scalar->result_id());
+      }
+    } else {
       ReportError(inst,
                   "HW matrix OpCompositeConstruct operand count is invalid");
       return false;
     }
-
-    element_ids.resize(matrix->rows * matrix->packed_cols, 0);
-    for (uint32_t row = 0; row < matrix->rows; ++row) {
-      for (uint32_t col_pack = 0; col_pack < matrix->packed_cols; ++col_pack) {
-        std::vector<uint32_t> lane_ids;
-        lane_ids.reserve(kPackedVec4Width);
-        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-          const uint32_t col = col_pack * kPackedVec4Width + lane;
-          lane_ids.push_back(
-              inst->GetSingleWordInOperand(MatrixFlatIndex(*matrix, row, col)));
-        }
-        Instruction* vec = builder.AddCompositeConstruct(
-            matrix->packed_vec4_type_id, lane_ids);
-        if (!vec) return false;
-        element_ids[MatrixPackedIndex(*matrix, row, col_pack)] =
-            vec->result_id();
-      }
-    }
-    RebuildAsCompositeConstruct(inst, matrix->lowered_type_id, element_ids);
-    return true;
+    return RebuildMatrixFromScalars(inst, *matrix, scalar_ids);
   }
 
-  const uint32_t expected_operands = vector->length;
-  if (inst->NumInOperands() != expected_operands) {
+  scalar_ids.reserve(vector->length);
+  for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+    Instruction* constituent =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(i));
+    if (!constituent) {
+      ReportError(inst, "invalid HW vector OpCompositeConstruct constituent");
+      return false;
+    }
+    if (constituent->type_id() == vector->component_type_id) {
+      scalar_ids.push_back(constituent->result_id());
+      continue;
+    }
+    Instruction* type = get_def_use_mgr()->GetDef(constituent->type_id());
+    if (!type || type->opcode() != spv::Op::OpTypeVector ||
+        type->NumInOperands() < 2 ||
+        type->GetSingleWordInOperand(0) != vector->component_type_id) {
+      ReportError(inst, "invalid HW vector OpCompositeConstruct constituent");
+      return false;
+    }
+    const uint32_t count = type->GetSingleWordInOperand(1);
+    for (uint32_t lane = 0; lane < count; ++lane) {
+      Instruction* scalar = builder.AddCompositeExtract(
+          vector->component_type_id, constituent->result_id(), {lane});
+      if (!scalar) return false;
+      scalar_ids.push_back(scalar->result_id());
+    }
+  }
+  if (scalar_ids.size() != vector->length) {
     ReportError(inst,
                 "HW vector OpCompositeConstruct operand count is invalid");
     return false;
   }
-
-  element_ids.resize(vector->packed_length, 0);
-  for (uint32_t pack = 0; pack < vector->packed_length; ++pack) {
-    std::vector<uint32_t> lane_ids;
-    lane_ids.reserve(kPackedVec4Width);
-    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-      lane_ids.push_back(
-          inst->GetSingleWordInOperand(pack * kPackedVec4Width + lane));
-    }
-    Instruction* vec =
-        builder.AddCompositeConstruct(vector->packed_vec4_type_id, lane_ids);
-    if (!vec) return false;
-    element_ids[pack] = vec->result_id();
-  }
-  RebuildAsCompositeConstruct(inst, vector->lowered_type_id, element_ids);
-  return true;
+  return RebuildVectorFromScalars(inst, *vector, scalar_ids);
 }
 
 bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
@@ -3001,6 +3222,10 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   }
   const bool is_replicate =
       inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT;
+  const spv::Op lowered_constituent_opcode =
+      inst->opcode() == spv::Op::OpSpecConstantComposite
+          ? spv::Op::OpSpecConstantComposite
+          : spv::Op::OpConstantComposite;
 
   const uint32_t component_type_id =
       matrix ? matrix->component_type_id : vector->component_type_id;
@@ -3093,7 +3318,8 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
               *matrix, row, col_pack * kPackedVec4Width + lane)]);
         }
         const uint32_t element_id = GetOrCreateCompositeConstant(
-            matrix->packed_vec4_type_id, lane_ids, &insert_after);
+            matrix->packed_vec4_type_id, lane_ids, &insert_after,
+            lowered_constituent_opcode);
         if (element_id == 0) return false;
         element_ids[MatrixPackedIndex(*matrix, row, col_pack)] = element_id;
       }
@@ -3107,7 +3333,8 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
         lane_ids.push_back(scalar_ids[pack * kPackedVec4Width + lane]);
       }
       element_ids[pack] = GetOrCreateCompositeConstant(
-          vector->packed_vec4_type_id, lane_ids, &insert_after);
+          vector->packed_vec4_type_id, lane_ids, &insert_after,
+          lowered_constituent_opcode);
       if (element_ids[pack] == 0) return false;
     }
   }
@@ -3123,82 +3350,413 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
 }
 
 bool HwLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
-  if (inst->NumInOperands() < 1) return true;
-  Instruction* object =
-      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-  if (!object) return true;
+  return RemapCompositeIndices(inst, 0, 1);
+}
 
-  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(object);
-  const VectorTypeInfo* vector = GetVectorType(object->type_id());
-  if (!matrix && !vector) return true;
+bool HwLowerToStandardPass::LowerCompositeInsert(Instruction* inst) {
+  return RemapCompositeIndices(inst, 1, 2);
+}
 
-  if (matrix) {
-    if (inst->NumInOperands() != 3 ||
-        inst->type_id() != matrix->component_type_id) {
-      ReportError(inst, "unsupported HW matrix OpCompositeExtract");
-      return false;
-    }
-    const uint32_t row = inst->GetSingleWordInOperand(1);
-    const uint32_t col = inst->GetSingleWordInOperand(2);
-    if (row >= matrix->rows || col >= matrix->cols) {
-      ReportError(inst, "HW matrix OpCompositeExtract index is out of range");
-      return false;
-    }
-
-    std::vector<Operand> operands;
-    if (!IsPackedVec4(*matrix)) {
-      operands.push_back(IdOperand(object->result_id()));
-      operands.push_back({SPV_OPERAND_TYPE_LITERAL_INTEGER,
-                          {MatrixFlatIndex(*matrix, row, col)}});
-      inst->SetInOperands(std::move(operands));
-      context()->UpdateDefUse(inst);
-      return true;
-    }
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    const uint32_t vec_id = ExtractCompositeElement(
-        &builder, matrix->packed_vec4_type_id, object->result_id(),
-        MatrixPackedIndex(*matrix, row, VectorPackedIndex(col)));
-    if (vec_id == 0) return false;
-    operands.push_back(IdOperand(vec_id));
-    operands.push_back({SPV_OPERAND_TYPE_LITERAL_INTEGER, {PackedLane(col)}});
-    inst->SetInOperands(std::move(operands));
-    context()->UpdateDefUse(inst);
-    return true;
-  }
-
-  if (inst->NumInOperands() != 2 ||
-      inst->type_id() != vector->component_type_id) {
-    ReportError(inst, "unsupported HW vector OpCompositeExtract");
+bool HwLowerToStandardPass::RemapCompositeIndices(
+    Instruction* inst, uint32_t composite_in_operand,
+    uint32_t first_index_in_operand) {
+  if (!inst || inst->NumInOperands() <= composite_in_operand ||
+      inst->NumInOperands() <= first_index_in_operand) {
+    ReportError(inst, "invalid HW composite indexing instruction");
     return false;
   }
-  const uint32_t index = inst->GetSingleWordInOperand(1);
-  if (index >= vector->length) {
-    ReportError(inst, "HW vector OpCompositeExtract index is out of range");
-    return false;
+
+  Instruction* composite = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(composite_in_operand));
+  if (!composite) return false;
+  uint32_t current_type_id = composite->type_id();
+  auto original = original_hw_value_types_.find(composite->result_id());
+  if (original != original_hw_value_types_.end()) {
+    current_type_id = original->second;
   }
 
   std::vector<Operand> operands;
-  if (!IsPackedVec4(*vector)) {
-    operands.push_back(IdOperand(object->result_id()));
-    operands.push_back({SPV_OPERAND_TYPE_LITERAL_INTEGER, {index}});
+  operands.reserve(inst->NumInOperands() + 1);
+  for (uint32_t i = 0; i < first_index_in_operand; ++i) {
+    operands.push_back(inst->GetInOperand(i));
+  }
+
+  bool remapped = false;
+  for (uint32_t i = first_index_in_operand; i < inst->NumInOperands(); ++i) {
+    const uint32_t index = inst->GetSingleWordInOperand(i);
+    if (const MatrixTypeInfo* matrix = GetMatrixType(current_type_id)) {
+      if (i + 1 >= inst->NumInOperands()) {
+        ReportError(inst,
+                    "HW matrix composite indexing requires row and column");
+        return false;
+      }
+      const uint32_t row = index;
+      const uint32_t col = inst->GetSingleWordInOperand(++i);
+      if (row >= matrix->rows || col >= matrix->cols) {
+        ReportError(inst, "HW matrix composite index is out of range");
+        return false;
+      }
+      if (IsPackedVec4(*matrix)) {
+        operands.push_back(
+            {SPV_OPERAND_TYPE_LITERAL_INTEGER,
+             {MatrixPackedIndex(*matrix, row, VectorPackedIndex(col))}});
+        operands.push_back(
+            {SPV_OPERAND_TYPE_LITERAL_INTEGER, {PackedLane(col)}});
+      } else {
+        operands.push_back({SPV_OPERAND_TYPE_LITERAL_INTEGER,
+                            {MatrixFlatIndex(*matrix, row, col)}});
+      }
+      current_type_id = matrix->component_type_id;
+      remapped = true;
+      continue;
+    }
+    if (const VectorTypeInfo* vector = GetVectorType(current_type_id)) {
+      if (index >= vector->length) {
+        ReportError(inst, "HW vector composite index is out of range");
+        return false;
+      }
+      if (IsPackedVec4(*vector)) {
+        operands.push_back(
+            {SPV_OPERAND_TYPE_LITERAL_INTEGER, {VectorPackedIndex(index)}});
+        operands.push_back(
+            {SPV_OPERAND_TYPE_LITERAL_INTEGER, {PackedLane(index)}});
+      } else {
+        operands.push_back(inst->GetInOperand(i));
+      }
+      current_type_id = vector->component_type_id;
+      remapped = true;
+      continue;
+    }
+
+    Instruction* type = get_def_use_mgr()->GetDef(current_type_id);
+    if (!type) return false;
+    operands.push_back(inst->GetInOperand(i));
+    switch (type->opcode()) {
+      case spv::Op::OpTypeArray:
+      case spv::Op::OpTypeRuntimeArray:
+      case spv::Op::OpTypeVector:
+      case spv::Op::OpTypeMatrix:
+        current_type_id = type->GetSingleWordInOperand(0);
+        break;
+      case spv::Op::OpTypeStruct:
+        if (index >= type->NumInOperands()) {
+          ReportError(inst, "nested HW composite struct index is out of range");
+          return false;
+        }
+        current_type_id = type->GetSingleWordInOperand(index);
+        break;
+      default:
+        ReportError(inst, "composite index path reaches a non-composite type");
+        return false;
+    }
+  }
+
+  if (remapped) {
     inst->SetInOperands(std::move(operands));
     context()->UpdateDefUse(inst);
+  }
+  return true;
+}
+
+bool HwLowerToStandardPass::LowerAccessChain(Instruction* inst) {
+  if (!inst || inst->NumInOperands() < 2) {
+    ReportError(inst, "invalid HW access chain");
+    return false;
+  }
+  Instruction* base =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  Instruction* pointer_type =
+      base ? get_def_use_mgr()->GetDef(base->type_id()) : nullptr;
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+      pointer_type->NumInOperands() < 2) {
     return true;
+  }
+
+  uint32_t current_type_id = pointer_type->GetSingleWordInOperand(1);
+  const bool is_ptr_chain = inst->opcode() == spv::Op::OpPtrAccessChain ||
+                            inst->opcode() == spv::Op::OpInBoundsPtrAccessChain;
+  const uint32_t first_index = is_ptr_chain ? 2 : 1;
+  if (inst->NumInOperands() <= first_index) return true;
+
+  std::vector<Operand> operands;
+  operands.reserve(inst->NumInOperands() + 1);
+  for (uint32_t i = 0; i < first_index; ++i) {
+    operands.push_back(inst->GetInOperand(i));
   }
 
   InstructionBuilder builder(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  const uint32_t vec_id =
-      ExtractCompositeElement(&builder, vector->packed_vec4_type_id,
-                              object->result_id(), VectorPackedIndex(index));
-  if (vec_id == 0) return false;
-  operands.push_back(IdOperand(vec_id));
-  operands.push_back({SPV_OPERAND_TYPE_LITERAL_INTEGER, {PackedLane(index)}});
-  inst->SetInOperands(std::move(operands));
+  bool remapped = false;
+  for (uint32_t i = first_index; i < inst->NumInOperands(); ++i) {
+    const uint32_t index_id = inst->GetSingleWordInOperand(i);
+    const MatrixTypeInfo* matrix = GetMatrixType(current_type_id);
+    const VectorTypeInfo* vector = GetVectorType(current_type_id);
+    if (matrix || vector) {
+      const bool packed =
+          matrix ? IsPackedVec4(*matrix) : IsPackedVec4(*vector);
+      const uint32_t component_type_id =
+          matrix ? matrix->component_type_id : vector->component_type_id;
+      if (!packed) {
+        operands.push_back(inst->GetInOperand(i));
+      } else {
+        Instruction* index = get_def_use_mgr()->GetDef(index_id);
+        Instruction* index_type =
+            index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
+        if (!index_type || index_type->opcode() != spv::Op::OpTypeInt ||
+            index_type->NumInOperands() < 2 ||
+            index_type->GetSingleWordInOperand(0) > 32) {
+          ReportError(inst,
+                      "packed HW access chain requires a 32-bit integer index");
+          return false;
+        }
+        const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+        const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
+        Instruction* piece = builder.AddBinaryOp(
+            index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
+            index_id, four_id);
+        Instruction* lane = builder.AddBinaryOp(
+            index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
+            index_id, four_id);
+        if (!piece || !lane) return false;
+        operands.push_back(IdOperand(piece->result_id()));
+        operands.push_back(IdOperand(lane->result_id()));
+      }
+      current_type_id = component_type_id;
+      remapped = true;
+      continue;
+    }
+
+    Instruction* type = get_def_use_mgr()->GetDef(current_type_id);
+    if (!type) return false;
+    operands.push_back(inst->GetInOperand(i));
+    switch (type->opcode()) {
+      case spv::Op::OpTypeArray:
+      case spv::Op::OpTypeRuntimeArray:
+      case spv::Op::OpTypeVector:
+      case spv::Op::OpTypeMatrix:
+        current_type_id = type->GetSingleWordInOperand(0);
+        break;
+      case spv::Op::OpTypeStruct: {
+        uint32_t member = 0;
+        if (!GetConstantU32(index_id, &member) ||
+            member >= type->NumInOperands()) {
+          ReportError(inst, "nested HW access-chain struct index is invalid");
+          return false;
+        }
+        current_type_id = type->GetSingleWordInOperand(member);
+        break;
+      }
+      default:
+        ReportError(inst, "HW access-chain path reaches a non-composite type");
+        return false;
+    }
+  }
+
+  if (remapped) {
+    inst->SetInOperands(std::move(operands));
+    context()->UpdateDefUse(inst);
+  }
+  return true;
+}
+
+bool HwLowerToStandardPass::LowerSelect(Instruction* inst) {
+  const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
+  const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+  if ((!matrix && !vector) || !inst || inst->NumInOperands() != 3) {
+    ReportError(inst, "invalid HW OpSelect");
+    return false;
+  }
+
+  const uint32_t condition_id = inst->GetSingleWordInOperand(0);
+  const uint32_t true_id = inst->GetSingleWordInOperand(1);
+  const uint32_t false_id = inst->GetSingleWordInOperand(2);
+  Instruction* condition = get_def_use_mgr()->GetDef(condition_id);
+  Instruction* condition_type =
+      condition ? get_def_use_mgr()->GetDef(condition->type_id()) : nullptr;
+  if (!condition_type || condition_type->opcode() != spv::Op::OpTypeBool) {
+    ReportError(inst, "HW OpSelect requires a scalar bool condition");
+    return false;
+  }
+
+  InstructionBuilder builder(
+      context(), inst,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (matrix) {
+    std::vector<uint32_t> scalar_ids(matrix->rows * matrix->cols, 0);
+    for (uint32_t row = 0; row < matrix->rows; ++row) {
+      for (uint32_t col = 0; col < matrix->cols; ++col) {
+        const uint32_t lhs =
+            ExtractMatrixScalar(&builder, *matrix, true_id, row, col);
+        const uint32_t rhs =
+            ExtractMatrixScalar(&builder, *matrix, false_id, row, col);
+        Instruction* select =
+            builder.AddTernaryOp(matrix->component_type_id, spv::Op::OpSelect,
+                                 condition_id, lhs, rhs);
+        if (!select) return false;
+        scalar_ids[MatrixFlatIndex(*matrix, row, col)] = select->result_id();
+      }
+    }
+    return RebuildMatrixFromScalars(inst, *matrix, scalar_ids);
+  }
+
+  std::vector<uint32_t> scalar_ids(vector->length, 0);
+  for (uint32_t i = 0; i < vector->length; ++i) {
+    const uint32_t lhs = ExtractVectorScalar(&builder, *vector, true_id, i);
+    const uint32_t rhs = ExtractVectorScalar(&builder, *vector, false_id, i);
+    Instruction* select = builder.AddTernaryOp(
+        vector->component_type_id, spv::Op::OpSelect, condition_id, lhs, rhs);
+    if (!select) return false;
+    scalar_ids[i] = select->result_id();
+  }
+  return RebuildVectorFromScalars(inst, *vector, scalar_ids);
+}
+
+bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
+  if (!inst || inst->NumInOperands() != 2) {
+    ReportError(inst, "invalid HW OpVectorExtractDynamic");
+    return false;
+  }
+  Instruction* object =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  const VectorTypeInfo* vector =
+      object ? GetVectorType(object->type_id()) : nullptr;
+  if (!vector || inst->type_id() != vector->component_type_id) {
+    ReportError(inst, "invalid HW OpVectorExtractDynamic object");
+    return false;
+  }
+
+  BasicBlock* block = context()->get_instr_block(inst);
+  Function* function = block ? block->GetParent() : nullptr;
+  const uint32_t value_ptr_type = GetOrCreatePointerType(
+      vector->lowered_type_id, spv::StorageClass::Function);
+  if (!function || value_ptr_type == 0) return false;
+  Instruction* variable = AddFunctionVariable(function, value_ptr_type);
+  if (!variable) return false;
+
+  InstructionBuilder builder(
+      context(), inst,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!AddStore(&builder, variable->result_id(), object->result_id(), {})) {
+    return false;
+  }
+  uint32_t index_id = inst->GetSingleWordInOperand(1);
+  uint32_t piece_index_id = index_id;
+  uint32_t lane_id = 0;
+  uint32_t piece_type_id = vector->component_type_id;
+  if (IsPackedVec4(*vector)) {
+    Instruction* index = get_def_use_mgr()->GetDef(index_id);
+    Instruction* index_type =
+        index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
+    if (!index || !index_type || index_type->opcode() != spv::Op::OpTypeInt ||
+        index_type->NumInOperands() < 2) {
+      return false;
+    }
+    const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+    const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
+    Instruction* piece_index = builder.AddBinaryOp(
+        index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
+        index_id, four_id);
+    Instruction* lane = builder.AddBinaryOp(
+        index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
+        index_id, four_id);
+    if (!piece_index || !lane) return false;
+    piece_index_id = piece_index->result_id();
+    lane_id = lane->result_id();
+    piece_type_id = vector->packed_vec4_type_id;
+  }
+
+  const uint32_t piece_ptr_type =
+      GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
+  Instruction* pointer = builder.AddAccessChain(
+      piece_ptr_type, variable->result_id(), {piece_index_id});
+  if (!pointer) return false;
+  const uint32_t piece =
+      AddLoad(&builder, piece_type_id, pointer->result_id(), {});
+  if (piece == 0) return false;
+  uint32_t result_id = piece;
+  if (IsPackedVec4(*vector)) {
+    Instruction* extract =
+        builder.AddBinaryOp(vector->component_type_id,
+                            spv::Op::OpVectorExtractDynamic, piece, lane_id);
+    if (!extract) return false;
+    result_id = extract->result_id();
+  }
+  inst->SetOpcode(spv::Op::OpCopyObject);
+  inst->SetInOperands({IdOperand(result_id)});
+  context()->UpdateDefUse(inst);
+  return true;
+}
+
+bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
+  const VectorTypeInfo* vector =
+      inst ? GetVectorType(inst->type_id()) : nullptr;
+  if (!vector || inst->NumInOperands() != 3) {
+    ReportError(inst, "invalid HW OpVectorInsertDynamic");
+    return false;
+  }
+  const uint32_t object_id = inst->GetSingleWordInOperand(0);
+  const uint32_t vector_id = inst->GetSingleWordInOperand(1);
+  const uint32_t index_id = inst->GetSingleWordInOperand(2);
+  BasicBlock* block = context()->get_instr_block(inst);
+  Function* function = block ? block->GetParent() : nullptr;
+  const uint32_t value_ptr_type = GetOrCreatePointerType(
+      vector->lowered_type_id, spv::StorageClass::Function);
+  if (!function || value_ptr_type == 0) return false;
+  Instruction* variable = AddFunctionVariable(function, value_ptr_type);
+  if (!variable) return false;
+
+  InstructionBuilder builder(
+      context(), inst,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!AddStore(&builder, variable->result_id(), vector_id, {})) return false;
+  uint32_t piece_index_id = index_id;
+  uint32_t lane_id = 0;
+  uint32_t piece_type_id = vector->component_type_id;
+  if (IsPackedVec4(*vector)) {
+    Instruction* index = get_def_use_mgr()->GetDef(index_id);
+    Instruction* index_type =
+        index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
+    if (!index || !index_type || index_type->opcode() != spv::Op::OpTypeInt ||
+        index_type->NumInOperands() < 2) {
+      return false;
+    }
+    const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+    const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
+    Instruction* piece_index = builder.AddBinaryOp(
+        index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
+        index_id, four_id);
+    Instruction* lane = builder.AddBinaryOp(
+        index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
+        index_id, four_id);
+    if (!piece_index || !lane) return false;
+    piece_index_id = piece_index->result_id();
+    lane_id = lane->result_id();
+    piece_type_id = vector->packed_vec4_type_id;
+  }
+
+  const uint32_t piece_ptr_type =
+      GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
+  Instruction* pointer = builder.AddAccessChain(
+      piece_ptr_type, variable->result_id(), {piece_index_id});
+  if (!pointer) return false;
+  uint32_t stored_id = object_id;
+  if (IsPackedVec4(*vector)) {
+    const uint32_t old_piece =
+        AddLoad(&builder, piece_type_id, pointer->result_id(), {});
+    Instruction* inserted =
+        builder.AddTernaryOp(piece_type_id, spv::Op::OpVectorInsertDynamic,
+                             old_piece, object_id, lane_id);
+    if (!inserted) return false;
+    stored_id = inserted->result_id();
+  }
+  if (!AddStore(&builder, pointer->result_id(), stored_id, {})) return false;
+  const uint32_t result_id =
+      AddLoad(&builder, vector->lowered_type_id, variable->result_id(), {});
+  if (result_id == 0) return false;
+  inst->SetOpcode(spv::Op::OpCopyObject);
+  inst->SetResultType(vector->lowered_type_id);
+  inst->SetInOperands({IdOperand(result_id)});
   context()->UpdateDefUse(inst);
   return true;
 }
@@ -3215,10 +3773,31 @@ bool HwLowerToStandardPass::LowerNullOrUndef(Instruction* inst) {
 }
 
 bool HwLowerToStandardPass::LowerHwBitcast(Instruction* inst) {
-  inst->SetOpcode(spv::Op::OpCopyObject);
-  inst->SetResultType(GetLoweredType(inst->type_id()));
-  context()->UpdateDefUse(inst);
-  return true;
+  if (inst && inst->NumInOperands() == 1) {
+    Instruction* object =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    const uint32_t result_type = GetLoweredType(inst->type_id());
+    uint32_t input_type = 0;
+    if (object) {
+      input_type = GetLoweredType(object->type_id());
+      auto original = original_hw_value_types_.find(object->result_id());
+      if (original != original_hw_value_types_.end()) {
+        input_type = GetLoweredType(original->second);
+      }
+      if (input_type == 0) input_type = object->type_id();
+    }
+    if (result_type != 0 && result_type == input_type) {
+      inst->SetOpcode(spv::Op::OpCopyObject);
+      inst->SetResultType(result_type);
+      context()->UpdateDefUse(inst);
+      return true;
+    }
+  }
+  // Cooperative values with the same logical shape may still choose different
+  // lowered layouts (for example, packed f32 versus scalar u32).  Preserve the
+  // component-wise bitcast semantics instead of assuming those aggregate
+  // representations are identical.
+  return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kConversion);
 }
 
 bool HwLowerToStandardPass::LowerHwConversion(Instruction* inst) {
@@ -3979,10 +4558,13 @@ uint32_t HwLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
 
 uint32_t HwLowerToStandardPass::GetOrCreateCompositeConstant(
     uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
-    Instruction** insert_after) {
+    Instruction** insert_after, spv::Op opcode) {
+  if (opcode != spv::Op::OpConstantComposite &&
+      opcode != spv::Op::OpSpecConstantComposite) {
+    return 0;
+  }
   for (Instruction& inst : get_module()->types_values()) {
-    if (inst.opcode() != spv::Op::OpConstantComposite ||
-        inst.type_id() != type_id ||
+    if (inst.opcode() != opcode || inst.type_id() != type_id ||
         inst.NumInOperands() != constituent_ids.size()) {
       continue;
     }
@@ -4003,8 +4585,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateCompositeConstant(
   for (uint32_t id : constituent_ids) operands.push_back(IdOperand(id));
   Instruction* added = AddTypeOrGlobalAfter(
       context(), insert_after ? *insert_after : nullptr,
-      MakeUnique<Instruction>(context(), spv::Op::OpConstantComposite, type_id,
-                              result_id, operands));
+      MakeUnique<Instruction>(context(), opcode, type_id, result_id, operands));
   if (!added) return 0;
   if (insert_after) *insert_after = added;
   return result_id;
@@ -7090,6 +7671,53 @@ uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
   return sum;
 }
 
+uint32_t HwLowerToStandardPass::BuildReduceCombine(InstructionBuilder* builder,
+                                                   uint32_t component_type_id,
+                                                   uint32_t combine_op,
+                                                   uint32_t lhs_id,
+                                                   uint32_t rhs_id) {
+  if (!builder || lhs_id == 0 || rhs_id == 0 || combine_op > 2) return 0;
+
+  Instruction* component_type = get_def_use_mgr()->GetDef(component_type_id);
+  if (!component_type) return 0;
+  if (combine_op == 0) {
+    const spv::Op add_opcode = component_type->opcode() == spv::Op::OpTypeFloat
+                                   ? spv::Op::OpFAdd
+                                   : spv::Op::OpIAdd;
+    Instruction* add =
+        builder->AddBinaryOp(component_type_id, add_opcode, lhs_id, rhs_id);
+    return add ? add->result_id() : 0;
+  }
+
+  uint32_t ext_opcode = 0;
+  if (component_type->opcode() == spv::Op::OpTypeFloat) {
+    ext_opcode = combine_op == 1 ? GLSLstd450FMin : GLSLstd450FMax;
+  } else if (component_type->opcode() == spv::Op::OpTypeInt &&
+             component_type->NumInOperands() >= 2) {
+    const bool is_signed = component_type->GetSingleWordInOperand(1) != 0;
+    if (is_signed) {
+      ext_opcode = combine_op == 1 ? GLSLstd450SMin : GLSLstd450SMax;
+    } else {
+      ext_opcode = combine_op == 1 ? GLSLstd450UMin : GLSLstd450UMax;
+    }
+  } else {
+    return 0;
+  }
+
+  const uint32_t import_id = GetOrCreateGLSLStd450Import();
+  const uint32_t result_id = TakeNextId();
+  if (import_id == 0 || result_id == 0) return 0;
+  std::unique_ptr<Instruction> ext_inst = MakeUnique<Instruction>(
+      context(), spv::Op::OpExtInst, component_type_id, result_id,
+      std::initializer_list<Operand>{
+          IdOperand(import_id),
+          {SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER, {ext_opcode}},
+          IdOperand(lhs_id),
+          IdOperand(rhs_id)});
+  Instruction* added = builder->AddInstruction(std::move(ext_inst));
+  return added ? added->result_id() : 0;
+}
+
 bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
     InstructionBuilder* builder, const VectorTypeInfo& result,
     const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
@@ -9664,8 +10292,15 @@ bool HwLowerToStandardPass::IsHwType(uint32_t type_id) const {
 }
 
 bool HwLowerToStandardPass::TypeContainsHw(uint32_t type_id) const {
+  std::unordered_set<uint32_t> visited;
+  return TypeContainsHwImpl(type_id, &visited);
+}
+
+bool HwLowerToStandardPass::TypeContainsHwImpl(
+    uint32_t type_id, std::unordered_set<uint32_t>* visited) const {
   if (type_id == 0) return false;
   if (IsHwType(type_id)) return true;
+  if (!visited || !visited->insert(type_id).second) return false;
 
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   if (!type) return false;
@@ -9673,17 +10308,49 @@ bool HwLowerToStandardPass::TypeContainsHw(uint32_t type_id) const {
     case spv::Op::OpTypePointer:
     case spv::Op::OpTypeArray:
     case spv::Op::OpTypeRuntimeArray:
-      return TypeContainsHw(type->GetSingleWordInOperand(
-          type->opcode() == spv::Op::OpTypePointer ? 1 : 0));
+      return TypeContainsHwImpl(
+          type->GetSingleWordInOperand(
+              type->opcode() == spv::Op::OpTypePointer ? 1 : 0),
+          visited);
     case spv::Op::OpTypeFunction:
     case spv::Op::OpTypeStruct:
       for (uint32_t i = 0; i < type->NumInOperands(); ++i) {
-        if (TypeContainsHw(type->GetSingleWordInOperand(i))) return true;
+        if (TypeContainsHwImpl(type->GetSingleWordInOperand(i), visited)) {
+          return true;
+        }
       }
       return false;
     default:
       return false;
   }
+}
+
+bool HwLowerToStandardPass::InstructionTouchesHw(
+    const Instruction* inst) const {
+  if (!inst) return false;
+  if (TypeContainsHw(inst->type_id())) return true;
+  if (inst->result_id() != 0 && IsTypeInst(inst->opcode()) &&
+      TypeContainsHw(inst->result_id())) {
+    return true;
+  }
+
+  bool touches_hw = false;
+  inst->ForEachInId([this, &touches_hw](const uint32_t* id) {
+    if (touches_hw || !id || *id == 0) return;
+    if (TypeContainsHw(*id)) {
+      touches_hw = true;
+      return;
+    }
+    Instruction* value = get_def_use_mgr()->GetDef(*id);
+    if (!value) return;
+    uint32_t value_type_id = value->type_id();
+    auto original = original_hw_value_types_.find(value->result_id());
+    if (original != original_hw_value_types_.end()) {
+      value_type_id = original->second;
+    }
+    touches_hw = TypeContainsHw(value_type_id);
+  });
+  return touches_hw;
 }
 
 bool HwLowerToStandardPass::HasHwTypeReference(
@@ -9722,6 +10389,24 @@ bool HwLowerToStandardPass::IsHwOpcode(spv::Op opcode) const {
   }
 }
 
+bool HwLowerToStandardPass::IsAnyHwOpcode(spv::Op opcode) const {
+  if (IsHwOpcode(opcode)) return true;
+  switch (opcode) {
+    case spv::Op::OpTypeTensorMapHW:
+    case spv::Op::OpCpAsyncTensorGlobalSharedHW:
+    case spv::Op::OpCpAsyncCommitGroupHW:
+    case spv::Op::OpCpAsyncWaitGroupHW:
+    case spv::Op::OpBarrierArriveHW:
+    case spv::Op::OpBarrierWaitHW:
+    case spv::Op::OpShuffleIndexHW:
+    case spv::Op::OpBytePermuteHW:
+    case spv::Op::OpShuffleFillDownHW:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool HwLowerToStandardPass::IsHwCapabilityOrExtension(
     const Instruction* inst) const {
   if (inst->opcode() == spv::Op::OpCapability) {
@@ -9741,6 +10426,25 @@ bool HwLowerToStandardPass::IsHwCapabilityOrExtension(
            extension == "GL_AZD_cooperative_vector";
   }
   return false;
+}
+
+bool HwLowerToStandardPass::IsAnyHwCapabilityOrExtension(
+    const Instruction* inst) const {
+  if (IsHwCapabilityOrExtension(inst)) return true;
+  if (inst->opcode() == spv::Op::OpExtension) {
+    return inst->GetInOperand(0).AsString() == "SPV_HW_neural_shader";
+  }
+  if (inst->opcode() == spv::Op::OpSourceExtension) {
+    return inst->GetInOperand(0).AsString() == "GL_HW_neural_shader";
+  }
+  return false;
+}
+
+bool HwLowerToStandardPass::HasHwOperand(const Instruction* inst) const {
+  return inst && inst->opcode() == spv::Op::OpSelectionMerge &&
+         inst->NumInOperands() >= 2 &&
+         (inst->GetSingleWordInOperand(1) &
+          uint32_t(spv::SelectionControlMask::Relreg)) != 0;
 }
 
 bool HwLowerToStandardPass::RequiresHwNeuralShaderExtension(

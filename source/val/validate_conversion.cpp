@@ -609,6 +609,14 @@ spv_result_t ConversionPass(ValidationState_t& _, const Instruction* inst) {
         if (ret != SPV_SUCCESS) return ret;
       }
 
+      if ((_.IsCooperativeVectorHWType(result_type) ||
+           _.IsCooperativeMatrixHWType(result_type)) &&
+          _.GetBitWidth(result_type) != _.GetBitWidth(input_type)) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << "Expected input to have the same component bit width as "
+               << "Result Type: " << spvOpcodeString(opcode);
+      }
+
       if (_.version() >= SPV_SPIRV_VERSION_WORD(1, 5) ||
           _.HasExtension(kSPV_KHR_physical_storage_buffer)) {
         const bool result_is_int_vector = _.IsIntVectorType(result_type);

@@ -42,9 +42,15 @@ class HwLowerToStandardPass : public Pass {
     kForceScalar,
   };
 
+  enum class CompletenessMode {
+    kCooperativeOnly,
+    kExtensionFree,
+  };
+
   explicit HwLowerToStandardPass(
-      LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4)
-      : lowering_mode_(lowering_mode) {}
+      LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4,
+      CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly)
+      : lowering_mode_(lowering_mode), completeness_mode_(completeness_mode) {}
 
   const char* name() const override { return "hw-lower-to-standard"; }
   Status Process() override;
@@ -88,6 +94,7 @@ class HwLowerToStandardPass : public Pass {
   };
 
   bool CollectHwTypes();
+  bool PreflightExtensionFreeMode() const;
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();
@@ -103,6 +110,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerMatrixMulAddPackedVec4(Instruction* inst);
   bool LowerMatrixMulAddScalarFallback(Instruction* inst);
   bool LowerMatrixLength(Instruction* inst, std::vector<Instruction*>* to_kill);
+  bool LowerMatrixReduce(Instruction* inst);
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
@@ -116,6 +124,10 @@ class HwLowerToStandardPass : public Pass {
   bool LowerConstantComposite(Instruction* inst);
   bool LowerCompositeConstruct(Instruction* inst);
   bool LowerCompositeExtract(Instruction* inst);
+  bool LowerCompositeInsert(Instruction* inst);
+  bool LowerSelect(Instruction* inst);
+  bool LowerVectorExtractDynamic(Instruction* inst);
+  bool LowerVectorInsertDynamic(Instruction* inst);
   bool LowerNullOrUndef(Instruction* inst);
   bool LowerHwBitcast(Instruction* inst);
   bool LowerHwConversion(Instruction* inst);
@@ -144,7 +156,10 @@ class HwLowerToStandardPass : public Pass {
   uint32_t GetOrCreateZero(uint32_t type_id);
   uint32_t GetOrCreateCompositeConstant(
       uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
-      Instruction** insert_after);
+      Instruction** insert_after, spv::Op opcode);
+  bool RemapCompositeIndices(Instruction* inst, uint32_t composite_in_operand,
+                             uint32_t first_index_in_operand);
+  bool LowerAccessChain(Instruction* inst);
   uint32_t BuildPairComponentAsUInt(InstructionBuilder* builder,
                                     Instruction* user, uint32_t pair_id,
                                     uint32_t component_index);
@@ -295,6 +310,9 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildHorizontalReduce(InstructionBuilder* builder,
                                  uint32_t component_type_id,
                                  uint32_t vector_id);
+  uint32_t BuildReduceCombine(InstructionBuilder* builder,
+                              uint32_t component_type_id, uint32_t combine_op,
+                              uint32_t lhs_id, uint32_t rhs_id);
   bool BuildVectorMatrixMulPatternPackedVec4(
       InstructionBuilder* builder, const VectorTypeInfo& result,
       const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
@@ -447,9 +465,15 @@ class HwLowerToStandardPass : public Pass {
   bool IsFloat32Type(uint32_t type_id) const;
   bool IsHwType(uint32_t type_id) const;
   bool TypeContainsHw(uint32_t type_id) const;
+  bool TypeContainsHwImpl(uint32_t type_id,
+                          std::unordered_set<uint32_t>* visited) const;
+  bool InstructionTouchesHw(const Instruction* inst) const;
   bool HasHwTypeReference(const Instruction* inst) const;
   bool IsHwOpcode(spv::Op opcode) const;
+  bool IsAnyHwOpcode(spv::Op opcode) const;
   bool IsHwCapabilityOrExtension(const Instruction* inst) const;
+  bool IsAnyHwCapabilityOrExtension(const Instruction* inst) const;
+  bool HasHwOperand(const Instruction* inst) const;
   bool RequiresHwNeuralShaderExtension(const Instruction* inst) const;
   bool ModuleRequiresHwNeuralShaderExtension() const;
   bool RemoveExtensionByName(const char* extension_name);
@@ -477,6 +501,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> generated_function_ids_;
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
+  CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
 };
 
 }  // namespace opt

@@ -1268,6 +1268,41 @@ TEST_F(ValidateComposites, CompositeExtractInsertIndexIntoAllTypesGood) {
   EXPECT_EQ(SPV_SUCCESS, ValidateInstructions());
 }
 
+TEST_F(ValidateComposites,
+       CooperativeMatrixAndVectorHWExtractInsertIndicesGood) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%float = OpTypeFloat 32
+%float_1 = OpConstant %float 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%mat = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%vec = OpTypeCooperativeVectorHW %float %uint_5
+%mat_value = OpUndef %mat
+%vec_value = OpUndef %vec
+%main = OpFunction %void None %func
+%entry = OpLabel
+%mat_inserted = OpCompositeInsert %mat %float_1 %mat_value 1 4
+%mat_element = OpCompositeExtract %float %mat_inserted 1 4
+%vec_inserted = OpCompositeInsert %vec %float_1 %vec_value 4
+%vec_element = OpCompositeExtract %float %vec_inserted 4
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str());
+  ASSERT_EQ(SPV_SUCCESS, ValidateInstructions());
+}
+
 // Invalid. More indexes are provided than needed for OpCompositeExtract.
 TEST_F(ValidateComposites, CompositeExtractReachedScalarBad) {
   // indexes that we are passing are: 0, 3, 1, 2, 0
