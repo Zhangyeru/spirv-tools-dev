@@ -33,6 +33,13 @@ size_t CountSubstring(const std::string& text, const std::string& needle) {
   return count;
 }
 
+void ExpectSingleElementwiseLoop(const std::string& text) {
+  EXPECT_EQ(1u, CountSubstring(text, "OpLoopMerge")) << text;
+  EXPECT_EQ(1u, CountSubstring(text, "OpULessThan")) << text;
+  EXPECT_EQ(1u, CountSubstring(text, "OpBranchConditional")) << text;
+  EXPECT_GE(CountSubstring(text, "OpAccessChain"), 2u) << text;
+}
+
 void ExpectNoHwOrCoopMatrix(const std::string& text) {
   EXPECT_EQ(0u, CountSubstring(text, "CooperativeMatrixHW"));
   EXPECT_EQ(0u, CountSubstring(text, "CooperativeVectorHW"));
@@ -169,8 +176,8 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));
@@ -206,8 +213,8 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
@@ -239,11 +246,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v4float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
 }
 
@@ -271,11 +279,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(8u, CountSubstring(disassembly, "OpUConvert %uint"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpUConvert %uint"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %uint 4"));
 }
 
@@ -302,11 +311,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
@@ -333,12 +343,13 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
-  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFMul %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v4float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorIMulScalarFallback) {
@@ -364,11 +375,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(8u, CountSubstring(disassembly, "OpIMul %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpIMul %int"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
@@ -397,11 +409,13 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(8u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
 
@@ -427,11 +441,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(8u, CountSubstring(disassembly, "OpSNegate %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %int"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
 
@@ -459,11 +474,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(10u, CountSubstring(disassembly, "OpIAdd %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpIAdd %int"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
 
@@ -493,11 +509,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v4float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
 }
 
@@ -526,11 +543,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(10u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
 
@@ -558,11 +576,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
@@ -590,12 +609,13 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpMatrixTimesScalar"));
-  EXPECT_EQ(10u, CountSubstring(disassembly, "OpFMul %float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %float"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
 }
 
@@ -623,11 +643,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(16u, CountSubstring(disassembly, "OpIMul %int"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpIMul %int"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
 }
@@ -659,8 +680,271 @@ OpFunctionEnd
       text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(8u, CountSubstring(disassembly, "OpFAdd %float"));
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersScalarToPackedVectorConversionWithLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%ivec8 = OpTypeCooperativeVectorHW %int %uint_8
+%fvec8 = OpTypeCooperativeVectorHW %float %uint_8
+%x = OpUndef %ivec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpConvertSToF %fvec8 %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertSToF %v4float"));
+  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersPackedToScalarMatrixConversionWithLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%fmat = OpTypeCooperativeMatrixHW %float %uint_2 %uint_8
+%imat = OpTypeCooperativeMatrixHW %int %uint_2 %uint_8
+%x = OpUndef %fmat
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpConvertFToS %imat %x
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersCooperativeVectorExtInstWithLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%zero = OpConstantNull %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpExtInst %vec8 %glsl FMax %zero %zero
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpExtInst %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest, FailsUnsupportedCooperativeVectorExtInst) {
+  const std::string text = R"(
+; CHECK: unsupported HW cooperative vector GLSL.std.450 opcode
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%zero = OpConstantNull %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpExtInst %vec8 %glsl Sin %zero
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest, FailsMismatchedCooperativeVectorExtInstLength) {
+  const std::string text = R"(
+; CHECK: invalid HW cooperative vector OpExtInst operand
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%short = OpConstantNull %vec4
+%wide = OpConstantNull %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpExtInst %vec8 %glsl FMax %wide %short
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest, LowersChainedElementwiseOpsToSeparateLoops) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%a = OpUndef %vec8
+%b = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%sum = OpFAdd %vec8 %a %b
+%neg = OpFNegate %vec8 %sum
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpULessThan"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest, PreservesEnclosingLoopHeaderWhenSplitting) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%false = OpConstantFalse %bool
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%x = OpUndef %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpBranch %outer_header
+%outer_header = OpLabel
+%y = OpFAdd %vec8 %x %x
+OpLoopMerge %outer_merge %outer_continue None
+OpBranchConditional %false %outer_body %outer_merge
+%outer_body = OpLabel
+OpBranch %outer_continue
+%outer_continue = OpLabel
+OpBranch %outer_header
+%outer_merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest, CompatibleHwBitcastRemainsLoopFreeCopy) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%mat_a = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4 MatrixUseAHW
+%mat_b = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4 MatrixUseBHW
+%a = OpUndef %mat_a
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%b = OpBitcast %mat_b %a
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCopyObject"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpBitcast"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatmul4x4x4F32Tiled) {

@@ -3226,113 +3226,7 @@ bool HwLowerToStandardPass::LowerHwConversion(Instruction* inst) {
     ReportError(inst, "unsupported HW conversion");
     return false;
   }
-
-  if (const VectorTypeInfo* result = GetVectorType(inst->type_id())) {
-    ValueLayout input_layout;
-    if (!DescribeVectorValue(inst->GetSingleWordInOperand(0), result->length,
-                             &input_layout)) {
-      ReportError(inst, "invalid HW vector conversion operand");
-      return false;
-    }
-
-    const bool result_packed = IsPackedVec4(*result);
-    const uint32_t result_piece_type =
-        result_packed ? result->packed_vec4_type_id : result->component_type_id;
-    const uint32_t result_piece_count =
-        result_packed ? result->packed_length : result->length;
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    if (input_layout.packed_vec4 == result_packed &&
-        input_layout.piece_count == result_piece_count) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result_piece_count);
-      for (uint32_t i = 0; i < result_piece_count; ++i) {
-        const uint32_t piece_id =
-            ExtractValuePiece(&builder, input_layout,
-                              inst->GetSingleWordInOperand(0), i);
-        if (piece_id == 0) return false;
-        Instruction* converted =
-            builder.AddUnaryOp(result_piece_type, inst->opcode(), piece_id);
-        if (!converted) return false;
-        piece_ids.push_back(converted->result_id());
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->length);
-    for (uint32_t i = 0; i < result->length; ++i) {
-      const uint32_t scalar_id = ExtractVectorValueScalar(
-          &builder, input_layout, inst->GetSingleWordInOperand(0), i);
-      if (scalar_id == 0) return false;
-      Instruction* converted =
-          builder.AddUnaryOp(result->component_type_id, inst->opcode(),
-                             scalar_id);
-      if (!converted) return false;
-      scalar_ids.push_back(converted->result_id());
-    }
-    return RebuildVectorFromScalars(inst, *result, scalar_ids);
-  }
-
-  if (const MatrixTypeInfo* result = GetMatrixType(inst->type_id())) {
-    ValueLayout input_layout;
-    if (!DescribeMatrixValue(inst->GetSingleWordInOperand(0), result->rows,
-                             result->cols, &input_layout)) {
-      ReportError(inst, "invalid HW matrix conversion operand");
-      return false;
-    }
-
-    const bool result_packed = IsPackedVec4(*result);
-    const uint32_t result_piece_type =
-        result_packed ? result->packed_vec4_type_id : result->component_type_id;
-    const uint32_t result_piece_count = result_packed
-                                            ? result->rows * result->packed_cols
-                                            : result->rows * result->cols;
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    if (input_layout.packed_vec4 == result_packed &&
-        input_layout.piece_count == result_piece_count) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result_piece_count);
-      for (uint32_t i = 0; i < result_piece_count; ++i) {
-        const uint32_t piece_id =
-            ExtractValuePiece(&builder, input_layout,
-                              inst->GetSingleWordInOperand(0), i);
-        if (piece_id == 0) return false;
-        Instruction* converted =
-            builder.AddUnaryOp(result_piece_type, inst->opcode(), piece_id);
-        if (!converted) return false;
-        piece_ids.push_back(converted->result_id());
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->rows * result->cols);
-    for (uint32_t row = 0; row < result->rows; ++row) {
-      for (uint32_t col = 0; col < result->cols; ++col) {
-        const uint32_t scalar_id = ExtractMatrixValueScalar(
-            &builder, input_layout, inst->GetSingleWordInOperand(0),
-            result->cols, row, col);
-        if (scalar_id == 0) return false;
-        Instruction* converted =
-            builder.AddUnaryOp(result->component_type_id, inst->opcode(),
-                               scalar_id);
-        if (!converted) return false;
-        scalar_ids.push_back(converted->result_id());
-      }
-    }
-    return RebuildMatrixFromScalars(inst, *result, scalar_ids);
-  }
-
-  ReportError(inst, "invalid HW conversion result type");
-  return false;
+  return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kConversion);
 }
 
 bool HwLowerToStandardPass::LowerHwArithmetic(Instruction* inst) {
@@ -3340,164 +3234,7 @@ bool HwLowerToStandardPass::LowerHwArithmetic(Instruction* inst) {
     ReportError(inst, "unsupported HW arithmetic");
     return false;
   }
-
-  if (const VectorTypeInfo* result = GetVectorType(inst->type_id())) {
-    std::vector<ValueLayout> operand_layouts(inst->NumInOperands());
-    for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
-      if (!DescribeVectorValue(inst->GetSingleWordInOperand(i), result->length,
-                               &operand_layouts[i])) {
-        ReportError(inst, "invalid HW vector arithmetic operand");
-        return false;
-      }
-    }
-
-    const bool result_packed = IsPackedVec4(*result);
-    const uint32_t result_piece_type =
-        result_packed ? result->packed_vec4_type_id : result->component_type_id;
-    const uint32_t result_piece_count =
-        result_packed ? result->packed_length : result->length;
-    bool can_lower_by_piece = true;
-    for (const ValueLayout& layout : operand_layouts) {
-      can_lower_by_piece &= layout.packed_vec4 == result_packed &&
-                            layout.piece_count == result_piece_count &&
-                            layout.piece_type_id == result_piece_type;
-    }
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    if (can_lower_by_piece) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result_piece_count);
-      for (uint32_t i = 0; i < result_piece_count; ++i) {
-        const uint32_t lhs_id = ExtractValuePiece(
-            &builder, operand_layouts[0], inst->GetSingleWordInOperand(0), i);
-        if (lhs_id == 0) return false;
-
-        Instruction* lowered = nullptr;
-        if (inst->NumInOperands() == 1) {
-          lowered = builder.AddUnaryOp(result_piece_type, inst->opcode(),
-                                       lhs_id);
-        } else {
-          const uint32_t rhs_id = ExtractValuePiece(
-              &builder, operand_layouts[1], inst->GetSingleWordInOperand(1), i);
-          if (rhs_id == 0) return false;
-          lowered = builder.AddBinaryOp(result_piece_type, inst->opcode(),
-                                        lhs_id, rhs_id);
-        }
-        if (!lowered) return false;
-        piece_ids.push_back(lowered->result_id());
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->length);
-    for (uint32_t i = 0; i < result->length; ++i) {
-      const uint32_t lhs_id = ExtractVectorValueScalar(
-          &builder, operand_layouts[0], inst->GetSingleWordInOperand(0), i);
-      if (lhs_id == 0) return false;
-
-      Instruction* lowered = nullptr;
-      if (inst->NumInOperands() == 1) {
-        lowered = builder.AddUnaryOp(result->component_type_id, inst->opcode(),
-                                     lhs_id);
-      } else {
-        const uint32_t rhs_id = ExtractVectorValueScalar(
-            &builder, operand_layouts[1], inst->GetSingleWordInOperand(1), i);
-        if (rhs_id == 0) return false;
-        lowered = builder.AddBinaryOp(result->component_type_id, inst->opcode(),
-                                      lhs_id, rhs_id);
-      }
-      if (!lowered) return false;
-      scalar_ids.push_back(lowered->result_id());
-    }
-    return RebuildVectorFromScalars(inst, *result, scalar_ids);
-  }
-
-  if (const MatrixTypeInfo* result = GetMatrixType(inst->type_id())) {
-    std::vector<ValueLayout> operand_layouts(inst->NumInOperands());
-    for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
-      if (!DescribeMatrixValue(inst->GetSingleWordInOperand(i), result->rows,
-                               result->cols, &operand_layouts[i])) {
-        ReportError(inst, "invalid HW matrix arithmetic operand");
-        return false;
-      }
-    }
-
-    const bool result_packed = IsPackedVec4(*result);
-    const uint32_t result_piece_type =
-        result_packed ? result->packed_vec4_type_id : result->component_type_id;
-    const uint32_t result_piece_count = result_packed
-                                            ? result->rows * result->packed_cols
-                                            : result->rows * result->cols;
-    bool can_lower_by_piece = true;
-    for (const ValueLayout& layout : operand_layouts) {
-      can_lower_by_piece &= layout.packed_vec4 == result_packed &&
-                            layout.piece_count == result_piece_count &&
-                            layout.piece_type_id == result_piece_type;
-    }
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    if (can_lower_by_piece) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result_piece_count);
-      for (uint32_t i = 0; i < result_piece_count; ++i) {
-        const uint32_t lhs_id = ExtractValuePiece(
-            &builder, operand_layouts[0], inst->GetSingleWordInOperand(0), i);
-        if (lhs_id == 0) return false;
-
-        Instruction* lowered = nullptr;
-        if (inst->NumInOperands() == 1) {
-          lowered = builder.AddUnaryOp(result_piece_type, inst->opcode(),
-                                       lhs_id);
-        } else {
-          const uint32_t rhs_id = ExtractValuePiece(
-              &builder, operand_layouts[1], inst->GetSingleWordInOperand(1), i);
-          if (rhs_id == 0) return false;
-          lowered = builder.AddBinaryOp(result_piece_type, inst->opcode(),
-                                        lhs_id, rhs_id);
-        }
-        if (!lowered) return false;
-        piece_ids.push_back(lowered->result_id());
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->rows * result->cols);
-    for (uint32_t row = 0; row < result->rows; ++row) {
-      for (uint32_t col = 0; col < result->cols; ++col) {
-        const uint32_t lhs_id = ExtractMatrixValueScalar(
-            &builder, operand_layouts[0], inst->GetSingleWordInOperand(0),
-            result->cols, row, col);
-        if (lhs_id == 0) return false;
-
-        Instruction* lowered = nullptr;
-        if (inst->NumInOperands() == 1) {
-          lowered = builder.AddUnaryOp(result->component_type_id, inst->opcode(),
-                                       lhs_id);
-        } else {
-          const uint32_t rhs_id = ExtractMatrixValueScalar(
-              &builder, operand_layouts[1], inst->GetSingleWordInOperand(1),
-              result->cols, row, col);
-          if (rhs_id == 0) return false;
-          lowered = builder.AddBinaryOp(result->component_type_id,
-                                        inst->opcode(), lhs_id, rhs_id);
-        }
-        if (!lowered) return false;
-        scalar_ids.push_back(lowered->result_id());
-      }
-    }
-    return RebuildMatrixFromScalars(inst, *result, scalar_ids);
-  }
-
-  ReportError(inst, "invalid HW arithmetic result type");
-  return false;
+  return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kArithmetic);
 }
 
 bool HwLowerToStandardPass::LowerHwScale(Instruction* inst) {
@@ -3505,166 +3242,506 @@ bool HwLowerToStandardPass::LowerHwScale(Instruction* inst) {
     ReportError(inst, "unsupported HW scale operation");
     return false;
   }
-
-  if (const VectorTypeInfo* result = GetVectorType(inst->type_id())) {
-    ValueLayout input_layout;
-    if (!DescribeVectorValue(inst->GetSingleWordInOperand(0), result->length,
-                             &input_layout)) {
-      ReportError(inst, "invalid HW vector scale operand");
-      return false;
-    }
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    const uint32_t scalar_id = inst->GetSingleWordInOperand(1);
-    const spv::Op scale_opcode = GetScaleOpcode(
-        get_def_use_mgr()->GetDef(result->component_type_id));
-    if (IsPackedVec4(*result) && input_layout.packed_vec4 &&
-        input_layout.piece_count == result->packed_length &&
-        input_layout.piece_type_id == result->packed_vec4_type_id) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result->packed_length);
-      for (uint32_t i = 0; i < result->packed_length; ++i) {
-        const uint32_t piece_id = ExtractValuePiece(
-            &builder, input_layout, inst->GetSingleWordInOperand(0), i);
-        if (piece_id == 0) return false;
-        const uint32_t scaled_id = BuildVectorTimesScalar(
-            &builder, scale_opcode, result->packed_vec4_type_id, piece_id,
-            scalar_id);
-        if (scaled_id == 0) return false;
-        piece_ids.push_back(scaled_id);
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->length);
-    for (uint32_t i = 0; i < result->length; ++i) {
-      const uint32_t element_id = ExtractVectorValueScalar(
-          &builder, input_layout, inst->GetSingleWordInOperand(0), i);
-      if (element_id == 0) return false;
-      Instruction* scaled = builder.AddBinaryOp(result->component_type_id,
-                                                scale_opcode, element_id,
-                                                scalar_id);
-      if (!scaled) return false;
-      scalar_ids.push_back(scaled->result_id());
-    }
-    return RebuildVectorFromScalars(inst, *result, scalar_ids);
-  }
-
-  if (const MatrixTypeInfo* result = GetMatrixType(inst->type_id())) {
-    ValueLayout input_layout;
-    if (!DescribeMatrixValue(inst->GetSingleWordInOperand(0), result->rows,
-                             result->cols, &input_layout)) {
-      ReportError(inst, "invalid HW matrix scale operand");
-      return false;
-    }
-
-    InstructionBuilder builder(
-        context(), inst,
-        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-    const uint32_t scalar_id = inst->GetSingleWordInOperand(1);
-    const spv::Op scale_opcode = GetScaleOpcode(
-        get_def_use_mgr()->GetDef(result->component_type_id));
-    if (IsPackedVec4(*result) && input_layout.packed_vec4 &&
-        input_layout.piece_count == result->rows * result->packed_cols &&
-        input_layout.piece_type_id == result->packed_vec4_type_id) {
-      std::vector<uint32_t> piece_ids;
-      piece_ids.reserve(result->rows * result->packed_cols);
-      for (uint32_t i = 0; i < result->rows * result->packed_cols; ++i) {
-        const uint32_t piece_id = ExtractValuePiece(
-            &builder, input_layout, inst->GetSingleWordInOperand(0), i);
-        if (piece_id == 0) return false;
-        const uint32_t scaled_id = BuildVectorTimesScalar(
-            &builder, scale_opcode, result->packed_vec4_type_id, piece_id,
-            scalar_id);
-        if (scaled_id == 0) return false;
-        piece_ids.push_back(scaled_id);
-      }
-      RebuildAsCompositeConstruct(inst, result->lowered_type_id, piece_ids);
-      return true;
-    }
-
-    std::vector<uint32_t> scalar_ids;
-    scalar_ids.reserve(result->rows * result->cols);
-    for (uint32_t row = 0; row < result->rows; ++row) {
-      for (uint32_t col = 0; col < result->cols; ++col) {
-        const uint32_t element_id = ExtractMatrixValueScalar(
-            &builder, input_layout, inst->GetSingleWordInOperand(0),
-            result->cols, row, col);
-        if (element_id == 0) return false;
-        Instruction* scaled = builder.AddBinaryOp(result->component_type_id,
-                                                  scale_opcode, element_id,
-                                                  scalar_id);
-        if (!scaled) return false;
-        scalar_ids.push_back(scaled->result_id());
-      }
-    }
-    return RebuildMatrixFromScalars(inst, *result, scalar_ids);
-  }
-
-  ReportError(inst, "invalid HW scale result type");
-  return false;
+  return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kScale);
 }
 
-bool HwLowerToStandardPass::LowerExtInstOnCooperativeVector(
-    Instruction* inst) {
+bool HwLowerToStandardPass::LowerExtInstOnCooperativeVector(Instruction* inst) {
   const VectorTypeInfo* info = GetVectorType(inst->type_id());
   if (!info) return true;  // Not a cooperative vector result; nothing to do.
+  return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kExtInst);
+}
 
-  InstructionBuilder builder(
-      context(), inst,
-      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
+                                                     ElementwiseLoopKind kind) {
+  if (!inst) return false;
 
-  const uint32_t glsl_std450_id = inst->GetSingleWordInOperand(0);
-  const uint32_t ext_opcode = inst->GetSingleWordInOperand(1);
-  const uint32_t num_ext_operands = inst->NumInOperands() - 2;
+  const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+  const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+  if (!result_vector && !result_matrix) {
+    ReportError(inst, "invalid HW element-wise result type");
+    return false;
+  }
 
-  // Determine the result type for each element-wise sub-operation.
-  const uint32_t elem_type_id = IsPackedVec4(*info)
-                                     ? info->packed_vec4_type_id
-                                     : info->component_type_id;
-  const uint32_t count =
-      IsPackedVec4(*info) ? info->packed_length : info->length;
+  const bool result_packed = result_vector ? IsPackedVec4(*result_vector)
+                                           : IsPackedVec4(*result_matrix);
+  const uint32_t result_component_type_id =
+      result_vector ? result_vector->component_type_id
+                    : result_matrix->component_type_id;
+  const uint32_t result_piece_type_id =
+      result_packed ? (result_vector ? result_vector->packed_vec4_type_id
+                                     : result_matrix->packed_vec4_type_id)
+                    : result_component_type_id;
+  const uint32_t result_piece_count =
+      result_vector
+          ? (result_packed ? result_vector->packed_length
+                           : result_vector->length)
+          : (result_packed ? result_matrix->rows * result_matrix->packed_cols
+                           : result_matrix->rows * result_matrix->cols);
+  const uint32_t logical_element_count =
+      result_vector ? result_vector->length
+                    : result_matrix->rows * result_matrix->cols;
+  const uint32_t lowered_result_type_id = result_vector
+                                              ? result_vector->lowered_type_id
+                                              : result_matrix->lowered_type_id;
+  if (result_piece_count == 0 || logical_element_count == 0 ||
+      lowered_result_type_id == 0 || result_piece_type_id == 0) {
+    ReportError(inst, "invalid HW element-wise result layout");
+    return false;
+  }
 
-  std::vector<uint32_t> result_ids;
-  result_ids.reserve(count);
+  const spv::Op original_opcode = inst->opcode();
+  std::vector<uint32_t> original_operand_ids;
+  original_operand_ids.reserve(inst->NumInOperands());
+  for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+    original_operand_ids.push_back(inst->GetSingleWordInOperand(i));
+  }
 
-  for (uint32_t i = 0; i < count; ++i) {
-    std::vector<Operand> operands;
-    operands.push_back(IdOperand(glsl_std450_id));
-    operands.push_back(
-        Operand(SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER, {ext_opcode}));
+  struct LoopOperand {
+    uint32_t value_id = 0;
+    uint32_t value_type_id = 0;
+    ValueLayout layout;
+    uint32_t variable_id = 0;
+    uint32_t scalar_pointer_type_id = 0;
+    uint32_t piece_pointer_type_id = 0;
+    uint32_t loop_piece_type_id = 0;
+  };
 
-    for (uint32_t op = 0; op < num_ext_operands; ++op) {
-      const uint32_t operand_id = inst->GetSingleWordInOperand(2 + op);
-      const VectorTypeInfo* op_info =
-          GetVectorType(get_def_use_mgr()->GetDef(operand_id)->type_id());
-      if (op_info) {
-        // Operand is a cooperative vector — extract the element.
-        const uint32_t elem_id =
-            ExtractCompositeElement(&builder, elem_type_id, operand_id, i);
-        if (elem_id == 0) return false;
-        operands.push_back(IdOperand(elem_id));
-      } else {
-        // Operand is a scalar or regular vector — pass through unchanged.
-        operands.push_back(IdOperand(operand_id));
-      }
+  std::vector<LoopOperand> loop_operands;
+  std::vector<int32_t> operand_to_loop_operand(inst->NumInOperands(), -1);
+  auto add_loop_operand = [&](uint32_t operand_index,
+                              const ValueLayout& layout) -> bool {
+    if (operand_index >= original_operand_ids.size()) return false;
+    Instruction* value =
+        get_def_use_mgr()->GetDef(original_operand_ids[operand_index]);
+    if (!value) return false;
+
+    uint32_t value_type_id = value->type_id();
+    auto original_type = original_hw_value_types_.find(value->result_id());
+    if (original_type != original_hw_value_types_.end()) {
+      const uint32_t lowered_type_id = GetLoweredType(original_type->second);
+      if (lowered_type_id != 0) value_type_id = lowered_type_id;
+    } else if (IsHwType(value_type_id)) {
+      const uint32_t lowered_type_id = GetLoweredType(value_type_id);
+      if (lowered_type_id != 0) value_type_id = lowered_type_id;
+    }
+    if (value_type_id == 0 || layout.component_type_id == 0 ||
+        layout.piece_type_id == 0 || layout.piece_count == 0) {
+      return false;
     }
 
+    LoopOperand operand;
+    operand.value_id = value->result_id();
+    operand.value_type_id = value_type_id;
+    operand.layout = layout;
+    operand.loop_piece_type_id = layout.piece_type_id;
+    loop_operands.push_back(operand);
+    operand_to_loop_operand[operand_index] =
+        static_cast<int32_t>(loop_operands.size() - 1);
+    return true;
+  };
+
+  if (kind == ElementwiseLoopKind::kExtInst) {
+    if (!result_vector || inst->NumInOperands() < 2) {
+      ReportError(inst, "invalid HW cooperative vector OpExtInst");
+      return false;
+    }
+    Instruction* import = get_def_use_mgr()->GetDef(original_operand_ids[0]);
+    if (!import || import->opcode() != spv::Op::OpExtInstImport ||
+        import->GetInOperand(0).AsString() != "GLSL.std.450") {
+      ReportError(inst,
+                  "HW cooperative vector OpExtInst must use GLSL.std.450");
+      return false;
+    }
+
+    uint32_t expected_ext_operand_count = 0;
+    switch (static_cast<GLSLstd450>(original_operand_ids[1])) {
+      case GLSLstd450Atan:
+      case GLSLstd450Tanh:
+      case GLSLstd450Exp:
+      case GLSLstd450Log:
+        expected_ext_operand_count = 1;
+        break;
+      case GLSLstd450FMin:
+      case GLSLstd450FMax:
+      case GLSLstd450NMin:
+      case GLSLstd450NMax:
+      case GLSLstd450Step:
+      case GLSLstd450UMin:
+      case GLSLstd450UMax:
+      case GLSLstd450SMin:
+      case GLSLstd450SMax:
+        expected_ext_operand_count = 2;
+        break;
+      case GLSLstd450FClamp:
+      case GLSLstd450NClamp:
+      case GLSLstd450Fma:
+      case GLSLstd450UClamp:
+      case GLSLstd450SClamp:
+        expected_ext_operand_count = 3;
+        break;
+      default:
+        ReportError(inst,
+                    "unsupported HW cooperative vector GLSL.std.450 opcode");
+        return false;
+    }
+    if (inst->NumInOperands() != 2 + expected_ext_operand_count) {
+      ReportError(inst,
+                  "invalid HW cooperative vector GLSL.std.450 operand count");
+      return false;
+    }
+
+    for (uint32_t i = 2; i < inst->NumInOperands(); ++i) {
+      Instruction* value = get_def_use_mgr()->GetDef(original_operand_ids[i]);
+      if (!value) {
+        ReportError(inst, "invalid HW cooperative vector OpExtInst operand");
+        return false;
+      }
+      uint32_t original_type_id = value->type_id();
+      auto original_type = original_hw_value_types_.find(value->result_id());
+      if (original_type != original_hw_value_types_.end()) {
+        original_type_id = original_type->second;
+      }
+      const VectorTypeInfo* operand_info = GetVectorType(original_type_id);
+      if (!operand_info) {
+        ReportError(inst,
+                    "HW cooperative vector OpExtInst operand must be a "
+                    "cooperative vector");
+        return false;
+      }
+
+      ValueLayout layout;
+      if (operand_info->length != result_vector->length ||
+          !DescribeVectorValue(value->result_id(), result_vector->length,
+                               &layout) ||
+          !add_loop_operand(i, layout)) {
+        ReportError(inst, "invalid HW cooperative vector OpExtInst operand");
+        return false;
+      }
+    }
+  } else {
+    const uint32_t loop_operand_count =
+        kind == ElementwiseLoopKind::kArithmetic ? inst->NumInOperands() : 1;
+    for (uint32_t i = 0; i < loop_operand_count; ++i) {
+      ValueLayout layout;
+      const bool described =
+          result_vector ? DescribeVectorValue(original_operand_ids[i],
+                                              result_vector->length, &layout)
+                        : DescribeMatrixValue(original_operand_ids[i],
+                                              result_matrix->rows,
+                                              result_matrix->cols, &layout);
+      if (!described || !add_loop_operand(i, layout)) {
+        ReportError(inst, "invalid HW element-wise operand");
+        return false;
+      }
+    }
+  }
+
+  if (kind == ElementwiseLoopKind::kArithmetic ||
+      kind == ElementwiseLoopKind::kScale) {
+    for (const LoopOperand& operand : loop_operands) {
+      if (operand.layout.component_type_id != result_component_type_id) {
+        ReportError(inst,
+                    "HW element-wise arithmetic component types do not match");
+        return false;
+      }
+    }
+  }
+  if (kind == ElementwiseLoopKind::kScale) {
+    Instruction* scalar = get_def_use_mgr()->GetDef(original_operand_ids[1]);
+    if (!scalar || scalar->type_id() != result_component_type_id) {
+      ReportError(inst, "HW scale scalar type does not match result component");
+      return false;
+    }
+  }
+
+  Instruction* type_insertion_point = &*(--context()->types_values_end());
+  for (LoopOperand& operand : loop_operands) {
+    if (result_packed && !operand.layout.packed_vec4) {
+      operand.loop_piece_type_id =
+          GetOrCreateVectorType(operand.layout.component_type_id,
+                                kPackedVec4Width, &type_insertion_point);
+      if (operand.loop_piece_type_id == 0) return false;
+    }
+    operand.scalar_pointer_type_id = GetOrCreatePointerType(
+        operand.layout.component_type_id, spv::StorageClass::Function);
+    operand.piece_pointer_type_id = GetOrCreatePointerType(
+        operand.layout.piece_type_id, spv::StorageClass::Function);
+    if (operand.scalar_pointer_type_id == 0 ||
+        operand.piece_pointer_type_id == 0) {
+      return false;
+    }
+  }
+
+  const uint32_t result_pointer_type_id = GetOrCreatePointerType(
+      lowered_result_type_id, spv::StorageClass::Function);
+  const uint32_t result_piece_pointer_type_id =
+      GetOrCreatePointerType(result_piece_type_id, spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_id = GetOrCreateUIntConstant(1);
+  const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t piece_count_id = GetOrCreateUIntConstant(result_piece_count);
+  if (result_pointer_type_id == 0 || result_piece_pointer_type_id == 0 ||
+      uint_type_id == 0 || uint_pointer_type_id == 0 || bool_type_id == 0 ||
+      zero_id == 0 || one_id == 0 || four_id == 0 || piece_count_id == 0) {
+    return false;
+  }
+
+  BasicBlock* preheader_block = context()->get_instr_block(inst);
+  Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
+  if (!preheader_block || !function) {
+    ReportError(inst, "HW element-wise operation must be inside a function");
+    return false;
+  }
+
+  Instruction* result_variable =
+      AddFunctionVariable(function, result_pointer_type_id);
+  Instruction* index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  if (!result_variable || !index_variable) return false;
+  for (LoopOperand& operand : loop_operands) {
+    const uint32_t pointer_type_id = GetOrCreatePointerType(
+        operand.value_type_id, spv::StorageClass::Function);
+    Instruction* variable = AddFunctionVariable(function, pointer_type_id);
+    if (!variable) return false;
+    operand.variable_id = variable->result_id();
+  }
+
+  auto split_iter = preheader_block->begin();
+  while (split_iter != preheader_block->end() && &*split_iter != inst) {
+    ++split_iter;
+  }
+  if (split_iter == preheader_block->end()) return false;
+
+  std::unique_ptr<Instruction> enclosing_loop_merge;
+  if (Instruction* loop_merge = preheader_block->GetLoopMergeInst()) {
+    enclosing_loop_merge.reset(loop_merge->Clone(context()));
+  }
+
+  const uint32_t merge_label_id = TakeNextId();
+  const uint32_t header_label_id = TakeNextId();
+  const uint32_t body_label_id = TakeNextId();
+  const uint32_t continue_label_id = TakeNextId();
+  if (merge_label_id == 0 || header_label_id == 0 || body_label_id == 0 ||
+      continue_label_id == 0) {
+    return false;
+  }
+
+  BasicBlock* merge_block =
+      preheader_block->SplitBasicBlock(context(), merge_label_id, split_iter);
+  BasicBlock* header_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(header_label_id)),
+      preheader_block);
+  BasicBlock* body_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(body_label_id)), header_block);
+  BasicBlock* continue_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(continue_label_id)),
+      body_block);
+  if (!merge_block || !header_block || !body_block || !continue_block) {
+    return false;
+  }
+
+  if (enclosing_loop_merge) {
+    Instruction* moved_loop_merge = merge_block->GetLoopMergeInst();
+    if (!moved_loop_merge) return false;
+    context()->KillInst(moved_loop_merge);
+  }
+
+  InstructionBuilder preheader_builder(
+      context(), preheader_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  for (const LoopOperand& operand : loop_operands) {
+    if (!preheader_builder.AddStore(operand.variable_id, operand.value_id)) {
+      return false;
+    }
+  }
+  if (!preheader_builder.AddStore(index_variable->result_id(), zero_id) ||
+      (enclosing_loop_merge &&
+       !preheader_builder.AddInstruction(std::move(enclosing_loop_merge))) ||
+      !preheader_builder.AddBranch(header_label_id)) {
+    return false;
+  }
+
+  InstructionBuilder header_builder(
+      context(), header_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* index =
+      header_builder.AddLoad(uint_type_id, index_variable->result_id());
+  Instruction* condition =
+      index ? header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                         index->result_id(), piece_count_id)
+            : nullptr;
+  if (!index || !condition ||
+      !header_builder.AddLoopMerge(merge_label_id, continue_label_id) ||
+      !header_builder.AddConditionalBranch(condition->result_id(),
+                                           body_label_id, merge_label_id)) {
+    return false;
+  }
+
+  InstructionBuilder body_builder(
+      context(), body_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  auto load_scalar = [&](const LoopOperand& operand,
+                         uint32_t logical_index_id) -> uint32_t {
+    if (!operand.layout.packed_vec4) {
+      Instruction* pointer =
+          body_builder.AddAccessChain(operand.scalar_pointer_type_id,
+                                      operand.variable_id, {logical_index_id});
+      Instruction* value =
+          pointer ? body_builder.AddLoad(operand.layout.component_type_id,
+                                         pointer->result_id())
+                  : nullptr;
+      return value ? value->result_id() : 0;
+    }
+
+    Instruction* packed_index = body_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
+    Instruction* lane = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUMod,
+                                                 logical_index_id, four_id);
+    if (!packed_index || !lane) return 0;
+    Instruction* pointer = body_builder.AddAccessChain(
+        operand.piece_pointer_type_id, operand.variable_id,
+        {packed_index->result_id()});
+    Instruction* piece =
+        pointer ? body_builder.AddLoad(operand.layout.piece_type_id,
+                                       pointer->result_id())
+                : nullptr;
+    Instruction* value =
+        piece ? body_builder.AddBinaryOp(operand.layout.component_type_id,
+                                         spv::Op::OpVectorExtractDynamic,
+                                         piece->result_id(), lane->result_id())
+              : nullptr;
+    return value ? value->result_id() : 0;
+  };
+
+  auto load_for_result_piece = [&](const LoopOperand& operand) -> uint32_t {
+    if (!result_packed) return load_scalar(operand, index->result_id());
+    if (operand.layout.packed_vec4) {
+      Instruction* pointer = body_builder.AddAccessChain(
+          operand.piece_pointer_type_id, operand.variable_id,
+          {index->result_id()});
+      Instruction* value =
+          pointer ? body_builder.AddLoad(operand.layout.piece_type_id,
+                                         pointer->result_id())
+                  : nullptr;
+      return value ? value->result_id() : 0;
+    }
+
+    Instruction* base = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIMul,
+                                                 index->result_id(), four_id);
+    if (!base) return 0;
+    std::vector<uint32_t> constituents;
+    constituents.reserve(kPackedVec4Width);
+    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      uint32_t logical_index_id = base->result_id();
+      if (lane != 0) {
+        const uint32_t lane_id = GetOrCreateUIntConstant(lane);
+        Instruction* lane_index = body_builder.AddBinaryOp(
+            uint_type_id, spv::Op::OpIAdd, base->result_id(), lane_id);
+        if (!lane_index) return 0;
+        logical_index_id = lane_index->result_id();
+      }
+      const uint32_t scalar_id = load_scalar(operand, logical_index_id);
+      if (scalar_id == 0) return 0;
+      constituents.push_back(scalar_id);
+    }
+    Instruction* piece =
+        body_builder.AddNaryOp(operand.loop_piece_type_id,
+                               spv::Op::OpCompositeConstruct, constituents);
+    return piece ? piece->result_id() : 0;
+  };
+
+  uint32_t lowered_piece_id = 0;
+  if (kind == ElementwiseLoopKind::kConversion) {
+    const uint32_t operand_id = load_for_result_piece(loop_operands[0]);
+    Instruction* converted =
+        operand_id ? body_builder.AddUnaryOp(result_piece_type_id,
+                                             original_opcode, operand_id)
+                   : nullptr;
+    lowered_piece_id = converted ? converted->result_id() : 0;
+  } else if (kind == ElementwiseLoopKind::kArithmetic) {
+    const uint32_t lhs_id = load_for_result_piece(loop_operands[0]);
+    Instruction* lowered = nullptr;
+    if (lhs_id != 0 && loop_operands.size() == 1) {
+      lowered = body_builder.AddUnaryOp(result_piece_type_id, original_opcode,
+                                        lhs_id);
+    } else if (lhs_id != 0 && loop_operands.size() == 2) {
+      const uint32_t rhs_id = load_for_result_piece(loop_operands[1]);
+      if (rhs_id != 0) {
+        lowered = body_builder.AddBinaryOp(result_piece_type_id,
+                                           original_opcode, lhs_id, rhs_id);
+      }
+    }
+    lowered_piece_id = lowered ? lowered->result_id() : 0;
+  } else if (kind == ElementwiseLoopKind::kScale) {
+    const uint32_t input_id = load_for_result_piece(loop_operands[0]);
+    const spv::Op scale_opcode =
+        GetScaleOpcode(get_def_use_mgr()->GetDef(result_component_type_id));
+    if (input_id != 0 && result_packed) {
+      lowered_piece_id = BuildVectorTimesScalar(&body_builder, scale_opcode,
+                                                result_piece_type_id, input_id,
+                                                original_operand_ids[1]);
+    } else if (input_id != 0) {
+      Instruction* scaled =
+          body_builder.AddBinaryOp(result_piece_type_id, scale_opcode, input_id,
+                                   original_operand_ids[1]);
+      lowered_piece_id = scaled ? scaled->result_id() : 0;
+    }
+  } else {
+    std::vector<Operand> operands;
+    operands.push_back(IdOperand(original_operand_ids[0]));
+    operands.push_back(Operand(SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER,
+                               {original_operand_ids[1]}));
+    for (uint32_t i = 2; i < original_operand_ids.size(); ++i) {
+      const int32_t loop_operand_index = operand_to_loop_operand[i];
+      if (loop_operand_index >= 0) {
+        const uint32_t operand_id = load_for_result_piece(
+            loop_operands[static_cast<size_t>(loop_operand_index)]);
+        if (operand_id == 0) return false;
+        operands.push_back(IdOperand(operand_id));
+      } else {
+        operands.push_back(IdOperand(original_operand_ids[i]));
+      }
+    }
     const uint32_t result_id = TakeNextId();
     if (result_id == 0) return false;
     std::unique_ptr<Instruction> ext_inst = MakeUnique<Instruction>(
-        context(), spv::Op::OpExtInst, elem_type_id, result_id,
+        context(), spv::Op::OpExtInst, result_piece_type_id, result_id,
         std::move(operands));
-    Instruction* added = builder.AddInstruction(std::move(ext_inst));
-    if (!added) return false;
-    result_ids.push_back(added->result_id());
+    Instruction* added = body_builder.AddInstruction(std::move(ext_inst));
+    lowered_piece_id = added ? added->result_id() : 0;
+  }
+  if (lowered_piece_id == 0) return false;
+
+  Instruction* result_piece_pointer = body_builder.AddAccessChain(
+      result_piece_pointer_type_id, result_variable->result_id(),
+      {index->result_id()});
+  if (!result_piece_pointer ||
+      !body_builder.AddStore(result_piece_pointer->result_id(),
+                             lowered_piece_id) ||
+      !body_builder.AddBranch(continue_label_id)) {
+    return false;
   }
 
-  RebuildAsCompositeConstruct(inst, info->lowered_type_id, result_ids);
+  InstructionBuilder continue_builder(
+      context(), continue_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_index = continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, index->result_id(), one_id);
+  if (!next_index ||
+      !continue_builder.AddStore(index_variable->result_id(),
+                                 next_index->result_id()) ||
+      !continue_builder.AddBranch(header_label_id)) {
+    return false;
+  }
+
+  inst->SetOpcode(spv::Op::OpLoad);
+  inst->SetResultType(lowered_result_type_id);
+  inst->SetInOperands({IdOperand(result_variable->result_id())});
+  context()->UpdateDefUse(inst);
   return true;
 }
 

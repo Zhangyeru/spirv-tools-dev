@@ -80,6 +80,13 @@ class HwLowerToStandardPass : public Pass {
     bool packed_vec4 = false;
   };
 
+  enum class ElementwiseLoopKind {
+    kConversion,
+    kArithmetic,
+    kScale,
+    kExtInst,
+  };
+
   bool CollectHwTypes();
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
@@ -115,6 +122,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerHwArithmetic(Instruction* inst);
   bool LowerHwScale(Instruction* inst);
   bool LowerExtInstOnCooperativeVector(Instruction* inst);
+  bool LowerElementwiseWithLoop(Instruction* inst, ElementwiseLoopKind kind);
 
   uint32_t GetOrCreateArrayType(uint32_t component_type_id, uint32_t length,
                                 Instruction* insert_after);
