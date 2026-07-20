@@ -109,6 +109,11 @@ class HwLowerToStandardPass : public Pass {
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();
+  bool LegalizeCooperativeCoreInstruction(Instruction* inst) const;
+  bool ValidateCompositeIndices(const Instruction* inst,
+                                uint32_t composite_in_operand,
+                                uint32_t first_index_in_operand) const;
+  bool ValidateAccessChain(const Instruction* inst) const;
   bool PrepareMatmulPatternFunctions();
   bool LowerHwInstructions(std::vector<Instruction*>* to_kill);
   bool ReplaceHwTypeUses();
@@ -565,6 +570,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;
   std::unordered_set<uint32_t> generated_function_ids_;
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
+  std::vector<std::pair<uint32_t, uint32_t>> pending_fp_fast_math_modes_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
   uint32_t max_elements_ = 1048576;

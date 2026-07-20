@@ -19,10 +19,12 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <string>
 #include <utility>
 
+#include "source/opcode.h"
 #include "source/opt/basic_block.h"
 #include "source/opt/constants.h"
 #include "source/opt/decoration_manager.h"
@@ -161,6 +163,91 @@ bool IsHwScaleOpcode(spv::Op opcode) {
          opcode == spv::Op::OpMatrixTimesScalar;
 }
 
+bool IsHwUnaryArithmeticOpcode(spv::Op opcode) {
+  return opcode == spv::Op::OpFNegate || opcode == spv::Op::OpSNegate ||
+         opcode == spv::Op::OpNot;
+}
+
+bool IsFloatArithmeticOpcode(spv::Op opcode) {
+  switch (opcode) {
+    case spv::Op::OpFAdd:
+    case spv::Op::OpFSub:
+    case spv::Op::OpFMul:
+    case spv::Op::OpFDiv:
+    case spv::Op::OpFNegate:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsHwShiftOpcode(spv::Op opcode) {
+  switch (opcode) {
+    case spv::Op::OpShiftRightLogical:
+    case spv::Op::OpShiftRightArithmetic:
+    case spv::Op::OpShiftLeftLogical:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsHwBitwiseOpcode(spv::Op opcode) {
+  switch (opcode) {
+    case spv::Op::OpBitwiseOr:
+    case spv::Op::OpBitwiseXor:
+    case spv::Op::OpBitwiseAnd:
+    case spv::Op::OpNot:
+      return true;
+    default:
+      return false;
+  }
+}
+
+enum class HwGlslStd450Domain {
+  kInvalid,
+  kFloat,
+  kUnsignedInteger,
+  kSignedInteger,
+};
+
+struct HwGlslStd450Info {
+  uint32_t operand_count = 0;
+  HwGlslStd450Domain domain = HwGlslStd450Domain::kInvalid;
+};
+
+HwGlslStd450Info DescribeSupportedHwGlslStd450(uint32_t opcode) {
+  switch (static_cast<GLSLstd450>(opcode)) {
+    case GLSLstd450Atan:
+    case GLSLstd450Tanh:
+    case GLSLstd450Exp:
+    case GLSLstd450Log:
+      return {1, HwGlslStd450Domain::kFloat};
+    case GLSLstd450FMin:
+    case GLSLstd450FMax:
+    case GLSLstd450NMin:
+    case GLSLstd450NMax:
+    case GLSLstd450Step:
+      return {2, HwGlslStd450Domain::kFloat};
+    case GLSLstd450UMin:
+    case GLSLstd450UMax:
+      return {2, HwGlslStd450Domain::kUnsignedInteger};
+    case GLSLstd450SMin:
+    case GLSLstd450SMax:
+      return {2, HwGlslStd450Domain::kSignedInteger};
+    case GLSLstd450FClamp:
+    case GLSLstd450NClamp:
+    case GLSLstd450Fma:
+      return {3, HwGlslStd450Domain::kFloat};
+    case GLSLstd450UClamp:
+      return {3, HwGlslStd450Domain::kUnsignedInteger};
+    case GLSLstd450SClamp:
+      return {3, HwGlslStd450Domain::kSignedInteger};
+    default:
+      return {};
+  }
+}
+
 // Authoritative core-opcode use closure for cooperative values.  Opcodes in
 // the arithmetic/conversion/scale families are classified by their semantic
 // helpers above; this list contains only structural operations whose lowering
@@ -176,6 +263,7 @@ bool IsCoreOpcodeAllowedOnHwValue(spv::Op opcode) {
     case spv::Op::OpConstantComposite:
     case spv::Op::OpSpecConstantComposite:
     case spv::Op::OpConstantCompositeReplicateEXT:
+    case spv::Op::OpSpecConstantCompositeReplicateEXT:
     case spv::Op::OpVariable:
     case spv::Op::OpLoad:
     case spv::Op::OpStore:
@@ -184,6 +272,7 @@ bool IsCoreOpcodeAllowedOnHwValue(spv::Op opcode) {
     case spv::Op::OpCopyObject:
     case spv::Op::OpCopyLogical:
     case spv::Op::OpCompositeConstruct:
+    case spv::Op::OpCompositeConstructReplicateEXT:
     case spv::Op::OpCompositeExtract:
     case spv::Op::OpCompositeInsert:
     case spv::Op::OpVectorExtractDynamic:
@@ -295,6 +384,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   matmul_pattern_function_ids_.clear();
   generated_function_ids_.clear();
   read_only_generated_function_ids_.clear();
+  pending_fp_fast_math_modes_.clear();
   active_fp_fast_math_mode_ = 0;
 
   bool has_hw = false;
@@ -734,6 +824,678 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
   return true;
 }
 
+bool HwLowerToStandardPass::ValidateCompositeIndices(
+    const Instruction* inst, uint32_t composite_in_operand,
+    uint32_t first_index_in_operand) const {
+  if (!inst || inst->NumInOperands() <= composite_in_operand ||
+      inst->NumInOperands() <= first_index_in_operand) {
+    ReportError(inst, "invalid HW composite indexing instruction");
+    return false;
+  }
+
+  Instruction* composite = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(composite_in_operand));
+  if (!composite) {
+    ReportError(inst, "invalid HW composite indexing object");
+    return false;
+  }
+  uint32_t current_type_id = composite->type_id();
+
+  for (uint32_t i = first_index_in_operand; i < inst->NumInOperands(); ++i) {
+    const uint32_t index = inst->GetSingleWordInOperand(i);
+    if (const MatrixTypeInfo* matrix = GetMatrixType(current_type_id)) {
+      if (i + 1 >= inst->NumInOperands()) {
+        ReportError(inst,
+                    "HW matrix composite indexing requires row and column");
+        return false;
+      }
+      const uint32_t row = index;
+      const uint32_t col = inst->GetSingleWordInOperand(++i);
+      if (row >= matrix->rows || col >= matrix->cols) {
+        ReportError(inst, "HW matrix composite index is out of range");
+        return false;
+      }
+      current_type_id = matrix->component_type_id;
+      continue;
+    }
+    if (const VectorTypeInfo* vector = GetVectorType(current_type_id)) {
+      if (index >= vector->length) {
+        ReportError(inst, "HW vector composite index is out of range");
+        return false;
+      }
+      current_type_id = vector->component_type_id;
+      continue;
+    }
+
+    Instruction* type = get_def_use_mgr()->GetDef(current_type_id);
+    if (!type) {
+      ReportError(inst, "invalid HW composite index type");
+      return false;
+    }
+    switch (type->opcode()) {
+      case spv::Op::OpTypeArray:
+      case spv::Op::OpTypeRuntimeArray:
+      case spv::Op::OpTypeVector:
+      case spv::Op::OpTypeMatrix:
+        current_type_id = type->GetSingleWordInOperand(0);
+        break;
+      case spv::Op::OpTypeStruct:
+        if (index >= type->NumInOperands()) {
+          ReportError(inst, "nested HW composite struct index is out of range");
+          return false;
+        }
+        current_type_id = type->GetSingleWordInOperand(index);
+        break;
+      default:
+        ReportError(inst, "composite index path reaches a non-composite type");
+        return false;
+    }
+  }
+
+  if (inst->opcode() == spv::Op::OpCompositeExtract) {
+    if (inst->type_id() != current_type_id) {
+      ReportError(inst, "HW OpCompositeExtract result type is invalid");
+      return false;
+    }
+    return true;
+  }
+
+  Instruction* object =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  if (!object || object->type_id() != current_type_id ||
+      inst->type_id() != composite->type_id()) {
+    ReportError(inst, "HW OpCompositeInsert types do not match");
+    return false;
+  }
+  return true;
+}
+
+bool HwLowerToStandardPass::ValidateAccessChain(const Instruction* inst) const {
+  if (!inst || inst->NumInOperands() < 2) {
+    ReportError(inst, "invalid HW access chain");
+    return false;
+  }
+  Instruction* base =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  Instruction* pointer_type =
+      base ? get_def_use_mgr()->GetDef(base->type_id()) : nullptr;
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+      pointer_type->NumInOperands() < 2) {
+    ReportError(inst, "invalid HW access-chain base pointer");
+    return false;
+  }
+
+  uint32_t current_type_id = pointer_type->GetSingleWordInOperand(1);
+  const bool is_ptr_chain = inst->opcode() == spv::Op::OpPtrAccessChain ||
+                            inst->opcode() == spv::Op::OpInBoundsPtrAccessChain;
+  const uint32_t first_index = is_ptr_chain ? 2 : 1;
+  for (uint32_t i = first_index; i < inst->NumInOperands(); ++i) {
+    const uint32_t index_id = inst->GetSingleWordInOperand(i);
+    const MatrixTypeInfo* matrix = GetMatrixType(current_type_id);
+    const VectorTypeInfo* vector = GetVectorType(current_type_id);
+    if (matrix || vector) {
+      Instruction* index = get_def_use_mgr()->GetDef(index_id);
+      Instruction* index_type =
+          index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
+      if (!index_type || index_type->opcode() != spv::Op::OpTypeInt ||
+          index_type->NumInOperands() < 2 ||
+          index_type->GetSingleWordInOperand(0) == 0 ||
+          index_type->GetSingleWordInOperand(0) > 64) {
+        ReportError(inst,
+                    "HW access chain requires an integer index of at most 64 "
+                    "bits");
+        return false;
+      }
+      current_type_id =
+          matrix ? matrix->component_type_id : vector->component_type_id;
+      continue;
+    }
+
+    Instruction* type = get_def_use_mgr()->GetDef(current_type_id);
+    if (!type) {
+      ReportError(inst, "invalid HW access-chain type");
+      return false;
+    }
+    switch (type->opcode()) {
+      case spv::Op::OpTypeArray:
+      case spv::Op::OpTypeRuntimeArray:
+      case spv::Op::OpTypeVector:
+      case spv::Op::OpTypeMatrix:
+        current_type_id = type->GetSingleWordInOperand(0);
+        break;
+      case spv::Op::OpTypeStruct: {
+        uint32_t member = 0;
+        if (!GetConstantU32(index_id, &member) ||
+            member >= type->NumInOperands()) {
+          ReportError(inst, "nested HW access-chain struct index is invalid");
+          return false;
+        }
+        current_type_id = type->GetSingleWordInOperand(member);
+        break;
+      }
+      default:
+        ReportError(inst, "HW access-chain path reaches a non-composite type");
+        return false;
+    }
+  }
+
+  Instruction* result_pointer_type = get_def_use_mgr()->GetDef(inst->type_id());
+  if (!result_pointer_type ||
+      result_pointer_type->opcode() != spv::Op::OpTypePointer ||
+      result_pointer_type->NumInOperands() < 2 ||
+      result_pointer_type->GetSingleWordInOperand(0) !=
+          pointer_type->GetSingleWordInOperand(0) ||
+      result_pointer_type->GetSingleWordInOperand(1) != current_type_id) {
+    ReportError(inst, "HW access-chain result pointer type is invalid");
+    return false;
+  }
+  return true;
+}
+
+bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
+    Instruction* inst) const {
+  if (!inst) return false;
+
+  auto get_value = [this](uint32_t id) {
+    return get_def_use_mgr()->GetDef(id);
+  };
+  auto get_matrix_value = [this, &get_value](uint32_t id) {
+    return GetMatrixTypeForValue(get_value(id));
+  };
+  auto get_vector_value = [this, &get_value](uint32_t id) {
+    Instruction* value = get_value(id);
+    return value ? GetVectorType(value->type_id()) : nullptr;
+  };
+  auto valid_integer_index = [this, &get_value](uint32_t id) {
+    Instruction* value = get_value(id);
+    Instruction* type =
+        value ? get_def_use_mgr()->GetDef(value->type_id()) : nullptr;
+    return type && type->opcode() == spv::Op::OpTypeInt &&
+           type->NumInOperands() >= 2 && type->GetSingleWordInOperand(0) != 0 &&
+           type->GetSingleWordInOperand(0) <= 64;
+  };
+  auto same_matrix_shape = [](const MatrixTypeInfo* lhs,
+                              const MatrixTypeInfo* rhs, bool same_component) {
+    return lhs && rhs && lhs->rows == rhs->rows && lhs->cols == rhs->cols &&
+           (!same_component ||
+            lhs->component_type_id == rhs->component_type_id);
+  };
+  auto same_vector_shape = [](const VectorTypeInfo* lhs,
+                              const VectorTypeInfo* rhs, bool same_component) {
+    return lhs && rhs && lhs->length == rhs->length &&
+           (!same_component ||
+            lhs->component_type_id == rhs->component_type_id);
+  };
+
+  switch (inst->opcode()) {
+    case spv::Op::OpCompositeConstruct:
+    case spv::Op::OpCompositeConstructReplicateEXT: {
+      const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
+      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+      if (!matrix && !vector) return true;
+      const bool is_replicate =
+          inst->opcode() == spv::Op::OpCompositeConstructReplicateEXT;
+      const uint32_t component_type_id =
+          matrix ? matrix->component_type_id : vector->component_type_id;
+      if (matrix || is_replicate) {
+        Instruction* scalar =
+            inst->NumInOperands() == 1
+                ? get_value(inst->GetSingleWordInOperand(0))
+                : nullptr;
+        if (!scalar || scalar->type_id() != component_type_id) {
+          ReportError(inst,
+                      is_replicate
+                          ? "HW OpCompositeConstructReplicateEXT operand is "
+                            "invalid"
+                          : "HW matrix OpCompositeConstruct requires one "
+                            "scalar constituent");
+          return false;
+        }
+        return true;
+      }
+
+      const uint64_t expected = vector->length;
+      uint64_t constituent_count = 0;
+      for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+        Instruction* constituent = get_value(inst->GetSingleWordInOperand(i));
+        if (!constituent) {
+          ReportError(inst,
+                      "invalid HW vector OpCompositeConstruct constituent");
+          return false;
+        }
+        if (constituent->type_id() == component_type_id) {
+          ++constituent_count;
+          continue;
+        }
+        Instruction* type = get_def_use_mgr()->GetDef(constituent->type_id());
+        if (!type || type->opcode() != spv::Op::OpTypeVector ||
+            type->NumInOperands() < 2 ||
+            type->GetSingleWordInOperand(0) != component_type_id) {
+          ReportError(inst,
+                      "invalid HW vector OpCompositeConstruct constituent");
+          return false;
+        }
+        constituent_count += type->GetSingleWordInOperand(1);
+      }
+      if (constituent_count != expected) {
+        ReportError(inst,
+                    "HW vector OpCompositeConstruct operand count is invalid");
+        return false;
+      }
+      return true;
+    }
+
+    case spv::Op::OpConstantComposite:
+    case spv::Op::OpSpecConstantComposite:
+    case spv::Op::OpConstantCompositeReplicateEXT:
+    case spv::Op::OpSpecConstantCompositeReplicateEXT: {
+      const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
+      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+      if (!matrix && !vector) return true;
+      const bool is_replicate =
+          inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT ||
+          inst->opcode() == spv::Op::OpSpecConstantCompositeReplicateEXT;
+      const bool result_is_spec =
+          inst->opcode() == spv::Op::OpSpecConstantComposite ||
+          inst->opcode() == spv::Op::OpSpecConstantCompositeReplicateEXT;
+      const uint32_t component_type_id =
+          matrix ? matrix->component_type_id : vector->component_type_id;
+      const uint64_t expected = matrix ? uint64_t(matrix->rows) * matrix->cols
+                                       : uint64_t(vector->length);
+      const uint64_t required_operands = matrix || is_replicate ? 1 : expected;
+      if (inst->NumInOperands() != required_operands) {
+        ReportError(inst, "HW OpConstantComposite operand count is invalid");
+        return false;
+      }
+      for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+        Instruction* operand = get_value(inst->GetSingleWordInOperand(i));
+        if (!operand || operand->type_id() != component_type_id ||
+            (!IsConstantInst(operand->opcode()) &&
+             operand->opcode() != spv::Op::OpUndef) ||
+            (!result_is_spec && IsSpecConstantInst(operand->opcode()))) {
+          ReportError(inst, "unsupported HW OpConstantComposite operand");
+          return false;
+        }
+      }
+      const bool packed =
+          matrix ? IsPackedVec4(*matrix) : IsPackedVec4(*vector);
+      const uint64_t lowered_constituent_count =
+          packed ? expected / kPackedVec4Width : expected;
+      if (lowered_constituent_count > kMaxCompositeConstituents) {
+        ReportError(inst,
+                    is_replicate
+                        ? "HW replicated constant exceeds the SPIR-V composite "
+                          "operand limit after lowering"
+                        : "HW constant composite exceeds the SPIR-V composite "
+                          "operand limit after lowering");
+        return false;
+      }
+      return true;
+    }
+
+    case spv::Op::OpCompositeExtract:
+      return ValidateCompositeIndices(inst, 0, 1);
+    case spv::Op::OpCompositeInsert:
+      return ValidateCompositeIndices(inst, 1, 2);
+    case spv::Op::OpAccessChain:
+    case spv::Op::OpInBoundsAccessChain:
+    case spv::Op::OpPtrAccessChain:
+    case spv::Op::OpInBoundsPtrAccessChain:
+      return ValidateAccessChain(inst);
+
+    case spv::Op::OpSelect: {
+      const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+      if (!result_matrix && !result_vector) return true;
+      if (inst->NumInOperands() != 3) {
+        ReportError(inst, "invalid HW OpSelect");
+        return false;
+      }
+      Instruction* condition = get_value(inst->GetSingleWordInOperand(0));
+      Instruction* condition_type =
+          condition ? get_def_use_mgr()->GetDef(condition->type_id()) : nullptr;
+      if (!condition_type || condition_type->opcode() != spv::Op::OpTypeBool) {
+        ReportError(inst, "HW OpSelect requires a scalar bool condition");
+        return false;
+      }
+      Instruction* true_value = get_value(inst->GetSingleWordInOperand(1));
+      Instruction* false_value = get_value(inst->GetSingleWordInOperand(2));
+      if (!true_value || !false_value ||
+          true_value->type_id() != inst->type_id() ||
+          false_value->type_id() != inst->type_id()) {
+        ReportError(inst, "invalid HW OpSelect object");
+        return false;
+      }
+      return true;
+    }
+
+    case spv::Op::OpVectorExtractDynamic: {
+      if (inst->NumInOperands() != 2) {
+        ReportError(inst, "invalid HW OpVectorExtractDynamic");
+        return false;
+      }
+      const VectorTypeInfo* vector =
+          get_vector_value(inst->GetSingleWordInOperand(0));
+      if (!vector || inst->type_id() != vector->component_type_id ||
+          !valid_integer_index(inst->GetSingleWordInOperand(1))) {
+        ReportError(inst, "invalid HW OpVectorExtractDynamic object or index");
+        return false;
+      }
+      return true;
+    }
+
+    case spv::Op::OpVectorInsertDynamic: {
+      const VectorTypeInfo* result = GetVectorType(inst->type_id());
+      if (!result || inst->NumInOperands() != 3) {
+        ReportError(inst, "invalid HW OpVectorInsertDynamic");
+        return false;
+      }
+      Instruction* vector = get_value(inst->GetSingleWordInOperand(0));
+      Instruction* object = get_value(inst->GetSingleWordInOperand(1));
+      if (!vector || vector->type_id() != inst->type_id() || !object ||
+          object->type_id() != result->component_type_id ||
+          !valid_integer_index(inst->GetSingleWordInOperand(2))) {
+        ReportError(inst, "invalid HW OpVectorInsertDynamic object or index");
+        return false;
+      }
+      return true;
+    }
+
+    case spv::Op::OpExtInst: {
+      const VectorTypeInfo* result = GetVectorType(inst->type_id());
+      if (!result) {
+        ReportError(inst, "HW OpExtInst requires a cooperative vector result");
+        return false;
+      }
+      if (inst->NumInOperands() < 2) {
+        ReportError(inst, "invalid HW cooperative vector OpExtInst");
+        return false;
+      }
+      Instruction* import = get_value(inst->GetSingleWordInOperand(0));
+      if (!import || import->opcode() != spv::Op::OpExtInstImport ||
+          import->GetInOperand(0).AsString() != "GLSL.std.450") {
+        ReportError(inst,
+                    "HW cooperative vector OpExtInst must use GLSL.std.450");
+        return false;
+      }
+      const HwGlslStd450Info ext_info =
+          DescribeSupportedHwGlslStd450(inst->GetSingleWordInOperand(1));
+      if (ext_info.operand_count == 0) {
+        ReportError(inst,
+                    "unsupported HW cooperative vector GLSL.std.450 opcode");
+        return false;
+      }
+      if (inst->NumInOperands() != ext_info.operand_count + 2) {
+        ReportError(inst,
+                    "invalid HW cooperative vector GLSL.std.450 operand count");
+        return false;
+      }
+      Instruction* component_type =
+          get_def_use_mgr()->GetDef(result->component_type_id);
+      const NumericScalarInfo component_info =
+          DescribeNumericScalarType(component_type);
+      const bool is_float_ext_inst =
+          ext_info.domain == HwGlslStd450Domain::kFloat;
+      // GLSL.std.450's U/S opcode selects the interpretation of integer bit
+      // patterns.  OpTypeInt signedness does not have to match that spelling;
+      // the validator only requires an integer component with matching width.
+      const bool domain_matches =
+          component_info.valid &&
+          (is_float_ext_inst == component_info.is_float);
+      if (!domain_matches) {
+        ReportError(inst,
+                    "HW cooperative vector GLSL.std.450 component type is "
+                    "incompatible with the opcode");
+        return false;
+      }
+      for (uint32_t i = 2; i < inst->NumInOperands(); ++i) {
+        const VectorTypeInfo* operand =
+            get_vector_value(inst->GetSingleWordInOperand(i));
+        const NumericScalarInfo operand_component_info =
+            DescribeNumericScalarType(
+                operand ? get_def_use_mgr()->GetDef(operand->component_type_id)
+                        : nullptr);
+        const bool component_matches =
+            is_float_ext_inst
+                ? operand &&
+                      operand->component_type_id == result->component_type_id
+                : operand_component_info.valid &&
+                      !operand_component_info.is_float &&
+                      operand_component_info.width == component_info.width;
+        if (!same_vector_shape(result, operand, false) ||
+            !component_matches) {
+          ReportError(inst, "invalid HW cooperative vector OpExtInst operand");
+          return false;
+        }
+      }
+      return true;
+    }
+
+    case spv::Op::OpBitcast: {
+      const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+      if ((!result_matrix && !result_vector) || inst->NumInOperands() != 1) {
+        ReportError(inst, "unsupported HW OpBitcast");
+        return false;
+      }
+      Instruction* object = get_value(inst->GetSingleWordInOperand(0));
+      const MatrixTypeInfo* input_matrix = GetMatrixTypeForValue(object);
+      const VectorTypeInfo* input_vector =
+          object ? GetVectorType(object->type_id()) : nullptr;
+      auto component_bit_width = [this](uint32_t type_id) {
+        Instruction* type = get_def_use_mgr()->GetDef(type_id);
+        return type && type->NumInOperands() >= 1
+                   ? type->GetSingleWordInOperand(0)
+                   : 0;
+      };
+      const bool matching_matrix =
+          same_matrix_shape(result_matrix, input_matrix, false) &&
+          component_bit_width(result_matrix->component_type_id) ==
+              component_bit_width(input_matrix->component_type_id);
+      const bool matching_vector =
+          same_vector_shape(result_vector, input_vector, false) &&
+          component_bit_width(result_vector->component_type_id) ==
+              component_bit_width(input_vector->component_type_id);
+      if (!object || (!matching_matrix && !matching_vector)) {
+        ReportError(inst, "unsupported HW OpBitcast");
+        return false;
+      }
+      return true;
+    }
+
+    default:
+      break;
+  }
+
+  if (IsHwConversionOpcode(inst->opcode())) {
+    if (inst->NumInOperands() != 1) {
+      ReportError(inst, "unsupported HW conversion");
+      return false;
+    }
+    const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    const MatrixTypeInfo* input_matrix =
+        get_matrix_value(inst->GetSingleWordInOperand(0));
+    const VectorTypeInfo* input_vector =
+        get_vector_value(inst->GetSingleWordInOperand(0));
+    if ((!same_matrix_shape(result_matrix, input_matrix, false) &&
+         !same_vector_shape(result_vector, input_vector, false)) ||
+        (!result_matrix && !result_vector)) {
+      ReportError(inst, "unsupported HW conversion input/output types");
+      return false;
+    }
+    const uint32_t result_component = result_matrix
+                                          ? result_matrix->component_type_id
+                                          : result_vector->component_type_id;
+    const uint32_t input_component = input_matrix
+                                         ? input_matrix->component_type_id
+                                         : input_vector->component_type_id;
+    const NumericScalarInfo result_info =
+        DescribeNumericScalarType(get_def_use_mgr()->GetDef(result_component));
+    const NumericScalarInfo input_info =
+        DescribeNumericScalarType(get_def_use_mgr()->GetDef(input_component));
+    bool types_match_opcode = result_info.valid && input_info.valid;
+    switch (inst->opcode()) {
+      case spv::Op::OpConvertFToU:
+        types_match_opcode &= input_info.is_float && !result_info.is_float &&
+                              !result_info.is_signed;
+        break;
+      case spv::Op::OpConvertFToS:
+        types_match_opcode &= input_info.is_float && !result_info.is_float;
+        break;
+      case spv::Op::OpConvertSToF:
+      case spv::Op::OpConvertUToF:
+        types_match_opcode &= !input_info.is_float && result_info.is_float;
+        break;
+      case spv::Op::OpUConvert:
+        types_match_opcode &= !input_info.is_float && !result_info.is_float &&
+                              !result_info.is_signed &&
+                              input_info.width != result_info.width;
+        break;
+      case spv::Op::OpSConvert:
+        types_match_opcode &= !input_info.is_float && !result_info.is_float &&
+                              input_info.width != result_info.width;
+        break;
+      case spv::Op::OpFConvert:
+        types_match_opcode &= input_info.is_float && result_info.is_float &&
+                              input_info.width != result_info.width;
+        break;
+      default:
+        types_match_opcode = false;
+        break;
+    }
+    if (!types_match_opcode) {
+      ReportError(inst, "unsupported HW conversion component types");
+      return false;
+    }
+    return true;
+  }
+
+  if (IsHwArithmeticOpcode(inst->opcode())) {
+    const uint32_t expected_operands =
+        IsHwUnaryArithmeticOpcode(inst->opcode()) ? 1 : 2;
+    if (inst->NumInOperands() != expected_operands) {
+      ReportError(inst, "unsupported HW arithmetic");
+      return false;
+    }
+    const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    if (!result_matrix && !result_vector) {
+      ReportError(inst, "unsupported HW arithmetic result type");
+      return false;
+    }
+    const bool is_float_arithmetic = IsFloatArithmeticOpcode(inst->opcode());
+    const bool is_shift = IsHwShiftOpcode(inst->opcode());
+    const bool is_bitwise = IsHwBitwiseOpcode(inst->opcode());
+    if ((is_shift || is_bitwise) && !result_vector) {
+      ReportError(inst,
+                  "HW shift/bitwise operations require a cooperative vector");
+      return false;
+    }
+    const uint32_t component_type_id = result_matrix
+                                           ? result_matrix->component_type_id
+                                           : result_vector->component_type_id;
+    Instruction* component_type = get_def_use_mgr()->GetDef(component_type_id);
+    const NumericScalarInfo component_info =
+        DescribeNumericScalarType(component_type);
+    if (!component_info.valid ||
+        (is_float_arithmetic != component_info.is_float)) {
+      ReportError(inst, "unsupported HW arithmetic component type");
+      return false;
+    }
+
+    if (inst->opcode() == spv::Op::OpUDiv && component_info.is_signed) {
+      ReportError(inst, "OpUDiv requires unsigned HW integer components");
+      return false;
+    }
+
+    for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
+      const uint32_t operand_id = inst->GetSingleWordInOperand(i);
+      const MatrixTypeInfo* operand_matrix = get_matrix_value(operand_id);
+      const VectorTypeInfo* operand_vector = get_vector_value(operand_id);
+      const bool matching_shape =
+          result_matrix
+              ? same_matrix_shape(result_matrix, operand_matrix, false)
+              : same_vector_shape(result_vector, operand_vector, false);
+      if (!matching_shape) {
+        ReportError(inst, "unsupported HW arithmetic");
+        return false;
+      }
+
+      const uint32_t operand_component_type_id =
+          result_matrix ? operand_matrix->component_type_id
+                        : operand_vector->component_type_id;
+      const NumericScalarInfo operand_component_info =
+          DescribeNumericScalarType(
+              get_def_use_mgr()->GetDef(operand_component_type_id));
+      if (!operand_component_info.valid ||
+          (is_float_arithmetic != operand_component_info.is_float)) {
+        ReportError(inst, "unsupported HW arithmetic component type");
+        return false;
+      }
+
+      // Integer arithmetic and bitwise base operands retain their bit width.
+      // Shift amounts are the sole exception: SPIR-V permits an independently
+      // sized integer vector with the same number of components.
+      const bool is_shift_amount = is_shift && i == 1;
+      if (!is_float_arithmetic && !is_shift_amount &&
+          operand_component_info.width != component_info.width) {
+        if (inst->opcode() == spv::Op::OpUDiv) {
+          ReportError(
+              inst,
+              "OpUDiv requires matching HW integer component bit widths");
+        } else {
+          ReportError(inst,
+                      "HW integer arithmetic component bit widths do not "
+                      "match");
+        }
+        return false;
+      }
+
+      if (inst->opcode() == spv::Op::OpUDiv &&
+          operand_component_info.is_signed) {
+        ReportError(inst, "OpUDiv requires unsigned HW integer components");
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (IsHwScaleOpcode(inst->opcode())) {
+    if (inst->NumInOperands() != 2) {
+      ReportError(inst, "unsupported HW scale operation");
+      return false;
+    }
+    const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    const bool expects_matrix = inst->opcode() == spv::Op::OpMatrixTimesScalar;
+    if ((expects_matrix && !result_matrix) ||
+        (!expects_matrix && !result_vector)) {
+      ReportError(inst, "unsupported HW scale operation");
+      return false;
+    }
+    const bool matching =
+        expects_matrix
+            ? same_matrix_shape(
+                  result_matrix,
+                  get_matrix_value(inst->GetSingleWordInOperand(0)), true)
+            : same_vector_shape(
+                  result_vector,
+                  get_vector_value(inst->GetSingleWordInOperand(0)), true);
+    const uint32_t component_type_id = expects_matrix
+                                           ? result_matrix->component_type_id
+                                           : result_vector->component_type_id;
+    Instruction* scalar = get_value(inst->GetSingleWordInOperand(1));
+    if (!matching || !scalar || scalar->type_id() != component_type_id) {
+      ReportError(inst, "unsupported HW scale operation");
+      return false;
+    }
+    return true;
+  }
+
+  return true;
+}
+
 bool HwLowerToStandardPass::LegalizeModule() {
   bool ok = true;
   auto pair_value_legal = [this](uint32_t value_id) {
@@ -804,31 +1566,6 @@ bool HwLowerToStandardPass::LegalizeModule() {
                              &pointer_legal, &memory_access_legal,
                              &matmul_types_legal](Instruction* inst) {
     if (!ok) return;
-
-    if (inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT &&
-        IsHwType(inst->type_id())) {
-      const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
-      uint64_t lowered_constituent_count = 0;
-      if (matrix) {
-        lowered_constituent_count =
-            static_cast<uint64_t>(matrix->rows) * matrix->cols;
-        if (IsPackedVec4(*matrix))
-          lowered_constituent_count /= kPackedVec4Width;
-      } else if (vector) {
-        lowered_constituent_count = vector->length;
-        if (IsPackedVec4(*vector))
-          lowered_constituent_count /= kPackedVec4Width;
-      }
-      if (lowered_constituent_count > kMaxCompositeConstituents) {
-        ReportError(
-            inst,
-            "HW replicated constant exceeds the SPIR-V composite operand "
-            "limit after lowering");
-        ok = false;
-        return;
-      }
-    }
 
     if (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreHW) {
@@ -917,10 +1654,11 @@ bool HwLowerToStandardPass::LegalizeModule() {
         TypeContainsHw(inst->GetSingleWordInOperand(1))) {
       const auto storage_class =
           static_cast<spv::StorageClass>(inst->GetSingleWordInOperand(0));
-      if (storage_class != spv::StorageClass::Function) {
+      if (storage_class != spv::StorageClass::Function &&
+          storage_class != spv::StorageClass::Private) {
         ReportError(inst,
-                    "HW cooperative values may only be stored in Function "
-                    "variables before lowering");
+                    "HW cooperative values may only be stored in Function or "
+                    "Private variables before lowering");
         ok = false;
         return;
       }
@@ -1056,54 +1794,21 @@ bool HwLowerToStandardPass::LegalizeModule() {
       }
     }
 
-    if (inst->opcode() == spv::Op::OpBitcast &&
-        TypeContainsHw(inst->type_id())) {
-      if (inst->NumInOperands() != 1) {
-        ReportError(inst, "unsupported HW OpBitcast");
-        ok = false;
-        return;
-      }
-      Instruction* object =
-          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-      const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-      const MatrixTypeInfo* input_matrix =
-          object ? GetMatrixType(object->type_id()) : nullptr;
-      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
-      const VectorTypeInfo* input_vector =
-          object ? GetVectorType(object->type_id()) : nullptr;
-      auto component_bit_width = [this](uint32_t type_id) -> uint32_t {
-        Instruction* type = get_def_use_mgr()->GetDef(type_id);
-        return type && type->NumInOperands() >= 1
-                   ? type->GetSingleWordInOperand(0)
-                   : 0;
-      };
-      const bool matching_matrix =
-          result_matrix && input_matrix &&
-          result_matrix->rows == input_matrix->rows &&
-          result_matrix->cols == input_matrix->cols &&
-          component_bit_width(result_matrix->component_type_id) ==
-              component_bit_width(input_matrix->component_type_id);
-      const bool matching_vector =
-          result_vector && input_vector &&
-          result_vector->length == input_vector->length &&
-          component_bit_width(result_vector->component_type_id) ==
-              component_bit_width(input_vector->component_type_id);
-      if (!object || (!matching_matrix && !matching_vector)) {
-        ReportError(inst, "unsupported HW OpBitcast");
-        ok = false;
-        return;
-      }
-    }
-
     const bool metadata_use =
         inst->opcode() == spv::Op::OpName ||
         inst->opcode() == spv::Op::OpMemberName || inst->IsDecoration() ||
         inst->IsNonSemanticInstruction() || inst->IsDebugLineInst();
     if (!IsHwOpcode(inst->opcode()) && InstructionTouchesHw(inst) &&
-        !metadata_use && !IsCoreOpcodeAllowedOnHwValue(inst->opcode())) {
-      ReportError(inst, "unsupported HW cooperative value use");
-      ok = false;
-      return;
+        !metadata_use) {
+      if (!IsCoreOpcodeAllowedOnHwValue(inst->opcode())) {
+        ReportError(inst, "unsupported HW cooperative value use");
+        ok = false;
+        return;
+      }
+      if (!LegalizeCooperativeCoreInstruction(inst)) {
+        ok = false;
+        return;
+      }
     }
   });
 
@@ -1245,11 +1950,13 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeConstruct:
+      case spv::Op::OpCompositeConstructReplicateEXT:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpConstantComposite:
       case spv::Op::OpSpecConstantComposite:
       case spv::Op::OpConstantCompositeReplicateEXT:
+      case spv::Op::OpSpecConstantCompositeReplicateEXT:
         if (IsHwType(inst->type_id())) worklist.push_back(inst);
         break;
       case spv::Op::OpCompositeExtract:
@@ -1341,11 +2048,13 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         ok = LowerVectorMatrixMul(inst, true);
         break;
       case spv::Op::OpCompositeConstruct:
+      case spv::Op::OpCompositeConstructReplicateEXT:
         ok = LowerCompositeConstruct(inst);
         break;
       case spv::Op::OpConstantComposite:
       case spv::Op::OpSpecConstantComposite:
       case spv::Op::OpConstantCompositeReplicateEXT:
+      case spv::Op::OpSpecConstantCompositeReplicateEXT:
         ok = LowerConstantComposite(inst);
         break;
       case spv::Op::OpCompositeExtract:
@@ -1406,6 +2115,47 @@ bool HwLowerToStandardPass::ReplaceHwTypeUses() {
     if (!old_type || !new_type) return false;
     context()->ReplaceAllUsesWith(type_pair.first, type_pair.second);
   }
+
+  // Unlike aggregate type declarations, OpTypeFunction declarations must be
+  // unique.  Distinct signatures that use cooperative types can become
+  // identical after the leaf types above are replaced, so canonicalize them
+  // before validation observes the rewritten module.
+  std::map<std::vector<uint32_t>, uint32_t> canonical_function_types;
+  std::vector<Instruction*> duplicate_function_types;
+  for (Instruction& type : get_module()->types_values()) {
+    if (type.opcode() != spv::Op::OpTypeFunction) continue;
+
+    std::vector<uint32_t> signature;
+    signature.reserve(type.NumInOperands());
+    for (uint32_t i = 0; i < type.NumInOperands(); ++i) {
+      signature.push_back(type.GetSingleWordInOperand(i));
+    }
+    const auto inserted = canonical_function_types.emplace(
+        std::move(signature), type.result_id());
+    if (inserted.second) continue;
+
+    context()->ReplaceAllUsesWith(type.result_id(), inserted.first->second);
+    duplicate_function_types.push_back(&type);
+  }
+  for (Instruction* duplicate : duplicate_function_types) {
+    context()->KillInst(duplicate);
+  }
+
+  // Distinct, logically matching cooperative types can canonicalize to the
+  // same lowered aggregate type.  OpCopyLogical requires its two types to be
+  // distinct, while OpCopyObject expresses the resulting same-type copy.
+  get_module()->ForEachInst([this](Instruction* inst) {
+    if (inst->opcode() != spv::Op::OpCopyLogical ||
+        inst->NumInOperands() != 1) {
+      return;
+    }
+    Instruction* source =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    if (source && inst->type_id() == source->type_id()) {
+      inst->SetOpcode(spv::Op::OpCopyObject);
+      context()->UpdateDefUse(inst);
+    }
+  });
   return true;
 }
 
@@ -4477,7 +5227,13 @@ bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   const uint32_t element_count =
       matrix ? matrix->rows * matrix->cols : vector->length;
   if (inst->NumInOperands() == 1 && element_count > max_unrolled_elements_) {
-    return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kBroadcast);
+    Instruction* operand =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    const uint32_t component_type_id =
+        matrix ? matrix->component_type_id : vector->component_type_id;
+    if (operand && operand->type_id() == component_type_id) {
+      return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kBroadcast);
+    }
   }
 
   InstructionBuilder builder(
@@ -4487,33 +5243,32 @@ bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
 
   if (matrix) {
     const uint32_t expected_operands = matrix->rows * matrix->cols;
-    if (inst->NumInOperands() == 1) {
-      Instruction* scalar =
-          get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-      if (!scalar || scalar->type_id() != matrix->component_type_id) {
-        ReportError(inst,
-                    "HW matrix OpCompositeConstruct constituent is invalid");
-        return false;
-      }
-      scalar_ids.assign(expected_operands, scalar->result_id());
-    } else if (inst->NumInOperands() == expected_operands) {
-      scalar_ids.reserve(expected_operands);
-      for (uint32_t i = 0; i < expected_operands; ++i) {
-        Instruction* scalar =
-            get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(i));
-        if (!scalar || scalar->type_id() != matrix->component_type_id) {
-          ReportError(inst,
-                      "HW matrix OpCompositeConstruct constituent is invalid");
-          return false;
-        }
-        scalar_ids.push_back(scalar->result_id());
-      }
-    } else {
+    Instruction* scalar =
+        inst->NumInOperands() == 1
+            ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
+            : nullptr;
+    if (!scalar || scalar->type_id() != matrix->component_type_id) {
       ReportError(inst,
-                  "HW matrix OpCompositeConstruct operand count is invalid");
+                  "HW matrix OpCompositeConstruct requires one scalar "
+                  "constituent");
       return false;
     }
+    scalar_ids.assign(expected_operands, scalar->result_id());
     return RebuildMatrixFromScalars(inst, *matrix, scalar_ids);
+  }
+
+  if (inst->opcode() == spv::Op::OpCompositeConstructReplicateEXT) {
+    Instruction* scalar =
+        inst->NumInOperands() == 1
+            ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
+            : nullptr;
+    if (!scalar || scalar->type_id() != vector->component_type_id) {
+      ReportError(inst,
+                  "HW OpCompositeConstructReplicateEXT operand is invalid");
+      return false;
+    }
+    scalar_ids.assign(vector->length, scalar->result_id());
+    return RebuildVectorFromScalars(inst, *vector, scalar_ids);
   }
 
   scalar_ids.reserve(vector->length);
@@ -4559,11 +5314,14 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     return false;
   }
   const bool is_replicate =
-      inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT;
+      inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT ||
+      inst->opcode() == spv::Op::OpSpecConstantCompositeReplicateEXT;
+  const bool is_spec =
+      inst->opcode() == spv::Op::OpSpecConstantComposite ||
+      inst->opcode() == spv::Op::OpSpecConstantCompositeReplicateEXT;
   const spv::Op lowered_constituent_opcode =
-      inst->opcode() == spv::Op::OpSpecConstantComposite
-          ? spv::Op::OpSpecConstantComposite
-          : spv::Op::OpConstantComposite;
+      is_spec ? spv::Op::OpSpecConstantComposite
+              : spv::Op::OpConstantComposite;
 
   const uint32_t component_type_id =
       matrix ? matrix->component_type_id : vector->component_type_id;
@@ -4571,38 +5329,18 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
       matrix ? matrix->rows * matrix->cols : vector->length;
 
   std::vector<uint32_t> scalar_ids;
-  auto append_scalar_constants =
-      [this, component_type_id](Instruction* operand,
-                                std::vector<uint32_t>* out) {
-        if (!operand || !out) return false;
-        if (operand->type_id() == component_type_id) {
-          out->push_back(operand->result_id());
-          return true;
-        }
-        if (operand->opcode() != spv::Op::OpConstantComposite) {
-          return false;
-        }
-        for (uint32_t i = 0; i < operand->NumInOperands(); ++i) {
-          Instruction* nested =
-              get_def_use_mgr()->GetDef(operand->GetSingleWordInOperand(i));
-          if (!nested || nested->type_id() != component_type_id) {
-            return false;
-          }
-          out->push_back(nested->result_id());
-        }
-        return true;
-      };
-
   for (uint32_t i = 0; i < inst->NumInOperands(); ++i) {
     Instruction* operand =
         get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(i));
-    if (!append_scalar_constants(operand, &scalar_ids)) {
+    if (!operand || operand->type_id() != component_type_id) {
       ReportError(inst, "unsupported HW OpConstantComposite operand");
       return false;
     }
+    scalar_ids.push_back(operand->result_id());
   }
 
-  if (scalar_ids.size() == 1 && expected_operands > 1) {
+  if ((matrix || is_replicate) && scalar_ids.size() == 1 &&
+      expected_operands > 1) {
     scalar_ids.resize(expected_operands, scalar_ids[0]);
   }
   if (scalar_ids.size() != expected_operands) {
@@ -4611,7 +5349,7 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   }
 
   if ((matrix && !IsPackedVec4(*matrix)) || (vector && !IsPackedVec4(*vector))) {
-    if (is_replicate) inst->SetOpcode(spv::Op::OpConstantComposite);
+    if (is_replicate) inst->SetOpcode(lowered_constituent_opcode);
     std::vector<Operand> operands;
     operands.reserve(scalar_ids.size());
     for (uint32_t id : scalar_ids) operands.push_back(IdOperand(id));
@@ -4680,7 +5418,7 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   std::vector<Operand> operands;
   operands.reserve(element_ids.size());
   for (uint32_t id : element_ids) operands.push_back(IdOperand(id));
-  if (is_replicate) inst->SetOpcode(spv::Op::OpConstantComposite);
+  if (is_replicate) inst->SetOpcode(lowered_constituent_opcode);
   inst->SetResultType(matrix ? matrix->lowered_type_id : vector->lowered_type_id);
   inst->SetInOperands(std::move(operands));
   context()->UpdateDefUse(inst);
@@ -5155,7 +5893,9 @@ bool HwLowerToStandardPass::LowerHwConversion(Instruction* inst) {
 }
 
 bool HwLowerToStandardPass::LowerHwArithmetic(Instruction* inst) {
-  if (inst->NumInOperands() != 1 && inst->NumInOperands() != 2) {
+  const uint32_t expected_operands =
+      IsHwUnaryArithmeticOpcode(inst->opcode()) ? 1 : 2;
+  if (inst->NumInOperands() != expected_operands) {
     ReportError(inst, "unsupported HW arithmetic");
     return false;
   }
@@ -5278,36 +6018,13 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
       return false;
     }
 
-    uint32_t expected_ext_operand_count = 0;
-    switch (static_cast<GLSLstd450>(original_operand_ids[1])) {
-      case GLSLstd450Atan:
-      case GLSLstd450Tanh:
-      case GLSLstd450Exp:
-      case GLSLstd450Log:
-        expected_ext_operand_count = 1;
-        break;
-      case GLSLstd450FMin:
-      case GLSLstd450FMax:
-      case GLSLstd450NMin:
-      case GLSLstd450NMax:
-      case GLSLstd450Step:
-      case GLSLstd450UMin:
-      case GLSLstd450UMax:
-      case GLSLstd450SMin:
-      case GLSLstd450SMax:
-        expected_ext_operand_count = 2;
-        break;
-      case GLSLstd450FClamp:
-      case GLSLstd450NClamp:
-      case GLSLstd450Fma:
-      case GLSLstd450UClamp:
-      case GLSLstd450SClamp:
-        expected_ext_operand_count = 3;
-        break;
-      default:
-        ReportError(inst,
-                    "unsupported HW cooperative vector GLSL.std.450 opcode");
-        return false;
+    const HwGlslStd450Info ext_info =
+        DescribeSupportedHwGlslStd450(original_operand_ids[1]);
+    const uint32_t expected_ext_operand_count = ext_info.operand_count;
+    if (expected_ext_operand_count == 0) {
+      ReportError(inst,
+                  "unsupported HW cooperative vector GLSL.std.450 opcode");
+      return false;
     }
     if (inst->NumInOperands() != 2 + expected_ext_operand_count) {
       ReportError(inst,
@@ -5388,8 +6105,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     }
   }
 
-  if (kind == ElementwiseLoopKind::kArithmetic ||
-      kind == ElementwiseLoopKind::kScale ||
+  if (kind == ElementwiseLoopKind::kScale ||
       kind == ElementwiseLoopKind::kSelect) {
     for (const LoopOperand& operand : loop_operands) {
       if (operand.layout.component_type_id != result_component_type_id) {
@@ -5433,12 +6149,23 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
   const uint32_t uint_pointer_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
+  uint32_t packed_select_condition_type_id = 0;
+  if (kind == ElementwiseLoopKind::kSelect && result_packed &&
+      bool_type_id != 0) {
+    Instruction* bool_type = get_def_use_mgr()->GetDef(bool_type_id);
+    if (bool_type) {
+      packed_select_condition_type_id = GetOrCreateVectorType(
+          bool_type_id, kPackedVec4Width, &bool_type);
+    }
+  }
   const uint32_t zero_id = GetOrCreateUIntConstant(0);
   const uint32_t one_id = GetOrCreateUIntConstant(1);
   const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
   const uint32_t piece_count_id = GetOrCreateUIntConstant(result_piece_count);
   if (result_pointer_type_id == 0 || result_piece_pointer_type_id == 0 ||
       uint_type_id == 0 || uint_pointer_type_id == 0 || bool_type_id == 0 ||
+      (kind == ElementwiseLoopKind::kSelect && result_packed &&
+       packed_select_condition_type_id == 0) ||
       zero_id == 0 || one_id == 0 || four_id == 0 || piece_count_id == 0) {
     return false;
   }
@@ -5506,6 +6233,14 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
   InstructionBuilder preheader_builder(
       context(), preheader_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  uint32_t select_condition_id =
+      kind == ElementwiseLoopKind::kSelect ? original_operand_ids[0] : 0;
+  if (kind == ElementwiseLoopKind::kSelect && result_packed) {
+    select_condition_id = BuildScalarSplat(
+        &preheader_builder, packed_select_condition_type_id,
+        original_operand_ids[0]);
+    if (select_condition_id == 0) return false;
+  }
   for (const LoopOperand& operand : loop_operands) {
     if (!preheader_builder.AddStore(operand.variable_id, operand.value_id)) {
       return false;
@@ -5607,6 +6342,18 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     return piece ? piece->result_id() : 0;
   };
 
+  auto convert_float_arithmetic_operand =
+      [&](const LoopOperand& operand, uint32_t operand_id) -> uint32_t {
+    if (operand_id == 0 || !IsFloatArithmeticOpcode(original_opcode) ||
+        operand.layout.component_type_id == result_component_type_id) {
+      return operand_id;
+    }
+    Instruction* converted = body_builder.AddUnaryOp(
+        result_piece_type_id, spv::Op::OpFConvert, operand_id);
+    ApplyActiveFPFastMathMode(converted);
+    return converted ? converted->result_id() : 0;
+  };
+
   uint32_t lowered_piece_id = 0;
   if (kind == ElementwiseLoopKind::kConversion) {
     const uint32_t operand_id = load_for_result_piece(loop_operands[0]);
@@ -5617,13 +6364,15 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     ApplyActiveFPFastMathMode(converted);
     lowered_piece_id = converted ? converted->result_id() : 0;
   } else if (kind == ElementwiseLoopKind::kArithmetic) {
-    const uint32_t lhs_id = load_for_result_piece(loop_operands[0]);
+    const uint32_t lhs_id = convert_float_arithmetic_operand(
+        loop_operands[0], load_for_result_piece(loop_operands[0]));
     Instruction* lowered = nullptr;
     if (lhs_id != 0 && loop_operands.size() == 1) {
       lowered = body_builder.AddUnaryOp(result_piece_type_id, original_opcode,
                                         lhs_id);
     } else if (lhs_id != 0 && loop_operands.size() == 2) {
-      const uint32_t rhs_id = load_for_result_piece(loop_operands[1]);
+      const uint32_t rhs_id = convert_float_arithmetic_operand(
+          loop_operands[1], load_for_result_piece(loop_operands[1]));
       if (rhs_id != 0) {
         lowered = body_builder.AddBinaryOp(result_piece_type_id,
                                            original_opcode, lhs_id, rhs_id);
@@ -5655,7 +6404,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     Instruction* selected =
         lhs_id && rhs_id
             ? body_builder.AddTernaryOp(result_piece_type_id, spv::Op::OpSelect,
-                                        original_operand_ids[0], lhs_id, rhs_id)
+                                        select_condition_id, lhs_id, rhs_id)
             : nullptr;
     lowered_piece_id = selected ? selected->result_id() : 0;
   } else if (kind == ElementwiseLoopKind::kBroadcast) {
@@ -10070,6 +10819,26 @@ void HwLowerToStandardPass::AddGeneratedFunction(
   }
 
   context()->AddFunction(std::move(function));
+
+  // Instructions built in a detached generated function are deliberately not
+  // registered with def-use until the function is complete.  Decorations that
+  // target those instructions must therefore be added only after their defs
+  // have been registered above; AddDecorationVal immediately analyzes the
+  // target use when def-use is valid.
+  if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse)) {
+    auto pending = pending_fp_fast_math_modes_.begin();
+    while (pending != pending_fp_fast_math_modes_.end()) {
+      if (context()->get_def_use_mgr()->GetDef(pending->first)) {
+        context()->get_decoration_mgr()->AddDecorationVal(
+            pending->first, uint32_t(spv::Decoration::FPFastMathMode),
+            pending->second);
+        pending = pending_fp_fast_math_modes_.erase(pending);
+      } else {
+        ++pending;
+      }
+    }
+  }
+
   generated_function_ids_.insert(function_id);
   if (!may_write_memory) {
     read_only_generated_function_ids_.insert(function_id);
@@ -11899,6 +12668,12 @@ void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
   if (!inst || inst->result_id() == 0 || active_fp_fast_math_mode_ == 0) {
     return;
   }
+  if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse) &&
+      !context()->get_def_use_mgr()->GetDef(inst->result_id())) {
+    pending_fp_fast_math_modes_.emplace_back(inst->result_id(),
+                                             active_fp_fast_math_mode_);
+    return;
+  }
   context()->get_decoration_mgr()->AddDecorationVal(
       inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode),
       active_fp_fast_math_mode_);
@@ -12674,21 +13449,11 @@ bool HwLowerToStandardPass::IsHwOpcode(spv::Op opcode) const {
 }
 
 bool HwLowerToStandardPass::IsAnyHwOpcode(spv::Op opcode) const {
-  if (IsHwOpcode(opcode)) return true;
-  switch (opcode) {
-    case spv::Op::OpTypeTensorMapHW:
-    case spv::Op::OpCpAsyncTensorGlobalSharedHW:
-    case spv::Op::OpCpAsyncCommitGroupHW:
-    case spv::Op::OpCpAsyncWaitGroupHW:
-    case spv::Op::OpBarrierArriveHW:
-    case spv::Op::OpBarrierWaitHW:
-    case spv::Op::OpShuffleIndexHW:
-    case spv::Op::OpBytePermuteHW:
-    case spv::Op::OpShuffleFillDownHW:
-      return true;
-    default:
-      return false;
-  }
+  const char* name = spvOpcodeString(opcode);
+  if (!name) return false;
+  const std::string opcode_name(name);
+  return opcode_name.size() >= 2 &&
+         opcode_name.compare(opcode_name.size() - 2, 2, "HW") == 0;
 }
 
 bool HwLowerToStandardPass::IsHwCapabilityOrExtension(
@@ -12734,24 +13499,8 @@ bool HwLowerToStandardPass::HasHwOperand(const Instruction* inst) const {
 bool HwLowerToStandardPass::RequiresHwNeuralShaderExtension(
     const Instruction* inst) const {
   if (!inst) return false;
-  switch (inst->opcode()) {
-    case spv::Op::OpTypeTensorMapHW:
-    case spv::Op::OpCpAsyncTensorGlobalSharedHW:
-    case spv::Op::OpCpAsyncCommitGroupHW:
-    case spv::Op::OpCpAsyncWaitGroupHW:
-    case spv::Op::OpBarrierArriveHW:
-    case spv::Op::OpBarrierWaitHW:
-    case spv::Op::OpShuffleIndexHW:
-    case spv::Op::OpBytePermuteHW:
-    case spv::Op::OpShuffleFillDownHW:
-      return true;
-    case spv::Op::OpSelectionMerge:
-      return inst->NumInOperands() >= 2 &&
-             (inst->GetSingleWordInOperand(1) &
-              uint32_t(spv::SelectionControlMask::Relreg)) != 0;
-    default:
-      return false;
-  }
+  return (IsAnyHwOpcode(inst->opcode()) && !IsHwOpcode(inst->opcode())) ||
+         HasHwOperand(inst);
 }
 
 bool HwLowerToStandardPass::ModuleRequiresHwNeuralShaderExtension() const {

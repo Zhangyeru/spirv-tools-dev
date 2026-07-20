@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "test/opt/pass_fixture.h"
 #include "test/opt/pass_utils.h"
@@ -31,6 +34,79 @@ size_t CountSubstring(const std::string& text, const std::string& needle) {
     pos += needle.size();
   }
   return count;
+}
+
+std::string MakeAsymmetricHwElementwiseModule(
+    const std::string& diagnostic, const std::string& instruction) {
+  return std::string("\n; CHECK: ") + diagnostic + R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_4 = OpConstant %uint 4
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%one = OpConstant %float 1
+%v2half = OpTypeVector %half 2
+%v2float = OpTypeVector %float 2
+%v4half = OpTypeVector %half 4
+%v4float = OpTypeVector %float 4
+%m2half = OpTypeMatrix %v2half 2
+%m2float = OpTypeMatrix %v2float 2
+%hvec4 = OpTypeCooperativeVectorHW %half %uint_4
+%fvec4 = OpTypeCooperativeVectorHW %float %uint_4
+%hmat2 = OpTypeCooperativeMatrixHW %half %uint_2 %uint_2
+%fmat2 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%ordinary_half = OpUndef %v4half
+%ordinary_float = OpUndef %v4float
+%ordinary_half_matrix = OpUndef %m2half
+%ordinary_float_matrix = OpUndef %m2float
+%hw_half = OpUndef %hvec4
+%hw_float = OpUndef %fvec4
+%hw_half_matrix = OpUndef %hmat2
+%hw_float_matrix = OpUndef %fmat2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+)" + instruction + R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+void ExpectFailureWithMissingExtInstOperand(HwLowerToStandardTest* test,
+                                            const std::string& text) {
+  auto context = BuildModule(SPV_ENV_UNIVERSAL_1_3, test->consumer(), text,
+                             SpirvTools::kDefaultAssembleOption);
+  ASSERT_NE(nullptr, context.get()) << "Assembling failed for shader:\n"
+                                    << text;
+
+  Instruction* ext_inst = nullptr;
+  context->module()->ForEachInst([&ext_inst](Instruction* inst) {
+    if (!ext_inst && inst->opcode() == spv::Op::OpExtInst) ext_inst = inst;
+  });
+  ASSERT_NE(nullptr, ext_inst);
+  ASSERT_GE(ext_inst->NumInOperands(), 1u);
+  ext_inst->RemoveInOperand(ext_inst->NumInOperands() - 1);
+  context->get_def_use_mgr()->AnalyzeInstUse(ext_inst);
+
+  std::ostringstream errors;
+  HwLowerToStandardPass pass;
+  pass.SetMessageConsumer(
+      [&errors](spv_message_level_t, const char*, const spv_position_t&,
+                const char* message) { errors << message << '\n'; });
+  EXPECT_EQ(Pass::Status::Failure, pass.Run(context.get()));
+  EXPECT_NE(std::string::npos,
+            errors.str().find(
+                "invalid HW cooperative vector GLSL.std.450 operand count"))
+      << errors.str();
 }
 
 void ExpectSingleElementwiseLoop(const std::string& text) {
@@ -990,6 +1066,90 @@ OpFunctionEnd
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
+TEST_F(HwLowerToStandardTest, RejectsMatrixExtInstResult) {
+  const std::string text = R"(
+; CHECK: HW OpExtInst requires a cooperative vector result
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%float = OpTypeFloat 32
+%mat2x2 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%zero = OpConstantNull %mat2x2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpExtInst %mat2x2 %glsl FMax %zero %zero
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsCooperativeVectorExtInstComponentTypeMismatch) {
+  const std::string text = R"(
+; CHECK: invalid HW cooperative vector OpExtInst operand
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%fvec8 = OpTypeCooperativeVectorHW %float %uint_8
+%uvec8 = OpTypeCooperativeVectorHW %uint %uint_8
+%fzero = OpConstantNull %fvec8
+%uzero = OpConstantNull %uvec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpExtInst %fvec8 %glsl FMax %fzero %uzero
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsCooperativeVectorExtInstInvalidArity) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%zero = OpConstantNull %vec8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpExtInst %vec8 %glsl FMax %zero %zero
+OpReturn
+OpFunctionEnd
+)";
+
+  ExpectFailureWithMissingExtInstOperand(this, text);
+}
+
 TEST_F(HwLowerToStandardTest, LowersChainedElementwiseOpsToSeparateLoops) {
   const std::string text = R"(
 OpCapability Shader
@@ -1022,6 +1182,94 @@ OpFunctionEnd
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpULessThan"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsConversionUnlessInputAndResultAreCooperative) {
+  const std::vector<std::string> instructions = {
+      "%bad = OpFConvert %fvec4 %ordinary_half",
+      "%bad = OpFConvert %v4float %hw_half",
+      "%bad = OpFConvert %fmat2 %ordinary_half_matrix",
+      "%bad = OpFConvert %m2float %hw_half_matrix",
+  };
+  for (const std::string& instruction : instructions) {
+    SCOPED_TRACE(instruction);
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        MakeAsymmetricHwElementwiseModule("unsupported HW conversion",
+                                          instruction));
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsArithmeticUnlessInputAndResultAreCooperative) {
+  const std::vector<std::string> instructions = {
+      "%bad = OpFNegate %fvec4 %ordinary_float",
+      "%bad = OpFNegate %v4float %hw_float",
+      "%bad = OpFNegate %fmat2 %ordinary_float_matrix",
+      "%bad = OpFNegate %m2float %hw_float_matrix",
+  };
+  for (const std::string& instruction : instructions) {
+    SCOPED_TRACE(instruction);
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        MakeAsymmetricHwElementwiseModule("unsupported HW arithmetic",
+                                          instruction));
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsScaleUnlessInputAndResultAreCooperative) {
+  const std::vector<std::string> instructions = {
+      "%bad = OpVectorTimesScalar %fvec4 %ordinary_float %one",
+      "%bad = OpVectorTimesScalar %v4float %hw_float %one",
+      "%bad = OpMatrixTimesScalar %fmat2 %ordinary_float_matrix %one",
+      "%bad = OpMatrixTimesScalar %m2float %hw_float_matrix %one",
+  };
+  for (const std::string& instruction : instructions) {
+    SCOPED_TRACE(instruction);
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        MakeAsymmetricHwElementwiseModule("unsupported HW scale operation",
+                                          instruction));
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       PreservesCopyLogicalBetweenDistinctNestedCooperativeTypes) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %float %uint_4
+%struct_a = OpTypeStruct %vec
+%struct_b = OpTypeStruct %vec
+%source = OpUndef %struct_a
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%copy = OpCopyLogical %struct_b %source
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_4);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_4);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCopyLogical"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpCopyObject"));
 }
 
 TEST_F(HwLowerToStandardTest, PreservesEnclosingLoopHeaderWhenSplitting) {
@@ -2241,11 +2489,7 @@ OpDecorate %Buf Block
 %bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
 %a = OpCooperativeMatrixLoadHW %mat4x4 %abase %shape %offset %int_0
 %b = OpCooperativeMatrixLoadHW %mat4x4 %bbase %shape %offset %int_0
-%c = OpCompositeConstruct %mat4x4
-  %float_0 %float_1 %float_2 %float_3
-  %float_1 %float_2 %float_3 %float_0
-  %float_2 %float_3 %float_0 %float_1
-  %float_3 %float_0 %float_1 %float_2
+%c = OpCompositeConstruct %mat4x4 %float_0
 %d = OpCooperativeMatrixMulAddHW %mat4x4 %a %b %c
 OpReturn
 OpFunctionEnd
@@ -3249,7 +3493,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
-%m = OpCompositeConstruct %mat2x8 %h0 %h1 %h2 %h3 %h4 %h5 %h6 %h7 %h8 %h9 %h10 %h11 %h12 %h13 %h14 %h15
+%m = OpCompositeConstruct %mat2x8 %h0
 OpReturn
 OpFunctionEnd
 )";
@@ -3296,7 +3540,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
-%m = OpCompositeConstruct %mat2x8 %f0 %f1 %f2 %f3 %f4 %f5 %f6 %f7 %f8 %f9 %f10 %f11 %f12 %f13 %f14 %f15
+%m = OpCompositeConstruct %mat2x8 %f0
 OpReturn
 OpFunctionEnd
 )";
@@ -3341,7 +3585,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
-%m = OpCompositeConstruct %mat3x5 %f0 %f1 %f2 %f3 %f4 %f5 %f6 %f7 %f8 %f9 %f10 %f11 %f12 %f13 %f14
+%m = OpCompositeConstruct %mat3x5 %f0
 OpReturn
 OpFunctionEnd
 )";
@@ -3506,6 +3750,99 @@ OpFunctionEnd
 }
 
 TEST_F(HwLowerToStandardTest,
+       LowersVectorReplicateInPackedAndScalarLoopPaths) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeVectorHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%one = OpConstant %float 1
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%broadcast = OpCompositeConstructReplicateEXT %vec8 %one
+%last = OpCompositeExtract %float %broadcast 7
+OpReturn
+OpFunctionEnd
+)";
+
+  auto unrolled = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u,
+      1024ull, 8u, 1024ull);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(unrolled));
+  ExpectNoHwOrCoopMatrix(std::get<0>(unrolled));
+  EXPECT_EQ(0u, CountSubstring(std::get<0>(unrolled), "OpLoopMerge"));
+  EXPECT_EQ(2u,
+            CountSubstring(std::get<0>(unrolled),
+                           "OpCompositeConstruct %v4float"));
+
+  auto looped = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u,
+      1024ull, 4u, 1024ull);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(looped));
+  ExpectNoHwOrCoopMatrix(std::get<0>(looped));
+  EXPECT_EQ(1u, CountSubstring(std::get<0>(looped), "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(std::get<0>(looped), "OpULessThan"));
+  EXPECT_EQ(1u,
+            CountSubstring(std::get<0>(looped), "OpBranchConditional"));
+  EXPECT_GE(CountSubstring(std::get<0>(looped), "OpAccessChain"), 1u);
+  EXPECT_NE(std::string::npos,
+            std::get<0>(looped).find("OpTypeArray %float %uint_8"));
+  EXPECT_EQ(std::string::npos,
+            std::get<0>(looped).find("OpTypeVector %float 4"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       LowersCooperativeMatrixCompositeConstructReplicate) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_4 = OpConstant %uint 4
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%one = OpConstant %float 1
+%mat2x4 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%broadcast = OpCompositeConstructReplicateEXT %mat2x4 %one
+%last = OpCompositeExtract %float %broadcast 1 3
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u,
+            CountSubstring(disassembly, "OpCompositeConstructReplicateEXT"));
+  EXPECT_EQ(1u, CountSubstring(
+                    disassembly, "OpCompositeConstruct %_arr_float_uint_8"));
+}
+
+TEST_F(HwLowerToStandardTest,
        LowersMixedScalarAndOrdinaryVectorCompositeConstruct) {
   const std::string text = R"(
 OpCapability Shader
@@ -3549,6 +3886,71 @@ OpFunctionEnd
   EXPECT_EQ(7u, CountSubstring(disassembly, "OpCompositeExtract %float"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
                                "OpCompositeConstruct %_arr_v4float_uint_2"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       LowersSingleOrdinaryVectorConstituentWithoutBroadcastLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%v4float = OpTypeVector %float 4
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%ordinary = OpUndef %v4float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%copy = OpCompositeConstruct %vec4 %ordinary
+%last = OpCompositeExtract %float %copy 3
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u,
+      1024ull, 2u, 1024ull);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(
+                    disassembly, "OpCompositeConstruct %_arr_v4float_uint_1"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsPlainVectorCompositeConstructScalarBroadcast) {
+  const std::string text = R"(
+; CHECK: HW vector OpCompositeConstruct operand count is invalid
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%one = OpConstant %float 1
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%bad = OpCompositeConstruct %vec4 %one
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -3632,7 +4034,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
-%m = OpCompositeConstruct %mat2x5 %h0 %h1 %h2 %h3 %h4 %h5 %h6 %h7 %h8 %h9
+%m = OpCompositeConstruct %mat2x5 %h0
 OpReturn
 OpFunctionEnd
 )";
@@ -5171,8 +5573,175 @@ OpFunctionEnd
 }
 
 TEST_F(HwLowerToStandardTest,
-       RejectsReplicatedConstantThatCannotBeSerializedAfterLowering) {
+       LowersConstantCompositeWithUndefConstituents) {
   const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%undef = OpUndef %float
+%mat1x4 = OpTypeCooperativeMatrixHW %float %uint_1 %uint_4
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%matrix_value = OpConstantComposite %mat1x4 %undef
+%vector_value = OpConstantComposite %vec4 %undef %undef %undef %undef
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly, "OpConstantComposite %v4float"));
+  EXPECT_EQ(2u, CountSubstring(
+                    disassembly,
+                    "OpConstantComposite %_arr_v4float_uint_1"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsNestedVectorConstantCompositeConstituent) {
+  const std::string text = R"(
+; CHECK: unsupported HW OpConstantComposite operand
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%one = OpConstant %float 1
+%v2float = OpTypeVector %float 2
+%pair = OpConstantComposite %v2float %one %one
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%bad = OpConstantComposite %vec4 %pair %pair %pair %pair
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest,
+       LowersReplicatedConstantAtCompositeConstituentLimit) {
+  struct Case {
+    const char* opcode;
+    const char* constituent;
+    const char* lowered_opcode;
+  };
+  const std::vector<Case> cases = {
+      {"OpConstantCompositeReplicateEXT", "OpConstant %float 1",
+       "OpConstantComposite"},
+      {"OpSpecConstantCompositeReplicateEXT",
+       "OpSpecConstant %float 1065353216", "OpSpecConstantComposite"},
+  };
+  for (const Case& test_case : cases) {
+    SCOPED_TRACE(test_case.opcode);
+    const std::string text = std::string(R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeVectorHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_65532 = OpConstant %uint 65532
+%float = OpTypeFloat 32
+%one = )") + test_case.constituent + R"(
+%vec65532 = OpTypeCooperativeVectorHW %float %uint_65532
+%value = )" + test_case.opcode + R"( %vec65532 %one
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+    auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar,
+        HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
+        16777216ull, 65532u, 4096ull);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(0u, CountSubstring(disassembly, test_case.opcode));
+    EXPECT_EQ(1u, CountSubstring(
+                      disassembly,
+                      std::string(test_case.lowered_opcode) +
+                          " %_arr_float_uint_65532"));
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       LowersPackedCooperativeVectorSpecConstantCompositeReplicate) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeVectorHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%one = OpSpecConstant %float 1065353216
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%value = OpSpecConstantCompositeReplicateEXT %vec8 %one
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(
+                    disassembly, "OpSpecConstantCompositeReplicateEXT"));
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly, "OpSpecConstantComposite %v4float"));
+  EXPECT_EQ(1u, CountSubstring(
+                    disassembly,
+                    "OpSpecConstantComposite %_arr_v4float_uint_2"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsReplicatedConstantThatCannotBeSerializedAfterLowering) {
+  const std::vector<std::string> opcodes = {
+      "OpConstantCompositeReplicateEXT",
+      "OpSpecConstantCompositeReplicateEXT",
+  };
+  for (const std::string& opcode : opcodes) {
+    SCOPED_TRACE(opcode);
+    const std::string text = std::string(R"(
 ; CHECK: HW replicated constant exceeds the SPIR-V composite operand limit
 OpCapability Shader
 OpCapability ReplicatedCompositesEXT
@@ -5187,7 +5756,7 @@ OpExecutionMode %main LocalSize 1 1 1
 %float = OpTypeFloat 32
 %one = OpConstant %float 1
 %vec65533 = OpTypeCooperativeVectorHW %float %uint_65533
-%value = OpConstantCompositeReplicateEXT %vec65533 %one
+%value = )") + opcode + R"( %vec65533 %one
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
@@ -5196,10 +5765,50 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
-      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
-      16777216ull, 70000u, 4096ull);
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+        HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
+        16777216ull, 70000u, 4096ull);
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsDirectConstantCompositesAboveConstituentLimit) {
+  const std::vector<std::pair<std::string, std::string>> cases = {
+      {"OpConstantComposite", "OpConstant %float 1"},
+      {"OpSpecConstantComposite", "OpSpecConstant %float 1065353216"},
+  };
+  for (const auto& test_case : cases) {
+    const std::string& opcode = test_case.first;
+    SCOPED_TRACE(opcode);
+    const std::string text = std::string(R"(
+; CHECK: HW constant composite exceeds the SPIR-V composite operand limit
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_65533 = OpConstant %uint 65533
+%float = OpTypeFloat 32
+%one = )") + test_case.second + R"(
+%mat1x65533 = OpTypeCooperativeMatrixHW %float %uint_1 %uint_65533
+%value = )" + opcode + R"( %mat1x65533 %one
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        text, HwLowerToStandardPass::LoweringMode::kForceScalar,
+        HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
+        16777216ull, 65532u, 4096ull);
+  }
 }
 
 TEST_F(HwLowerToStandardTest, FailsForInvalidMatmulShape) {
@@ -5300,6 +5909,63 @@ OpFunctionEnd
   EXPECT_NE(std::string::npos,
             disassembly.find("OpFunctionParameter %_arr_v4float_uint_4"));
   EXPECT_NE(std::string::npos, disassembly.find("OpFunctionCall %void"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       DeduplicatesFunctionTypesAfterCooperativeTypeReplacement) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%uint_5 = OpConstant %uint 5
+%float = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %float %uint_5
+%array = OpTypeArray %float %uint_5
+%vec_fn = OpTypeFunction %vec %vec
+%array_fn = OpTypeFunction %array %array
+%void_fn = OpTypeFunction %void
+%vec_value = OpUndef %vec
+%array_value = OpUndef %array
+%vec_helper = OpFunction %vec None %vec_fn
+%vec_param = OpFunctionParameter %vec
+%vec_entry = OpLabel
+OpReturnValue %vec_param
+OpFunctionEnd
+%array_helper = OpFunction %array None %array_fn
+%array_param = OpFunctionParameter %array
+%array_entry = OpLabel
+OpReturnValue %array_param
+OpFunctionEnd
+%main = OpFunction %void None %void_fn
+%entry = OpLabel
+%vec_call = OpFunctionCall %vec %vec_helper %vec_value
+%array_call = OpFunctionCall %array %array_helper %array_value
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_3);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u,
+            CountSubstring(
+                disassembly,
+                "OpTypeFunction %_arr_float_uint_5 %_arr_float_uint_5"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpTypeFunction"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpFunctionParameter"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersNestedHwFunctionReturnAndFunctionPointer) {
@@ -5533,9 +6199,71 @@ OpFunctionEnd
   EXPECT_EQ(1u, CountSubstring(disassembly, " Volatile"));
 }
 
+TEST_F(HwLowerToStandardTest,
+       LowersNestedPrivateCooperativeVariableAndPointerParameter) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_2 = OpConstant %uint 2
+%uint_5 = OpConstant %uint 5
+%float = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %float %uint_5
+%vec_array = OpTypeArray %vec %uint_2
+%Payload = OpTypeStruct %vec_array %uint
+%_ptr_Private_Payload = OpTypePointer Private %Payload
+%Payload_null = OpConstantNull %Payload
+%global = OpVariable %_ptr_Private_Payload Private %Payload_null
+%helper_fn = OpTypeFunction %Payload %_ptr_Private_Payload
+%main_fn = OpTypeFunction %void
+%helper = OpFunction %Payload None %helper_fn
+%pointer = OpFunctionParameter %_ptr_Private_Payload
+%helper_entry = OpLabel
+%loaded = OpLoad %Payload %pointer
+%value = OpCompositeExtract %vec %loaded 0 1
+%doubled = OpFAdd %vec %value %value
+%updated = OpCompositeInsert %Payload %doubled %loaded 0 1
+OpStore %pointer %updated
+OpReturnValue %updated
+OpFunctionEnd
+%main = OpFunction %void None %main_fn
+%entry = OpLabel
+%result = OpFunctionCall %Payload %helper %global
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_3);
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeArray"), 1u);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeStruct"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypePointer Private"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpConstantNull"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpVariable"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionParameter"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpLoad"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpStore"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+}
+
 TEST_F(HwLowerToStandardTest, FailsForPointerEscapeOrNonFunctionHwPointer) {
   const std::string text = R"(
-; CHECK: HW cooperative values may only be stored in Function variables before lowering
+; CHECK: HW cooperative values may only be stored in Function or Private variables before lowering
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -5560,7 +6288,7 @@ OpFunctionEnd
 
 TEST_F(HwLowerToStandardTest, FailsNestedHwStructInStorageBuffer) {
   const std::string text = R"(
-; CHECK: HW cooperative values may only be stored in Function variables before lowering
+; CHECK: HW cooperative values may only be stored in Function or Private variables before lowering
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -5586,7 +6314,7 @@ OpFunctionEnd
 
 TEST_F(HwLowerToStandardTest, FailsNestedHwArrayInUniform) {
   const std::string text = R"(
-; CHECK: HW cooperative values may only be stored in Function variables before lowering
+; CHECK: HW cooperative values may only be stored in Function or Private variables before lowering
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -5640,11 +6368,7 @@ OpDecorate %Buf Block
 %shape = OpConstantComposite %v2uint %uint_4 %uint_4
 %offset = OpConstantComposite %v2uint %uint_0 %uint_0
 %mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
-%const_b = OpConstantComposite %mat4x4
-  %float_1 %float_0 %float_0 %float_0
-  %float_0 %float_1 %float_0 %float_0
-  %float_0 %float_0 %float_1 %float_0
-  %float_0 %float_0 %float_0 %float_1
+%const_b = OpConstantComposite %mat4x4 %float_1
 %_runtimearr_float = OpTypeRuntimeArray %float
 %Buf = OpTypeStruct %_runtimearr_float
 %_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
@@ -5707,11 +6431,7 @@ OpDecorate %Buf Block
 %shape = OpConstantComposite %v2uint %uint_4 %uint_4
 %offset = OpConstantComposite %v2uint %uint_0 %uint_0
 %mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
-%const_a = OpConstantComposite %mat4x4
-  %float_1 %float_0 %float_0 %float_0
-  %float_0 %float_1 %float_0 %float_0
-  %float_0 %float_0 %float_1 %float_0
-  %float_0 %float_0 %float_0 %float_1
+%const_a = OpConstantComposite %mat4x4 %float_1
 %_runtimearr_float = OpTypeRuntimeArray %float
 %Buf = OpTypeStruct %_runtimearr_float
 %_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
@@ -5772,11 +6492,7 @@ OpDecorate %Buf Block
 %shape = OpConstantComposite %v2uint %uint_4 %uint_4
 %offset = OpConstantComposite %v2uint %uint_0 %uint_0
 %mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
-%const_c = OpConstantComposite %mat4x4
-  %float_0 %float_0 %float_0 %float_0
-  %float_0 %float_0 %float_0 %float_0
-  %float_0 %float_0 %float_0 %float_0
-  %float_0 %float_0 %float_0 %float_0
+%const_c = OpConstantComposite %mat4x4 %float_0
 %_runtimearr_float = OpTypeRuntimeArray %float
 %Buf = OpTypeStruct %_runtimearr_float
 %_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
@@ -5841,15 +6557,7 @@ OpDecorate %Buf Block
 %vec4 = OpTypeCooperativeVectorHW %float %uint_4
 %vec8 = OpTypeCooperativeVectorHW %float %uint_8
 %mat8x4 = OpTypeCooperativeMatrixHW %float %uint_8 %uint_4
-%const_w = OpConstantComposite %mat8x4
-  %float_1 %float_0 %float_0 %float_0
-  %float_0 %float_1 %float_0 %float_0
-  %float_0 %float_0 %float_1 %float_0
-  %float_0 %float_0 %float_0 %float_1
-  %float_1 %float_0 %float_0 %float_0
-  %float_0 %float_1 %float_0 %float_0
-  %float_0 %float_0 %float_1 %float_0
-  %float_0 %float_0 %float_0 %float_1
+%const_w = OpConstantComposite %mat8x4 %float_1
 %const_bias = OpConstantComposite %vec4 %float_0 %float_0 %float_0 %float_0
 %_runtimearr_float = OpTypeRuntimeArray %float
 %Buf = OpTypeStruct %_runtimearr_float
@@ -6363,6 +7071,56 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, "OpSelect"), 0u);
 }
 
+TEST_F(HwLowerToStandardTest,
+       PackedSelectLoopUsesHoistedVectorConditionInSpirv13) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%uint = OpTypeInt 32 0
+%uint_7 = OpConstant %uint 7
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %float %uint_8
+%a = OpUndef %vec
+%b = OpUndef %vec
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%selected = OpSelect %vec %true %a %b
+%last = OpCompositeExtract %float %selected 7
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_3);
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u,
+      1024ull, 4u, 1024ull);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %bool 4"));
+  const size_t splat = disassembly.find("OpCompositeConstruct %v4bool");
+  const size_t loop_merge = disassembly.find("OpLoopMerge");
+  ASSERT_NE(std::string::npos, splat);
+  ASSERT_NE(std::string::npos, loop_merge);
+  EXPECT_LT(splat, loop_merge);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSelect %v4float"));
+}
+
 TEST_F(HwLowerToStandardTest, LowersCompositeInsertOnHwValue) {
   const std::string text = R"(
 OpCapability Shader
@@ -6619,8 +7377,33 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(std::get<0>(result));
 }
 
-TEST_F(HwLowerToStandardTest, ExtensionFreeModeRejectsUnloweredHwOpcode) {
-  const std::string text = R"(
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeModeRejectsEveryUnloweredHwOpcode) {
+  struct UnsupportedHwOpcodeCase {
+    const char* name;
+    const char* declarations;
+    const char* body;
+  };
+  const UnsupportedHwOpcodeCase cases[] = {
+      {"OpTypeTensorMapHW", "%tensor_map = OpTypeTensorMapHW 1\n", ""},
+      {"OpCpAsyncTensorGlobalSharedHW", "",
+       "OpCpAsyncTensorGlobalSharedHW 1 %uint_0 %uint_0 %uint_0\n"},
+      {"OpCpAsyncCommitGroupHW", "", "OpCpAsyncCommitGroupHW\n"},
+      {"OpCpAsyncWaitGroupHW", "", "OpCpAsyncWaitGroupHW 0\n"},
+      {"OpBarrierArriveHW", "",
+       "OpBarrierArriveHW %uint_0 %uint_1\n"},
+      {"OpBarrierWaitHW", "", "OpBarrierWaitHW %uint_0 %uint_1\n"},
+      {"OpShuffleIndexHW", "",
+       "%result = OpShuffleIndexHW %uint %uint_1 %uint_0\n"},
+      {"OpBytePermuteHW", "",
+       "%result = OpBytePermuteHW %uint %uint_1 %uint_1 %uint_0\n"},
+      {"OpShuffleFillDownHW", "",
+       "%result = OpShuffleFillDownHW %uint %uint_1 %uint_0 %uint_1\n"},
+  };
+
+  for (const UnsupportedHwOpcodeCase& test_case : cases) {
+    SCOPED_TRACE(test_case.name);
+    const std::string text = std::string(R"(
 ; CHECK: extension-free HW lowering has no equivalent lowering for this HW opcode
 OpCapability Shader
 OpExtension "SPV_HW_neural_shader"
@@ -6629,19 +7412,21 @@ OpEntryPoint GLCompute %main "main"
 OpExecutionMode %main LocalSize 1 1 1
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
-%int = OpTypeInt 32 1
-%int_0 = OpConstant %int 0
-%int_1 = OpConstant %int 1
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+)") + test_case.declarations + R"(
 %main = OpFunction %void None %fn
 %entry = OpLabel
-OpBarrierArriveHW %int_0 %int_1
+)" + test_case.body + R"(
 OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
-      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+    SinglePassRunAndFail<HwLowerToStandardPass>(
+        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+        HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+  }
 }
 
 TEST_F(HwLowerToStandardTest, ExtensionFreeModeRejectsRelregOperand) {
@@ -6852,6 +7637,366 @@ OpFunctionEnd
   EXPECT_NE(std::string::npos, disassembly.find("OpSpecConstant %uint 6"));
   EXPECT_NE(std::string::npos, disassembly.find("OpConstant %uint 6"));
   EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %float %uint_6"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedWidthFloatVectorArithmeticPacked) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%hvec = OpTypeCooperativeVectorHW %half %uint_8
+%fvec = OpTypeCooperativeVectorHW %float %uint_8
+%h = OpUndef %hvec
+%f = OpUndef %fvec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%add = OpFAdd %fvec %h %f
+%sub = OpFSub %hvec %f %h
+%mul = OpFMul %fvec %h %h
+%div = OpFDiv %hvec %f %f
+%negate = OpFNegate %fvec %h
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(5u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(7u, CountSubstring(disassembly, "OpFConvert %v4"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFSub %v4half"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFDiv %v4half"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v4float"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedWidthFloatMatrixArithmeticScalar) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%hmat = OpTypeCooperativeMatrixHW %half %uint_2 %uint_3
+%fmat = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%h = OpUndef %hmat
+%f = OpUndef %fmat
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%add = OpFAdd %fmat %h %f
+%negate = OpFNegate %hmat %f
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %half"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %half"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedSignednessIntegerVectorArithmetic) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%uint_5 = OpConstant %uint 5
+%uvec = OpTypeCooperativeVectorHW %uint %uint_5
+%svec = OpTypeCooperativeVectorHW %int %uint_5
+%u = OpUndef %uvec
+%s = OpUndef %svec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%add = OpIAdd %uvec %s %u
+%sub = OpISub %svec %u %s
+%mul = OpIMul %uvec %s %s
+%div = OpSDiv %svec %u %s
+%negate = OpSNegate %uvec %s
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(5u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpIAdd"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpISub"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpIMul"), 0u);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSDiv %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %uint"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedSignednessIntegerMatrixArithmetic) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%umat = OpTypeCooperativeMatrixHW %uint %uint_2 %uint_3
+%smat = OpTypeCooperativeMatrixHW %int %uint_2 %uint_3
+%u = OpUndef %umat
+%s = OpUndef %smat
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%add = OpIAdd %umat %s %u
+%div = OpSDiv %smat %u %s
+%negate = OpSNegate %umat %s
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(3u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpIAdd"), 0u);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSDiv %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %uint"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedShiftWidthAndSignedness) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Int8
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%char = OpTypeInt 8 1
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%uint_5 = OpConstant %uint 5
+%shift_vec = OpTypeCooperativeVectorHW %char %uint_5
+%uvec = OpTypeCooperativeVectorHW %uint %uint_5
+%svec = OpTypeCooperativeVectorHW %int %uint_5
+%shift = OpUndef %shift_vec
+%u = OpUndef %uvec
+%s = OpUndef %svec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%logical = OpShiftRightLogical %uvec %s %shift
+%arithmetic = OpShiftRightArithmetic %svec %u %shift
+%left = OpShiftLeftLogical %uvec %s %shift
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(3u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightLogical %uint"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightArithmetic %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftLeftLogical %uint"));
+  EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %char %uint_5"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersMixedSignednessBitwiseOps) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%uint_5 = OpConstant %uint 5
+%uvec = OpTypeCooperativeVectorHW %uint %uint_5
+%svec = OpTypeCooperativeVectorHW %int %uint_5
+%u = OpUndef %uvec
+%s = OpUndef %svec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%or = OpBitwiseOr %uvec %s %u
+%xor = OpBitwiseXor %svec %u %s
+%and = OpBitwiseAnd %uvec %s %s
+%not = OpNot %svec %u
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseOr %uint"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseXor %int"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseAnd %uint"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpNot %int"));
+}
+
+TEST_F(HwLowerToStandardTest, LowersIntegerExtInstAcrossSignedness) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%uint_5 = OpConstant %uint 5
+%uvec = OpTypeCooperativeVectorHW %uint %uint_5
+%svec = OpTypeCooperativeVectorHW %int %uint_5
+%u = OpUndef %uvec
+%s = OpUndef %svec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%umin = OpExtInst %svec %glsl UMin %u %s
+%umax = OpExtInst %uvec %glsl UMax %s %u
+%uclamp = OpExtInst %svec %glsl UClamp %u %s %u
+%smin = OpExtInst %uvec %glsl SMin %s %u
+%smax = OpExtInst %svec %glsl SMax %u %s
+%sclamp = OpExtInst %uvec %glsl SClamp %s %u %s
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(6u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " UMin "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " UMax "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " UClamp "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " SMin "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " SMax "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " SClamp "));
+}
+
+TEST_F(HwLowerToStandardTest, RejectsMixedWidthUnsignedDivision) {
+  const std::string text = R"(
+; CHECK: OpUDiv requires matching HW integer component bit widths
+OpCapability Shader
+OpCapability Int16
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn_ty = OpTypeFunction %void
+%ushort = OpTypeInt 16 0
+%uint = OpTypeInt 32 0
+%uint_5 = OpConstant %uint 5
+%u16vec = OpTypeCooperativeVectorHW %ushort %uint_5
+%u32vec = OpTypeCooperativeVectorHW %uint %uint_5
+%u16 = OpUndef %u16vec
+%u32 = OpUndef %u32vec
+%main = OpFunction %void None %fn_ty
+%entry = OpLabel
+%div = OpUDiv %u32vec %u16 %u32
+OpReturn
+OpFunctionEnd
+)";
+
+  // The current validator deliberately accepts this HW form even though a
+  // standard OpUDiv requires matching operand/result types.  Refuse to guess
+  // whether narrowing occurs before or after division.
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
 }  // namespace
