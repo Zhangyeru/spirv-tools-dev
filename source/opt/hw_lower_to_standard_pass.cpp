@@ -16,11 +16,16 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <numeric>
 #include <string>
 #include <utility>
 
 #include "source/opt/basic_block.h"
 #include "source/opt/constants.h"
+#include "source/opt/decoration_manager.h"
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/instruction.h"
@@ -64,12 +69,11 @@ constexpr uint32_t kHwVectorStoreOffsetInIdx = 1;
 constexpr uint32_t kHwVectorStoreObjectInIdx = 2;
 constexpr uint32_t kHwVectorStoreMemoryOperandsInIdx = 3;
 
-constexpr uint32_t kDefaultMaxLoweredElements = 131072;
-constexpr uint32_t kDefaultMaxLoweredMatmulMacs = 65536;
 constexpr uint32_t kDefaultMatrixTileM = 2;
 constexpr uint32_t kDefaultMatrixTileN = 4;
 constexpr uint32_t kDefaultVectorMatmulTileN = 4;
 constexpr uint32_t kPackedVec4Width = 4;
+constexpr uint32_t kMaxCompositeConstituents = 65532;
 
 struct DirectVectorLoadCandidate {
   Instruction* source_load = nullptr;
@@ -221,8 +225,41 @@ bool IsNumericScalarType(const Instruction* type) {
           type->opcode() == spv::Op::OpTypeInt);
 }
 
+bool IsSupportedHwComponentType(const Instruction* type) {
+  if (!IsNumericScalarType(type) || type->NumInOperands() < 1) return false;
+
+  const uint32_t bit_width = type->GetSingleWordInOperand(0);
+  if (type->opcode() == spv::Op::OpTypeFloat) {
+    return bit_width == 16 || bit_width == 32;
+  }
+  return bit_width == 8 || bit_width == 16 || bit_width == 32;
+}
+
 bool IsFloatScalarType(const Instruction* type) {
   return type && type->opcode() == spv::Op::OpTypeFloat;
+}
+
+struct NumericScalarInfo {
+  bool valid = false;
+  bool is_float = false;
+  bool is_signed = false;
+  uint32_t width = 0;
+};
+
+NumericScalarInfo DescribeNumericScalarType(const Instruction* type) {
+  NumericScalarInfo result;
+  if (!type || type->NumInOperands() < 1) return result;
+  if (type->opcode() == spv::Op::OpTypeFloat) {
+    result.valid = true;
+    result.is_float = true;
+    result.width = type->GetSingleWordInOperand(0);
+  } else if (type->opcode() == spv::Op::OpTypeInt &&
+             type->NumInOperands() >= 2) {
+    result.valid = true;
+    result.width = type->GetSingleWordInOperand(0);
+    result.is_signed = type->GetSingleWordInOperand(1) != 0;
+  }
+  return result;
 }
 
 spv::Op GetScaleOpcode(const Instruction* type) {
@@ -232,6 +269,20 @@ spv::Op GetScaleOpcode(const Instruction* type) {
 }  // namespace
 
 Pass::Status HwLowerToStandardPass::Process() {
+  if (max_elements_ == 0 || max_matmul_macs_ == 0 ||
+      max_unrolled_elements_ == 0 || max_unrolled_matmul_macs_ == 0 ||
+      max_unrolled_elements_ > max_elements_ ||
+      max_unrolled_matmul_macs_ > max_matmul_macs_) {
+    ReportError(nullptr, "invalid HW lowering size configuration");
+    return Status::Failure;
+  }
+  // An instruction word count is 16-bit.  OpCompositeConstruct has three
+  // fixed words in addition to its constituents, so user-provided unroll
+  // thresholds must never force an unserializable aggregate instruction.
+  max_unrolled_elements_ =
+      std::min(max_unrolled_elements_, kMaxCompositeConstituents);
+  max_unrolled_matmul_macs_ =
+      std::min(max_unrolled_matmul_macs_, uint64_t(kMaxCompositeConstituents));
   matrix_types_.clear();
   vector_types_.clear();
   lowered_types_.clear();
@@ -244,6 +295,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   matmul_pattern_function_ids_.clear();
   generated_function_ids_.clear();
   read_only_generated_function_ids_.clear();
+  active_fp_fast_math_mode_ = 0;
 
   bool has_hw = false;
   get_module()->ForEachInst([this, &has_hw](Instruction* inst) {
@@ -261,9 +313,10 @@ Pass::Status HwLowerToStandardPass::Process() {
   }
 
   if (!CollectHwTypes()) return Status::Failure;
+  if (!LegalizeModule()) return Status::Failure;
+  if (!MaterializeLoweredTypes()) return Status::Failure;
   RecordOriginalHwValueTypes();
   if (!EliminateHwFunctionVariables()) return Status::Failure;
-  if (!LegalizeModule()) return Status::Failure;
   if (!PrepareMatmulPatternFunctions()) return Status::Failure;
 
   std::vector<Instruction*> to_kill;
@@ -325,10 +378,8 @@ bool HwLowerToStandardPass::CollectHwTypes() {
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
       Instruction* cols_def =
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(2));
-      if ((rows_def && (rows_def->opcode() == spv::Op::OpSpecConstant ||
-                        rows_def->opcode() == spv::Op::OpSpecConstantOp)) ||
-          (cols_def && (cols_def->opcode() == spv::Op::OpSpecConstant ||
-                        cols_def->opcode() == spv::Op::OpSpecConstantOp))) {
+      if ((rows_def && IsSpecConstantInst(rows_def->opcode())) ||
+          (cols_def && IsSpecConstantInst(cols_def->opcode()))) {
         ReportError(inst,
                     "HW cooperative matrix specialization-constant shape is "
                     "not supported");
@@ -342,47 +393,30 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       }
       const uint64_t element_count =
           static_cast<uint64_t>(info.rows) * static_cast<uint64_t>(info.cols);
-      if (element_count == 0 || element_count > kDefaultMaxLoweredElements) {
+      if (element_count == 0 || element_count > max_elements_) {
         ReportError(inst, "HW cooperative matrix shape is unsupported");
         return false;
       }
 
       Instruction* component_type =
           get_def_use_mgr()->GetDef(info.component_type_id);
-      if (!IsNumericScalarType(component_type)) {
-        ReportError(inst, "unsupported HW cooperative matrix component type");
+      if (!IsSupportedHwComponentType(component_type)) {
+        ReportError(inst,
+                    "HW cooperative matrix component type must be 16/32-bit "
+                    "floating-point or 8/16/32-bit integer");
         return false;
       }
 
       if (IsFloat16Type(info.component_type_id) &&
           ShouldUsePackedVec4(info.cols)) {
-        Instruction* insertion_point = inst;
         info.packed_f16vec4 = true;
         info.packed_cols = info.cols / kPackedVec4Width;
-        info.packed_vec4_type_id = GetOrCreateVectorType(
-            info.component_type_id, kPackedVec4Width, &insertion_point);
-        if (info.packed_vec4_type_id == 0) return false;
-        info.lowered_type_id = GetOrCreatePackedArrayType(
-            info.packed_vec4_type_id, info.rows * info.packed_cols,
-            insertion_point);
       } else if (IsFloat32Type(info.component_type_id) &&
                  ShouldUsePackedVec4(info.cols)) {
-        Instruction* insertion_point = inst;
         info.packed_f32vec4 = true;
         info.packed_cols = info.cols / kPackedVec4Width;
-        info.packed_vec4_type_id = GetOrCreateVectorType(
-            info.component_type_id, kPackedVec4Width, &insertion_point);
-        if (info.packed_vec4_type_id == 0) return false;
-        info.lowered_type_id = GetOrCreatePackedArrayType(
-            info.packed_vec4_type_id, info.rows * info.packed_cols,
-            insertion_point);
-      } else {
-        info.lowered_type_id = GetOrCreateArrayType(
-            info.component_type_id, static_cast<uint32_t>(element_count), inst);
       }
-      if (info.lowered_type_id == 0) return false;
       matrix_types_[info.type_id] = info;
-      lowered_types_[info.type_id] = info.lowered_type_id;
       continue;
     }
 
@@ -396,8 +430,7 @@ bool HwLowerToStandardPass::CollectHwTypes() {
     info.component_type_id = inst->GetSingleWordInOperand(0);
     Instruction* length_def =
         get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
-    if (length_def && (length_def->opcode() == spv::Op::OpSpecConstant ||
-                       length_def->opcode() == spv::Op::OpSpecConstantOp)) {
+    if (length_def && IsSpecConstantInst(length_def->opcode())) {
       ReportError(inst,
                   "HW cooperative vector specialization-constant shape is "
                   "not supported");
@@ -407,44 +440,87 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       ReportError(inst, "HW cooperative vector length must be constant");
       return false;
     }
-    if (info.length == 0 || info.length > kDefaultMaxLoweredElements) {
+    if (info.length == 0 || info.length > max_elements_) {
       ReportError(inst, "HW cooperative vector length is unsupported");
       return false;
     }
 
-    Instruction* component_type = get_def_use_mgr()->GetDef(info.component_type_id);
-    if (!IsNumericScalarType(component_type)) {
-      ReportError(inst, "unsupported HW cooperative vector component type");
+    Instruction* component_type =
+        get_def_use_mgr()->GetDef(info.component_type_id);
+    if (!IsSupportedHwComponentType(component_type)) {
+      ReportError(inst,
+                  "HW cooperative vector component type must be 16/32-bit "
+                  "floating-point or 8/16/32-bit integer");
       return false;
     }
 
     if (IsFloat16Type(info.component_type_id) &&
         ShouldUsePackedVec4(info.length)) {
-      Instruction* insertion_point = inst;
       info.packed_f16vec4 = true;
       info.packed_length = info.length / kPackedVec4Width;
-      info.packed_vec4_type_id = GetOrCreateVectorType(
-          info.component_type_id, kPackedVec4Width, &insertion_point);
-      if (info.packed_vec4_type_id == 0) return false;
-      info.lowered_type_id = GetOrCreatePackedArrayType(
-          info.packed_vec4_type_id, info.packed_length, insertion_point);
     } else if (IsFloat32Type(info.component_type_id) &&
                ShouldUsePackedVec4(info.length)) {
-      Instruction* insertion_point = inst;
       info.packed_f32vec4 = true;
       info.packed_length = info.length / kPackedVec4Width;
-      info.packed_vec4_type_id = GetOrCreateVectorType(
-          info.component_type_id, kPackedVec4Width, &insertion_point);
-      if (info.packed_vec4_type_id == 0) return false;
-      info.lowered_type_id = GetOrCreatePackedArrayType(
-          info.packed_vec4_type_id, info.packed_length, insertion_point);
-    } else {
-      info.lowered_type_id =
-          GetOrCreateArrayType(info.component_type_id, info.length, inst);
     }
-    if (info.lowered_type_id == 0) return false;
     vector_types_[info.type_id] = info;
-    lowered_types_[info.type_id] = info.lowered_type_id;
+  }
+
+  return true;
+}
+
+bool HwLowerToStandardPass::MaterializeLoweredTypes() {
+  // Materialize ordinary types only after every cooperative declaration and
+  // operation has passed read-only legality and limit analysis.  A rejected
+  // module must not be left partially rewritten.
+  std::vector<uint32_t> type_ids;
+  for (Instruction& inst : get_module()->types_values()) {
+    if (matrix_types_.count(inst.result_id()) ||
+        vector_types_.count(inst.result_id())) {
+      type_ids.push_back(inst.result_id());
+    }
+  }
+  for (uint32_t type_id : type_ids) {
+    auto matrix_entry = matrix_types_.find(type_id);
+    if (matrix_entry != matrix_types_.end()) {
+      MatrixTypeInfo& info = matrix_entry->second;
+      Instruction* insertion_point = get_def_use_mgr()->GetDef(info.type_id);
+      if (!insertion_point) return false;
+      if (IsPackedVec4(info)) {
+        info.packed_vec4_type_id = GetOrCreateVectorType(
+            info.component_type_id, kPackedVec4Width, &insertion_point);
+        if (info.packed_vec4_type_id == 0) return false;
+        info.lowered_type_id = GetOrCreatePackedArrayType(
+            info.packed_vec4_type_id, info.rows * info.packed_cols,
+            insertion_point);
+      } else {
+        info.lowered_type_id = GetOrCreateArrayType(
+            info.component_type_id, info.rows * info.cols, insertion_point);
+      }
+      if (info.lowered_type_id == 0) return false;
+      lowered_types_[info.type_id] = info.lowered_type_id;
+      continue;
+    }
+
+    auto vector_entry = vector_types_.find(type_id);
+    if (vector_entry != vector_types_.end()) {
+      VectorTypeInfo& info = vector_entry->second;
+      Instruction* insertion_point = get_def_use_mgr()->GetDef(info.type_id);
+      if (!insertion_point) return false;
+      if (IsPackedVec4(info)) {
+        info.packed_vec4_type_id = GetOrCreateVectorType(
+            info.component_type_id, kPackedVec4Width, &insertion_point);
+        if (info.packed_vec4_type_id == 0) return false;
+        info.lowered_type_id = GetOrCreatePackedArrayType(
+            info.packed_vec4_type_id, info.packed_length, insertion_point);
+      } else {
+        info.lowered_type_id = GetOrCreateArrayType(
+            info.component_type_id, info.length, insertion_point);
+      }
+      if (info.lowered_type_id == 0) return false;
+      lowered_types_[info.type_id] = info.lowered_type_id;
+      continue;
+    }
   }
 
   return true;
@@ -493,21 +569,33 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
     std::vector<Instruction*> var_loads;
     BasicBlock* block = nullptr;
     bool spans_multiple_blocks = false;
+    bool has_non_forwardable_user = false;
 
     get_def_use_mgr()->ForEachUser(var, [&](Instruction* user) {
+      if (is_ignorable_user(user)) return;
       BasicBlock* user_block = context()->get_instr_block(user);
-      if (!user_block) return;
+      if (!user_block) {
+        has_non_forwardable_user = true;
+        return;
+      }
       if (!block) {
         block = user_block;
       } else if (block != user_block) {
         spans_multiple_blocks = true;
       }
-      if (user->opcode() == spv::Op::OpStore &&
+      if (user->opcode() == spv::Op::OpStore && user->NumInOperands() == 2 &&
           user->GetSingleWordInOperand(0) == var_id) {
         var_stores.push_back(user);
       } else if (user->opcode() == spv::Op::OpLoad &&
+                 user->NumInOperands() == 1 &&
                  user->GetSingleWordInOperand(0) == var_id) {
         var_loads.push_back(user);
+      } else {
+        // Derived pointers may alias a later direct load, and memory operands
+        // such as Volatile must not be dropped by value forwarding.  Only a
+        // variable whose complete non-metadata use set is plain direct
+        // stores/loads is eligible.
+        has_non_forwardable_user = true;
       }
     });
 
@@ -515,8 +603,8 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
     // Across blocks (especially loop headers/backedges), program order is not
     // dominance order and replacing a load with the textually preceding store
     // would break loop-carried cooperative values.
-    if (var_stores.empty() || var_loads.empty() || !block ||
-        spans_multiple_blocks) {
+    if (has_non_forwardable_user || var_stores.empty() || var_loads.empty() ||
+        !block || spans_multiple_blocks) {
       continue;
     }
 
@@ -648,8 +736,182 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
 
 bool HwLowerToStandardPass::LegalizeModule() {
   bool ok = true;
-  get_module()->ForEachInst([this, &ok](Instruction* inst) {
+  auto pair_value_legal = [this](uint32_t value_id) {
+    Instruction* value = get_def_use_mgr()->GetDef(value_id);
+    Instruction* type =
+        value ? get_def_use_mgr()->GetDef(value->type_id()) : nullptr;
+    if (!type || type->opcode() != spv::Op::OpTypeVector ||
+        type->NumInOperands() < 2 || type->GetSingleWordInOperand(1) < 2) {
+      return false;
+    }
+    Instruction* component =
+        get_def_use_mgr()->GetDef(type->GetSingleWordInOperand(0));
+    return component && component->NumInOperands() >= 1 &&
+           ((component->opcode() == spv::Op::OpTypeInt &&
+             component->GetSingleWordInOperand(0) == 32) ||
+            (component->opcode() == spv::Op::OpTypeFloat &&
+             component->GetSingleWordInOperand(0) == 32));
+  };
+  auto integer_value_legal = [this](uint32_t value_id) {
+    Instruction* value = get_def_use_mgr()->GetDef(value_id);
+    Instruction* type =
+        value ? get_def_use_mgr()->GetDef(value->type_id()) : nullptr;
+    return type && type->opcode() == spv::Op::OpTypeInt &&
+           type->NumInOperands() >= 2 && type->GetSingleWordInOperand(0) != 0 &&
+           type->GetSingleWordInOperand(0) <= 64;
+  };
+  auto pointer_legal = [this](uint32_t pointer_id, uint32_t component_type_id) {
+    Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+    Instruction* pointer_type =
+        pointer ? get_def_use_mgr()->GetDef(pointer->type_id()) : nullptr;
+    if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+        pointer_type->NumInOperands() < 2) {
+      return false;
+    }
+    Instruction* pointee =
+        get_def_use_mgr()->GetDef(pointer_type->GetSingleWordInOperand(1));
+    return pointee &&
+           (pointee->opcode() == spv::Op::OpTypeArray ||
+            pointee->opcode() == spv::Op::OpTypeRuntimeArray) &&
+           pointee->NumInOperands() >= 1 &&
+           pointee->GetSingleWordInOperand(0) == component_type_id;
+  };
+  auto memory_access_legal =
+      [this](Instruction* inst, uint32_t first_memory_operand,
+             uint32_t pointer_id, uint32_t component_type_id) {
+        std::vector<Operand> normalized;
+        return NormalizeMemoryOperandsForAccess(
+            pointer_id, component_type_id,
+            CopyMemoryOperands(inst, first_memory_operand), &normalized);
+      };
+  auto matmul_types_legal = [this](uint32_t result_type_id, uint32_t a_type_id,
+                                   uint32_t b_type_id,
+                                   uint32_t accumulator_type_id) {
+    if (result_type_id != accumulator_type_id) return false;
+    const NumericScalarInfo result =
+        DescribeNumericScalarType(get_def_use_mgr()->GetDef(result_type_id));
+    const NumericScalarInfo a =
+        DescribeNumericScalarType(get_def_use_mgr()->GetDef(a_type_id));
+    const NumericScalarInfo b =
+        DescribeNumericScalarType(get_def_use_mgr()->GetDef(b_type_id));
+    if (!result.valid || !a.valid || !b.valid ||
+        result.is_float != a.is_float || result.is_float != b.is_float) {
+      return false;
+    }
+    return result.width >= a.width && result.width >= b.width;
+  };
+  get_module()->ForEachInst([this, &ok, &pair_value_legal, &integer_value_legal,
+                             &pointer_legal, &memory_access_legal,
+                             &matmul_types_legal](Instruction* inst) {
     if (!ok) return;
+
+    if (inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT &&
+        IsHwType(inst->type_id())) {
+      const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
+      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+      uint64_t lowered_constituent_count = 0;
+      if (matrix) {
+        lowered_constituent_count =
+            static_cast<uint64_t>(matrix->rows) * matrix->cols;
+        if (IsPackedVec4(*matrix))
+          lowered_constituent_count /= kPackedVec4Width;
+      } else if (vector) {
+        lowered_constituent_count = vector->length;
+        if (IsPackedVec4(*vector))
+          lowered_constituent_count /= kPackedVec4Width;
+      }
+      if (lowered_constituent_count > kMaxCompositeConstituents) {
+        ReportError(
+            inst,
+            "HW replicated constant exceeds the SPIR-V composite operand "
+            "limit after lowering");
+        ok = false;
+        return;
+      }
+    }
+
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW ||
+        inst->opcode() == spv::Op::OpCooperativeMatrixStoreHW) {
+      const bool is_load = inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW;
+      const uint32_t minimum_operands = is_load ? 4 : 5;
+      const uint32_t pointer_index =
+          is_load ? kHwMatrixLoadPointerInIdx : kHwMatrixStorePointerInIdx;
+      const uint32_t shape_index =
+          is_load ? kHwMatrixLoadShapeInIdx : kHwMatrixStoreShapeInIdx;
+      const uint32_t offset_index =
+          is_load ? kHwMatrixLoadOffsetInIdx : kHwMatrixStoreOffsetInIdx;
+      const uint32_t layout_index =
+          is_load ? kHwMatrixLoadLayoutInIdx : kHwMatrixStoreLayoutInIdx;
+      const uint32_t memory_index = is_load ? kHwMatrixLoadMemoryOperandsInIdx
+                                            : kHwMatrixStoreMemoryOperandsInIdx;
+      const MatrixTypeInfo* info =
+          is_load ? GetMatrixType(inst->type_id()) : nullptr;
+      if (!is_load && inst->NumInOperands() > kHwMatrixStoreObjectInIdx) {
+        info = GetMatrixTypeForValue(get_def_use_mgr()->GetDef(
+            inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx)));
+      }
+      uint32_t layout = 0;
+      if (inst->NumInOperands() < minimum_operands || !info ||
+          !pair_value_legal(inst->GetSingleWordInOperand(shape_index)) ||
+          !pair_value_legal(inst->GetSingleWordInOperand(offset_index)) ||
+          !GetConstantU32(inst->GetSingleWordInOperand(layout_index),
+                          &layout) ||
+          layout > 1 ||
+          !pointer_legal(inst->GetSingleWordInOperand(pointer_index),
+                         info->component_type_id) ||
+          !memory_access_legal(inst, memory_index,
+                               inst->GetSingleWordInOperand(pointer_index),
+                               info->component_type_id)) {
+        ReportError(inst,
+                    "HW cooperative matrix memory access cannot be lowered");
+        ok = false;
+        return;
+      }
+    }
+
+    if (inst->opcode() == spv::Op::OpCooperativeVectorLoadHW ||
+        inst->opcode() == spv::Op::OpCooperativeVectorStoreHW) {
+      const bool is_load = inst->opcode() == spv::Op::OpCooperativeVectorLoadHW;
+      const uint32_t minimum_operands = is_load ? 2 : 3;
+      const uint32_t pointer_index =
+          is_load ? kHwVectorLoadPointerInIdx : kHwVectorStorePointerInIdx;
+      const uint32_t offset_index =
+          is_load ? kHwVectorLoadOffsetInIdx : kHwVectorStoreOffsetInIdx;
+      const uint32_t memory_index = is_load ? kHwVectorLoadMemoryOperandsInIdx
+                                            : kHwVectorStoreMemoryOperandsInIdx;
+      const VectorTypeInfo* info =
+          is_load ? GetVectorType(inst->type_id()) : nullptr;
+      if (!is_load && inst->NumInOperands() > kHwVectorStoreObjectInIdx) {
+        Instruction* object = get_def_use_mgr()->GetDef(
+            inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
+        info = object ? GetVectorType(object->type_id()) : nullptr;
+      }
+      if (inst->NumInOperands() < minimum_operands || !info ||
+          !integer_value_legal(inst->GetSingleWordInOperand(offset_index)) ||
+          !pointer_legal(inst->GetSingleWordInOperand(pointer_index),
+                         info->component_type_id) ||
+          !memory_access_legal(inst, memory_index,
+                               inst->GetSingleWordInOperand(pointer_index),
+                               info->component_type_id)) {
+        ReportError(inst,
+                    "HW cooperative vector memory access cannot be lowered");
+        ok = false;
+        return;
+      }
+    }
+
+    if (inst->opcode() == spv::Op::OpCooperativeMatrixLengthHW) {
+      Instruction* result_type = get_def_use_mgr()->GetDef(inst->type_id());
+      if (inst->NumInOperands() != 1 ||
+          !GetMatrixType(inst->GetSingleWordInOperand(0)) || !result_type ||
+          result_type->opcode() != spv::Op::OpTypeInt ||
+          result_type->NumInOperands() < 2 ||
+          result_type->GetSingleWordInOperand(0) != 32) {
+        ReportError(inst, "invalid OpCooperativeMatrixLengthHW");
+        ok = false;
+        return;
+      }
+    }
 
     if (inst->opcode() == spv::Op::OpTypePointer &&
         TypeContainsHw(inst->GetSingleWordInOperand(1))) {
@@ -708,13 +970,11 @@ bool HwLowerToStandardPass::LegalizeModule() {
         ok = false;
         return;
       }
-      if (!IsFloatScalarType(get_def_use_mgr()->GetDef(result->component_type_id)) ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(a->component_type_id)) ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(b->component_type_id)) ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(c->component_type_id))) {
+      if (!matmul_types_legal(result->component_type_id, a->component_type_id,
+                              b->component_type_id, c->component_type_id)) {
         ReportError(inst,
-                    "HW cooperative matrix multiply requires floating-point "
-                    "component types");
+                    "HW cooperative matrix multiply component types are "
+                    "incompatible");
         ok = false;
         return;
       }
@@ -729,7 +989,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       const uint64_t mac_count = static_cast<uint64_t>(result->rows) *
                                  static_cast<uint64_t>(result->cols) *
                                  static_cast<uint64_t>(a->cols);
-      if (mac_count > kDefaultMaxLoweredMatmulMacs) {
+      if (mac_count > max_matmul_macs_) {
         ReportError(inst,
                     "HW cooperative matrix multiply expansion is too large");
         ok = false;
@@ -761,16 +1021,18 @@ bool HwLowerToStandardPass::LegalizeModule() {
             inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
         bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
       }
+      const uint32_t accumulator_type_id = has_bias && bias
+                                               ? bias->component_type_id
+                                           : result ? result->component_type_id
+                                                    : 0;
       if (!result || !input || !matrix ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(result->component_type_id)) ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(input->component_type_id)) ||
-          !IsFloatScalarType(get_def_use_mgr()->GetDef(matrix->component_type_id)) ||
-          (has_bias &&
-           (!bias || !IsFloatScalarType(
-                         get_def_use_mgr()->GetDef(bias->component_type_id))))) {
+          !matmul_types_legal(result ? result->component_type_id : 0,
+                              input ? input->component_type_id : 0,
+                              matrix ? matrix->component_type_id : 0,
+                              accumulator_type_id)) {
         ReportError(inst,
-                    "HW cooperative vector matrix multiply requires "
-                    "floating-point component types");
+                    "HW cooperative vector matrix multiply component types "
+                    "are incompatible");
         ok = false;
         return;
       }
@@ -785,7 +1047,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       }
       const uint64_t mac_count = static_cast<uint64_t>(result->length) *
                                  static_cast<uint64_t>(input->length);
-      if (mac_count > kDefaultMaxLoweredMatmulMacs) {
+      if (mac_count > max_matmul_macs_) {
         ReportError(inst,
                     "HW cooperative vector matrix multiply expansion is too "
                     "large");
@@ -891,8 +1153,17 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
   for (Instruction* inst : vector_stores) {
     if (!inst || inst->IsNop()) continue;
+    Instruction* object = get_def_use_mgr()->GetDef(
+        inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
+    std::vector<Instruction*> chain;
+    Instruction* matmul = TraceFunctionValueSource(object, inst, &chain);
+    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+    active_fp_fast_math_mode_ =
+        matmul ? GetFPFastMathMode(matmul->result_id()) : 0;
     bool handled = false;
-    if (!TryLowerFusedVectorMatmulStore(inst, &handled)) return false;
+    const bool ok = TryLowerFusedVectorMatmulStore(inst, &handled);
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    if (!ok) return false;
   }
 
   std::vector<Instruction*> matrix_stores;
@@ -903,8 +1174,17 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
   for (Instruction* inst : matrix_stores) {
     if (!inst || inst->IsNop()) continue;
+    Instruction* object = get_def_use_mgr()->GetDef(
+        inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx));
+    std::vector<Instruction*> chain;
+    Instruction* matmul = TraceFunctionValueSource(object, inst, &chain);
+    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+    active_fp_fast_math_mode_ =
+        matmul ? GetFPFastMathMode(matmul->result_id()) : 0;
     bool handled = false;
-    if (!TryLowerFusedMatrixMatmulStore(inst, &handled)) return false;
+    const bool ok = TryLowerFusedMatrixMatmulStore(inst, &handled);
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    if (!ok) return false;
   }
 
   std::vector<Instruction*> direct_matmuls;
@@ -921,6 +1201,8 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
   for (Instruction* inst : direct_matmuls) {
     if (!inst || inst->IsNop()) continue;
+    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+    active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
     bool handled = false;
     bool ok = true;
     switch (inst->opcode()) {
@@ -936,6 +1218,8 @@ bool HwLowerToStandardPass::LowerHwInstructions(
       default:
         break;
     }
+    if (handled) RemoveFPFastMathMode(inst->result_id());
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
     if (!ok) return false;
   }
 
@@ -1023,6 +1307,10 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
 
   for (Instruction* inst : worklist) {
+    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+    const uint32_t source_fast_math_mode =
+        inst ? GetFPFastMathMode(inst->result_id()) : 0;
+    active_fp_fast_math_mode_ = source_fast_math_mode;
     bool ok = true;
     switch (inst->opcode()) {
       case spv::Op::OpCooperativeMatrixLoadHW:
@@ -1101,6 +1389,10 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         }
         break;
     }
+    if (ok && source_fast_math_mode != 0) {
+      RemoveFPFastMathMode(inst->result_id());
+    }
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
     if (!ok) return false;
   }
 
@@ -1204,10 +1496,28 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwMatrixLoadMemoryOperandsInIdx);
 
+  const uint32_t element_count = info->rows * info->cols;
+  if (element_count > max_unrolled_elements_) {
+    uint32_t result_id = 0;
+    if (!BuildScalarMemoryLoop(
+            inst, info->lowered_type_id, info->component_type_id, element_count,
+            pointer_id, 0, shape_id, offset_id, info->cols, layout, true,
+            info->packed_vec4_type_id, memory_operands, &result_id)) {
+      return false;
+    }
+    inst->SetOpcode(spv::Op::OpCopyObject);
+    inst->SetResultType(info->lowered_type_id);
+    inst->SetInOperands({IdOperand(result_id)});
+    context()->UpdateDefUse(inst);
+    return true;
+  }
+
   if (IsPackedVec4(*info)) {
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
-        CanCapturePointer(pointer_id)) {
+        CanCapturePointer(pointer_id) &&
+        MemoryAccessOperandsAreMovable(inst,
+                                       kHwMatrixLoadMemoryOperandsInIdx)) {
       const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
       if (pointer_type_id == 0) return false;
 
@@ -1309,6 +1619,18 @@ bool HwLowerToStandardPass::LowerMatrixStore(
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwMatrixStoreMemoryOperandsInIdx);
 
+  const uint32_t element_count = info->rows * info->cols;
+  if (element_count > max_unrolled_elements_) {
+    if (!BuildScalarMemoryLoop(
+            inst, info->lowered_type_id, info->component_type_id, element_count,
+            pointer_id, object_id, shape_id, offset_id, info->cols, layout,
+            true, info->packed_vec4_type_id, memory_operands, nullptr)) {
+      return false;
+    }
+    to_kill->push_back(inst);
+    return true;
+  }
+
   if (IsPackedVec4(*info)) {
     bool fused = false;
     if (!TryLowerFusedMatrixMatmulStore(inst, &fused)) return false;
@@ -1316,7 +1638,9 @@ bool HwLowerToStandardPass::LowerMatrixStore(
 
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
-        CanCapturePointer(pointer_id)) {
+        CanCapturePointer(pointer_id) &&
+        MemoryAccessOperandsAreMovable(inst,
+                                       kHwMatrixStoreMemoryOperandsInIdx)) {
       const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
       if (pointer_type_id == 0) return false;
 
@@ -1346,7 +1670,8 @@ bool HwLowerToStandardPass::LowerMatrixStore(
           if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) {
             return false;
           }
-          if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) {
+          if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
+                        info->component_type_id)) {
             return false;
           }
         }
@@ -1367,7 +1692,8 @@ bool HwLowerToStandardPass::LowerMatrixStore(
       const uint32_t elem_ptr_id = BuildElementAccess(
           &builder, inst, pointer_id, info->component_type_id, index_id);
       if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) return false;
-      if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) {
+      if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
+                    info->component_type_id)) {
         return false;
       }
     }
@@ -1378,6 +1704,8 @@ bool HwLowerToStandardPass::LowerMatrixStore(
 }
 
 bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
+  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+  active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
@@ -1390,13 +1718,21 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c) {
     ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
     return false;
   }
 
-  if (CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)) {
-    return LowerMatrixMulAddPackedVec4(inst);
-  }
-  return LowerMatrixMulAddScalarFallback(inst);
+  const uint64_t mac_count = static_cast<uint64_t>(result->rows) *
+                             static_cast<uint64_t>(result->cols) *
+                             static_cast<uint64_t>(a->cols);
+  bool lowered = mac_count > max_unrolled_matmul_macs_
+                     ? LowerMatrixMulAddWithLoop(inst)
+                     : (CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)
+                            ? LowerMatrixMulAddPackedVec4(inst)
+                            : LowerMatrixMulAddScalarFallback(inst));
+  if (lowered) RemoveFPFastMathMode(inst->result_id());
+  active_fp_fast_math_mode_ = saved_fast_math_mode;
+  return lowered;
 }
 
 bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
@@ -1455,7 +1791,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(
   const uint32_t a_id = a_inst->result_id();
   const uint32_t b_id = b_inst->result_id();
   const uint32_t c_id = c_inst->result_id();
-  const uint32_t float_type_id = result->component_type_id;
+  const uint32_t accumulator_type_id = result->component_type_id;
 
   for (uint32_t row0 = 0; row0 < result->rows; row0 += kDefaultMatrixTileM) {
     const uint32_t tile_m = std::min(kDefaultMatrixTileM, result->rows - row0);
@@ -1493,11 +1829,11 @@ bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(
 
         for (uint32_t i = 0; i < tile_m; ++i) {
           for (uint32_t j = 0; j < tile_n; ++j) {
-            const uint32_t fma =
-                BuildFma(&builder, float_type_id, a_elems[i], b_elems[j],
-                         acc[i * tile_n + j]);
-            if (fma == 0) return false;
-            acc[i * tile_n + j] = fma;
+            const uint32_t accumulated = BuildMatmulAccumulate(
+                &builder, accumulator_type_id, a->component_type_id, a_elems[i],
+                b->component_type_id, b_elems[j], acc[i * tile_n + j]);
+            if (accumulated == 0) return false;
+            acc[i * tile_n + j] = accumulated;
           }
         }
       }
@@ -1542,6 +1878,274 @@ bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(
   return true;
 }
 
+bool HwLowerToStandardPass::LowerMatrixMulAddWithLoop(Instruction* inst) {
+  const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
+  Instruction* a_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
+  Instruction* b_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kHwMatrixMulAddBInIdx));
+  Instruction* c_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kHwMatrixMulAddCInIdx));
+  const MatrixTypeInfo* a = GetMatrixTypeForValue(a_inst);
+  const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
+  const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
+  BasicBlock* preheader_block = context()->get_instr_block(inst);
+  Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
+  if (!result || !a || !b || !c || !function) return false;
+
+  const uint32_t a_pointer_type_id =
+      GetOrCreatePointerType(a->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t b_pointer_type_id =
+      GetOrCreatePointerType(b->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t c_pointer_type_id =
+      GetOrCreatePointerType(c->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t result_pointer_type_id = GetOrCreatePointerType(
+      result->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t accumulator_pointer_type_id = GetOrCreatePointerType(
+      result->component_type_id, spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_id = GetOrCreateUIntConstant(1);
+  const uint32_t output_count_id =
+      GetOrCreateUIntConstant(result->rows * result->cols);
+  const uint32_t result_cols_id = GetOrCreateUIntConstant(result->cols);
+  const uint32_t inner_count_id = GetOrCreateUIntConstant(a->cols);
+  const uint32_t result_zero_id = GetOrCreateZero(result->lowered_type_id);
+  if (a_pointer_type_id == 0 || b_pointer_type_id == 0 ||
+      c_pointer_type_id == 0 || result_pointer_type_id == 0 ||
+      accumulator_pointer_type_id == 0 || uint_type_id == 0 ||
+      uint_pointer_type_id == 0 || bool_type_id == 0 || zero_id == 0 ||
+      one_id == 0 || output_count_id == 0 || result_cols_id == 0 ||
+      inner_count_id == 0 || result_zero_id == 0) {
+    return false;
+  }
+
+  Instruction* a_variable = AddFunctionVariable(function, a_pointer_type_id);
+  Instruction* b_variable = AddFunctionVariable(function, b_pointer_type_id);
+  Instruction* c_variable = AddFunctionVariable(function, c_pointer_type_id);
+  Instruction* result_variable =
+      AddFunctionVariable(function, result_pointer_type_id);
+  Instruction* output_index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* k_variable = AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* accumulator_variable =
+      AddFunctionVariable(function, accumulator_pointer_type_id);
+  if (!a_variable || !b_variable || !c_variable || !result_variable ||
+      !output_index_variable || !k_variable || !accumulator_variable) {
+    return false;
+  }
+
+  auto split_iter = preheader_block->begin();
+  while (split_iter != preheader_block->end() && &*split_iter != inst) {
+    ++split_iter;
+  }
+  if (split_iter == preheader_block->end()) return false;
+  std::unique_ptr<Instruction> enclosing_loop_merge;
+  if (Instruction* loop_merge = preheader_block->GetLoopMergeInst()) {
+    enclosing_loop_merge.reset(loop_merge->Clone(context()));
+  }
+
+  std::array<uint32_t, 8> labels;
+  for (uint32_t& label : labels) {
+    label = TakeNextId();
+    if (label == 0) return false;
+  }
+  const uint32_t merge_label = labels[0];
+  const uint32_t outer_header_label = labels[1];
+  const uint32_t outer_body_label = labels[2];
+  const uint32_t k_header_label = labels[3];
+  const uint32_t k_body_label = labels[4];
+  const uint32_t k_continue_label = labels[5];
+  const uint32_t k_merge_label = labels[6];
+  const uint32_t outer_continue_label = labels[7];
+  BasicBlock* merge_block =
+      preheader_block->SplitBasicBlock(context(), merge_label, split_iter);
+  BasicBlock* outer_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_header_label)),
+      preheader_block);
+  BasicBlock* outer_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_body_label)),
+      outer_header);
+  BasicBlock* k_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_header_label)), outer_body);
+  BasicBlock* k_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_body_label)), k_header);
+  BasicBlock* k_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_continue_label)), k_body);
+  BasicBlock* k_merge = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_merge_label)), k_continue);
+  BasicBlock* outer_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_continue_label)),
+      k_merge);
+  if (!merge_block || !outer_header || !outer_body || !k_header || !k_body ||
+      !k_continue || !k_merge || !outer_continue) {
+    return false;
+  }
+  if (enclosing_loop_merge) {
+    Instruction* moved_loop_merge = merge_block->GetLoopMergeInst();
+    if (!moved_loop_merge) return false;
+    context()->KillInst(moved_loop_merge);
+  }
+
+  InstructionBuilder preheader_builder(
+      context(), preheader_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!preheader_builder.AddStore(a_variable->result_id(),
+                                  a_inst->result_id()) ||
+      !preheader_builder.AddStore(b_variable->result_id(),
+                                  b_inst->result_id()) ||
+      !preheader_builder.AddStore(c_variable->result_id(),
+                                  c_inst->result_id()) ||
+      !preheader_builder.AddStore(result_variable->result_id(),
+                                  result_zero_id) ||
+      !preheader_builder.AddStore(output_index_variable->result_id(),
+                                  zero_id) ||
+      (enclosing_loop_merge &&
+       !preheader_builder.AddInstruction(std::move(enclosing_loop_merge))) ||
+      !preheader_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_header_builder(
+      context(), outer_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* output_index = outer_header_builder.AddLoad(
+      uint_type_id, output_index_variable->result_id());
+  Instruction* outer_condition =
+      output_index ? outer_header_builder.AddBinaryOp(
+                         bool_type_id, spv::Op::OpULessThan,
+                         output_index->result_id(), output_count_id)
+                   : nullptr;
+  if (!output_index || !outer_condition ||
+      !outer_header_builder.AddLoopMerge(merge_label, outer_continue_label) ||
+      !outer_header_builder.AddConditionalBranch(
+          outer_condition->result_id(), outer_body_label, merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_body_builder(
+      context(), outer_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t initial_accumulator = BuildLogicalAggregateLoad(
+      &outer_body_builder, c_variable->result_id(), c->component_type_id,
+      c->packed_vec4_type_id, output_index->result_id());
+  if (initial_accumulator == 0 ||
+      !outer_body_builder.AddStore(accumulator_variable->result_id(),
+                                   initial_accumulator) ||
+      !outer_body_builder.AddStore(k_variable->result_id(), zero_id) ||
+      !outer_body_builder.AddBranch(k_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_header_builder(
+      context(), k_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* k =
+      k_header_builder.AddLoad(uint_type_id, k_variable->result_id());
+  Instruction* k_condition =
+      k ? k_header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                       k->result_id(), inner_count_id)
+        : nullptr;
+  if (!k || !k_condition ||
+      !k_header_builder.AddLoopMerge(k_merge_label, k_continue_label) ||
+      !k_header_builder.AddConditionalBranch(k_condition->result_id(),
+                                             k_body_label, k_merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_body_builder(
+      context(), k_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* row = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpUDiv, output_index->result_id(), result_cols_id);
+  Instruction* col = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpUMod, output_index->result_id(), result_cols_id);
+  Instruction* a_row_base =
+      row ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIMul,
+                                       row->result_id(), inner_count_id)
+          : nullptr;
+  Instruction* a_index =
+      a_row_base
+          ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                       a_row_base->result_id(), k->result_id())
+          : nullptr;
+  Instruction* b_row_base = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIMul, k->result_id(), result_cols_id);
+  Instruction* b_index = b_row_base && col
+                             ? k_body_builder.AddBinaryOp(
+                                   uint_type_id, spv::Op::OpIAdd,
+                                   b_row_base->result_id(), col->result_id())
+                             : nullptr;
+  if (!row || !col || !a_index || !b_index) return false;
+  const uint32_t a_value = BuildLogicalAggregateLoad(
+      &k_body_builder, a_variable->result_id(), a->component_type_id,
+      a->packed_vec4_type_id, a_index->result_id());
+  const uint32_t b_value = BuildLogicalAggregateLoad(
+      &k_body_builder, b_variable->result_id(), b->component_type_id,
+      b->packed_vec4_type_id, b_index->result_id());
+  Instruction* accumulator = k_body_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  const uint32_t accumulated =
+      accumulator ? BuildMatmulAccumulate(
+                        &k_body_builder, result->component_type_id,
+                        a->component_type_id, a_value, b->component_type_id,
+                        b_value, accumulator->result_id())
+                  : 0;
+  if (accumulated == 0 ||
+      !k_body_builder.AddStore(accumulator_variable->result_id(),
+                               accumulated) ||
+      !k_body_builder.AddBranch(k_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_continue_builder(
+      context(), k_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_k = k_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, k->result_id(), one_id);
+  if (!next_k ||
+      !k_continue_builder.AddStore(k_variable->result_id(),
+                                   next_k->result_id()) ||
+      !k_continue_builder.AddBranch(k_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_merge_builder(
+      context(), k_merge,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* final_accumulator = k_merge_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  if (!final_accumulator ||
+      !BuildLogicalAggregateStore(
+          &k_merge_builder, result_variable->result_id(),
+          result->component_type_id, result->packed_vec4_type_id,
+          output_index->result_id(), final_accumulator->result_id()) ||
+      !k_merge_builder.AddBranch(outer_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_continue_builder(
+      context(), outer_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_output = outer_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, output_index->result_id(), one_id);
+  if (!next_output ||
+      !outer_continue_builder.AddStore(output_index_variable->result_id(),
+                                       next_output->result_id()) ||
+      !outer_continue_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  inst->SetOpcode(spv::Op::OpLoad);
+  inst->SetResultType(result->lowered_type_id);
+  inst->SetInOperands({IdOperand(result_variable->result_id())});
+  context()->UpdateDefUse(inst);
+  return true;
+}
+
 bool HwLowerToStandardPass::LowerMatrixLength(
     Instruction* inst, std::vector<Instruction*>* to_kill) {
   if (inst->NumInOperands() < 1) {
@@ -1565,6 +2169,15 @@ bool HwLowerToStandardPass::LowerMatrixLength(
 }
 
 bool HwLowerToStandardPass::LowerMatrixReduce(Instruction* inst) {
+  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+  active_fp_fast_math_mode_ = inst ? GetFPFastMathMode(inst->result_id()) : 0;
+  const bool lowered = LowerMatrixReduceImpl(inst);
+  if (lowered && inst) RemoveFPFastMathMode(inst->result_id());
+  active_fp_fast_math_mode_ = saved_fast_math_mode;
+  return lowered;
+}
+
+bool HwLowerToStandardPass::LowerMatrixReduceImpl(Instruction* inst) {
   if (!inst || inst->NumInOperands() != 3) {
     ReportError(inst, "invalid OpCooperativeMatrixReduceHW");
     return false;
@@ -1585,6 +2198,10 @@ bool HwLowerToStandardPass::LowerMatrixReduce(Instruction* inst) {
       combine_op > 2) {
     ReportError(inst, "invalid OpCooperativeMatrixReduceHW");
     return false;
+  }
+
+  if (result->rows * result->cols > max_unrolled_elements_) {
+    return LowerMatrixReduceWithLoop(inst, reduce_axis, combine_op);
   }
 
   InstructionBuilder builder(
@@ -1629,6 +2246,347 @@ bool HwLowerToStandardPass::LowerMatrixReduce(Instruction* inst) {
   return RebuildMatrixFromScalars(inst, *result, scalar_ids);
 }
 
+bool HwLowerToStandardPass::LowerMatrixReduceWithLoop(Instruction* inst,
+                                                      uint32_t reduce_axis,
+                                                      uint32_t combine_op) {
+  const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
+  Instruction* input =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  const MatrixTypeInfo* source = GetMatrixTypeForValue(input);
+  BasicBlock* preheader_block = context()->get_instr_block(inst);
+  Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
+  if (!result || !source || !input || !function) return false;
+
+  const uint32_t source_pointer_type_id = GetOrCreatePointerType(
+      source->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t result_pointer_type_id = GetOrCreatePointerType(
+      result->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t accumulator_pointer_type_id = GetOrCreatePointerType(
+      result->component_type_id, spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_id = GetOrCreateUIntConstant(1);
+  const uint32_t cols_id = GetOrCreateUIntConstant(result->cols);
+  const uint32_t output_count_id =
+      GetOrCreateUIntConstant(reduce_axis == 0 ? result->rows : result->cols);
+  const uint32_t reduce_count_id =
+      GetOrCreateUIntConstant(reduce_axis == 0 ? result->cols : result->rows);
+  const uint32_t broadcast_count_id =
+      GetOrCreateUIntConstant(reduce_axis == 0 ? result->cols : result->rows);
+  const uint32_t result_zero_id = GetOrCreateZero(result->lowered_type_id);
+  if (source_pointer_type_id == 0 || result_pointer_type_id == 0 ||
+      accumulator_pointer_type_id == 0 || uint_type_id == 0 ||
+      uint_pointer_type_id == 0 || bool_type_id == 0 || zero_id == 0 ||
+      one_id == 0 || cols_id == 0 || output_count_id == 0 ||
+      reduce_count_id == 0 || broadcast_count_id == 0 || result_zero_id == 0) {
+    return false;
+  }
+
+  Instruction* source_variable =
+      AddFunctionVariable(function, source_pointer_type_id);
+  Instruction* result_variable =
+      AddFunctionVariable(function, result_pointer_type_id);
+  Instruction* output_index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* reduce_index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* broadcast_index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* accumulator_variable =
+      AddFunctionVariable(function, accumulator_pointer_type_id);
+  if (!source_variable || !result_variable || !output_index_variable ||
+      !reduce_index_variable || !broadcast_index_variable ||
+      !accumulator_variable) {
+    return false;
+  }
+
+  auto split_iter = preheader_block->begin();
+  while (split_iter != preheader_block->end() && &*split_iter != inst) {
+    ++split_iter;
+  }
+  if (split_iter == preheader_block->end()) return false;
+  std::unique_ptr<Instruction> enclosing_loop_merge;
+  if (Instruction* loop_merge = preheader_block->GetLoopMergeInst()) {
+    enclosing_loop_merge.reset(loop_merge->Clone(context()));
+  }
+  std::array<uint32_t, 12> labels;
+  for (uint32_t& label : labels) {
+    label = TakeNextId();
+    if (label == 0) return false;
+  }
+  const uint32_t merge_label = labels[0];
+  const uint32_t outer_header_label = labels[1];
+  const uint32_t outer_body_label = labels[2];
+  const uint32_t reduce_header_label = labels[3];
+  const uint32_t reduce_body_label = labels[4];
+  const uint32_t reduce_continue_label = labels[5];
+  const uint32_t reduce_merge_label = labels[6];
+  const uint32_t broadcast_header_label = labels[7];
+  const uint32_t broadcast_body_label = labels[8];
+  const uint32_t broadcast_continue_label = labels[9];
+  const uint32_t broadcast_merge_label = labels[10];
+  const uint32_t outer_continue_label = labels[11];
+  BasicBlock* merge_block =
+      preheader_block->SplitBasicBlock(context(), merge_label, split_iter);
+  BasicBlock* outer_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_header_label)),
+      preheader_block);
+  BasicBlock* outer_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_body_label)),
+      outer_header);
+  BasicBlock* reduce_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(reduce_header_label)),
+      outer_body);
+  BasicBlock* reduce_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(reduce_body_label)),
+      reduce_header);
+  BasicBlock* reduce_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(reduce_continue_label)),
+      reduce_body);
+  BasicBlock* reduce_merge = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(reduce_merge_label)),
+      reduce_continue);
+  BasicBlock* broadcast_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(broadcast_header_label)),
+      reduce_merge);
+  BasicBlock* broadcast_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(broadcast_body_label)),
+      broadcast_header);
+  BasicBlock* broadcast_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(broadcast_continue_label)),
+      broadcast_body);
+  BasicBlock* broadcast_merge = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(broadcast_merge_label)),
+      broadcast_continue);
+  BasicBlock* outer_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_continue_label)),
+      broadcast_merge);
+  if (!merge_block || !outer_header || !outer_body || !reduce_header ||
+      !reduce_body || !reduce_continue || !reduce_merge || !broadcast_header ||
+      !broadcast_body || !broadcast_continue || !broadcast_merge ||
+      !outer_continue) {
+    return false;
+  }
+  if (enclosing_loop_merge) {
+    Instruction* moved_loop_merge = merge_block->GetLoopMergeInst();
+    if (!moved_loop_merge) return false;
+    context()->KillInst(moved_loop_merge);
+  }
+
+  InstructionBuilder preheader_builder(
+      context(), preheader_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!preheader_builder.AddStore(source_variable->result_id(),
+                                  input->result_id()) ||
+      !preheader_builder.AddStore(result_variable->result_id(),
+                                  result_zero_id) ||
+      !preheader_builder.AddStore(output_index_variable->result_id(),
+                                  zero_id) ||
+      (enclosing_loop_merge &&
+       !preheader_builder.AddInstruction(std::move(enclosing_loop_merge))) ||
+      !preheader_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_header_builder(
+      context(), outer_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* output_index = outer_header_builder.AddLoad(
+      uint_type_id, output_index_variable->result_id());
+  Instruction* outer_condition =
+      output_index ? outer_header_builder.AddBinaryOp(
+                         bool_type_id, spv::Op::OpULessThan,
+                         output_index->result_id(), output_count_id)
+                   : nullptr;
+  if (!output_index || !outer_condition ||
+      !outer_header_builder.AddLoopMerge(merge_label, outer_continue_label) ||
+      !outer_header_builder.AddConditionalBranch(
+          outer_condition->result_id(), outer_body_label, merge_label)) {
+    return false;
+  }
+
+  auto build_source_index = [&](InstructionBuilder* builder,
+                                uint32_t reduce_index_id) -> uint32_t {
+    uint32_t source_row_id =
+        reduce_axis == 0 ? output_index->result_id() : reduce_index_id;
+    uint32_t source_col_id =
+        reduce_axis == 0 ? reduce_index_id : output_index->result_id();
+    Instruction* row_base = builder->AddBinaryOp(uint_type_id, spv::Op::OpIMul,
+                                                 source_row_id, cols_id);
+    Instruction* source_index =
+        row_base ? builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                        row_base->result_id(), source_col_id)
+                 : nullptr;
+    return source_index ? source_index->result_id() : 0;
+  };
+
+  InstructionBuilder outer_body_builder(
+      context(), outer_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t first_source_index =
+      build_source_index(&outer_body_builder, zero_id);
+  const uint32_t initial_accumulator = BuildLogicalAggregateLoad(
+      &outer_body_builder, source_variable->result_id(),
+      source->component_type_id, source->packed_vec4_type_id,
+      first_source_index);
+  if (initial_accumulator == 0 ||
+      !outer_body_builder.AddStore(accumulator_variable->result_id(),
+                                   initial_accumulator) ||
+      !outer_body_builder.AddStore(reduce_index_variable->result_id(),
+                                   one_id) ||
+      !outer_body_builder.AddBranch(reduce_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder reduce_header_builder(
+      context(), reduce_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* reduce_index = reduce_header_builder.AddLoad(
+      uint_type_id, reduce_index_variable->result_id());
+  Instruction* reduce_condition =
+      reduce_index ? reduce_header_builder.AddBinaryOp(
+                         bool_type_id, spv::Op::OpULessThan,
+                         reduce_index->result_id(), reduce_count_id)
+                   : nullptr;
+  if (!reduce_index || !reduce_condition ||
+      !reduce_header_builder.AddLoopMerge(reduce_merge_label,
+                                          reduce_continue_label) ||
+      !reduce_header_builder.AddConditionalBranch(reduce_condition->result_id(),
+                                                  reduce_body_label,
+                                                  reduce_merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder reduce_body_builder(
+      context(), reduce_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t source_index =
+      build_source_index(&reduce_body_builder, reduce_index->result_id());
+  const uint32_t value = BuildLogicalAggregateLoad(
+      &reduce_body_builder, source_variable->result_id(),
+      source->component_type_id, source->packed_vec4_type_id, source_index);
+  Instruction* accumulator = reduce_body_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  const uint32_t combined =
+      accumulator
+          ? BuildReduceCombine(&reduce_body_builder, result->component_type_id,
+                               combine_op, accumulator->result_id(), value)
+          : 0;
+  if (combined == 0 ||
+      !reduce_body_builder.AddStore(accumulator_variable->result_id(),
+                                    combined) ||
+      !reduce_body_builder.AddBranch(reduce_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder reduce_continue_builder(
+      context(), reduce_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_reduce = reduce_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, reduce_index->result_id(), one_id);
+  if (!next_reduce ||
+      !reduce_continue_builder.AddStore(reduce_index_variable->result_id(),
+                                        next_reduce->result_id()) ||
+      !reduce_continue_builder.AddBranch(reduce_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder reduce_merge_builder(
+      context(), reduce_merge,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* final_accumulator = reduce_merge_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  if (!final_accumulator ||
+      !reduce_merge_builder.AddStore(broadcast_index_variable->result_id(),
+                                     zero_id) ||
+      !reduce_merge_builder.AddBranch(broadcast_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder broadcast_header_builder(
+      context(), broadcast_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* broadcast_index = broadcast_header_builder.AddLoad(
+      uint_type_id, broadcast_index_variable->result_id());
+  Instruction* broadcast_condition =
+      broadcast_index ? broadcast_header_builder.AddBinaryOp(
+                            bool_type_id, spv::Op::OpULessThan,
+                            broadcast_index->result_id(), broadcast_count_id)
+                      : nullptr;
+  if (!broadcast_index || !broadcast_condition ||
+      !broadcast_header_builder.AddLoopMerge(broadcast_merge_label,
+                                             broadcast_continue_label) ||
+      !broadcast_header_builder.AddConditionalBranch(
+          broadcast_condition->result_id(), broadcast_body_label,
+          broadcast_merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder broadcast_body_builder(
+      context(), broadcast_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t destination_row_id = reduce_axis == 0
+                                          ? output_index->result_id()
+                                          : broadcast_index->result_id();
+  const uint32_t destination_col_id = reduce_axis == 0
+                                          ? broadcast_index->result_id()
+                                          : output_index->result_id();
+  Instruction* destination_row_base = broadcast_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIMul, destination_row_id, cols_id);
+  Instruction* destination_index =
+      destination_row_base
+          ? broadcast_body_builder.AddBinaryOp(
+                uint_type_id, spv::Op::OpIAdd,
+                destination_row_base->result_id(), destination_col_id)
+          : nullptr;
+  if (!destination_index ||
+      !BuildLogicalAggregateStore(
+          &broadcast_body_builder, result_variable->result_id(),
+          result->component_type_id, result->packed_vec4_type_id,
+          destination_index->result_id(), final_accumulator->result_id()) ||
+      !broadcast_body_builder.AddBranch(broadcast_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder broadcast_continue_builder(
+      context(), broadcast_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_broadcast = broadcast_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, broadcast_index->result_id(), one_id);
+  if (!next_broadcast ||
+      !broadcast_continue_builder.AddStore(
+          broadcast_index_variable->result_id(), next_broadcast->result_id()) ||
+      !broadcast_continue_builder.AddBranch(broadcast_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder broadcast_merge_builder(
+      context(), broadcast_merge,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!broadcast_merge_builder.AddBranch(outer_continue_label)) return false;
+
+  InstructionBuilder outer_continue_builder(
+      context(), outer_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_output = outer_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, output_index->result_id(), one_id);
+  if (!next_output ||
+      !outer_continue_builder.AddStore(output_index_variable->result_id(),
+                                       next_output->result_id()) ||
+      !outer_continue_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  inst->SetOpcode(spv::Op::OpLoad);
+  inst->SetResultType(result->lowered_type_id);
+  inst->SetInOperands({IdOperand(result_variable->result_id())});
+  context()->UpdateDefUse(inst);
+  return true;
+}
+
 bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   const VectorTypeInfo* info = GetVectorType(inst->type_id());
   if (!info || inst->NumInOperands() < 1) {
@@ -1643,18 +2601,44 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   element_ids.reserve(info->length);
   const uint32_t pointer_id =
       inst->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
+  const uint32_t offset_id =
+      inst->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwVectorLoadMemoryOperandsInIdx);
+
+  if (info->length > max_unrolled_elements_) {
+    uint32_t result_id = 0;
+    if (!BuildScalarMemoryLoop(
+            inst, info->lowered_type_id, info->component_type_id, info->length,
+            pointer_id, 0, 0, offset_id, 0, 0, false, info->packed_vec4_type_id,
+            memory_operands, &result_id)) {
+      return false;
+    }
+    inst->SetOpcode(spv::Op::OpCopyObject);
+    inst->SetResultType(info->lowered_type_id);
+    inst->SetInOperands({IdOperand(result_id)});
+    context()->UpdateDefUse(inst);
+    return true;
+  }
 
   if (IsPackedVec4(*info)) {
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
-    if (CanCapturePointer(pointer_id)) {
+    Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
+    Instruction* offset_type =
+        offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+    const bool has_32_bit_offset =
+        offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
+        offset_type->NumInOperands() >= 2 &&
+        offset_type->GetSingleWordInOperand(0) == 32;
+    if (has_32_bit_offset && CanCapturePointer(pointer_id) &&
+        MemoryAccessOperandsAreMovable(inst,
+                                       kHwVectorLoadMemoryOperandsInIdx)) {
       uint32_t result_id = 0;
       if (!BuildPackedVectorLoadOuterLoop(inst, *info, pointer_id,
-                                          pointer_type_id, memory_operands,
-                                          &result_id)) {
+                                          pointer_type_id, offset_id,
+                                          memory_operands, &result_id)) {
         return false;
       }
       inst->SetOpcode(spv::Op::OpCopyObject);
@@ -1669,8 +2653,10 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
       std::vector<uint32_t> lane_ids;
       lane_ids.reserve(kPackedVec4Width);
       for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-        const uint32_t index_id =
+        const uint32_t logical_index_id =
             GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
+        const uint32_t index_id = BuildVectorElementIndex(
+            &builder, inst, offset_id, logical_index_id);
         const uint32_t elem_ptr_id = BuildElementAccess(
             &builder, inst, pointer_id, info->component_type_id, index_id);
         if (index_id == 0 || elem_ptr_id == 0) return false;
@@ -1690,7 +2676,9 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
   }
 
   for (uint32_t i = 0; i < info->length; ++i) {
-    const uint32_t index_id = GetOrCreateUIntConstant(i);
+    const uint32_t logical_index_id = GetOrCreateUIntConstant(i);
+    const uint32_t index_id =
+        BuildVectorElementIndex(&builder, inst, offset_id, logical_index_id);
     const uint32_t elem_ptr_id = BuildElementAccess(
         &builder, inst, pointer_id, info->component_type_id, index_id);
     if (elem_ptr_id == 0) return false;
@@ -1727,8 +2715,21 @@ bool HwLowerToStandardPass::LowerVectorStore(
       inst->GetSingleWordInOperand(kHwVectorStorePointerInIdx);
   const uint32_t object_id =
       inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx);
+  const uint32_t offset_id =
+      inst->GetSingleWordInOperand(kHwVectorStoreOffsetInIdx);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx);
+
+  if (info->length > max_unrolled_elements_) {
+    if (!BuildScalarMemoryLoop(
+            inst, info->lowered_type_id, info->component_type_id, info->length,
+            pointer_id, object_id, 0, offset_id, 0, 0, false,
+            info->packed_vec4_type_id, memory_operands, nullptr)) {
+      return false;
+    }
+    to_kill->push_back(inst);
+    return true;
+  }
 
   if (IsPackedVec4(*info)) {
     bool fused = false;
@@ -1738,10 +2739,19 @@ bool HwLowerToStandardPass::LowerVectorStore(
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
-    if (CanCapturePointer(pointer_id)) {
+    Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
+    Instruction* offset_type =
+        offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+    const bool has_32_bit_offset =
+        offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
+        offset_type->NumInOperands() >= 2 &&
+        offset_type->GetSingleWordInOperand(0) == 32;
+    if (has_32_bit_offset && CanCapturePointer(pointer_id) &&
+        MemoryAccessOperandsAreMovable(inst,
+                                       kHwVectorStoreMemoryOperandsInIdx)) {
       if (!BuildPackedVectorStoreOuterLoop(inst, *info, pointer_id,
-                                           pointer_type_id, object_id,
-                                           memory_operands)) {
+                                           pointer_type_id, offset_id,
+                                           object_id, memory_operands)) {
         return false;
       }
       to_kill->push_back(inst);
@@ -1755,12 +2765,15 @@ bool HwLowerToStandardPass::LowerVectorStore(
       for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
         const uint32_t value_id = ExtractCompositeElement(
             &builder, info->component_type_id, vec_id, lane);
-        const uint32_t index_id =
+        const uint32_t logical_index_id =
             GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
+        const uint32_t index_id = BuildVectorElementIndex(
+            &builder, inst, offset_id, logical_index_id);
         const uint32_t elem_ptr_id = BuildElementAccess(
             &builder, inst, pointer_id, info->component_type_id, index_id);
         if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) return false;
-        if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) {
+        if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
+                      info->component_type_id)) {
           return false;
         }
       }
@@ -1773,11 +2786,14 @@ bool HwLowerToStandardPass::LowerVectorStore(
   for (uint32_t i = 0; i < info->length; ++i) {
     const uint32_t value_id = ExtractCompositeElement(
         &builder, info->component_type_id, object_id, i);
-    const uint32_t index_id = GetOrCreateUIntConstant(i);
+    const uint32_t logical_index_id = GetOrCreateUIntConstant(i);
+    const uint32_t index_id =
+        BuildVectorElementIndex(&builder, inst, offset_id, logical_index_id);
     const uint32_t elem_ptr_id = BuildElementAccess(
         &builder, inst, pointer_id, info->component_type_id, index_id);
     if (value_id == 0 || elem_ptr_id == 0) return false;
-    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) {
+    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
+                  info->component_type_id)) {
       return false;
     }
   }
@@ -1790,6 +2806,16 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
                                                             bool* handled) {
   if (handled) *handled = false;
   if (!handled || !inst || inst->NumInOperands() < 2) return false;
+  if (!MemoryAccessOperandsAreMovable(inst,
+                                      kHwVectorStoreMemoryOperandsInIdx)) {
+    return true;
+  }
+  uint32_t output_offset = 0;
+  if (!GetConstantU32(inst->GetSingleWordInOperand(kHwVectorStoreOffsetInIdx),
+                      &output_offset) ||
+      output_offset != 0) {
+    return true;
+  }
 
   Instruction* object = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
@@ -1797,6 +2823,7 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   Instruction* matmul = TraceFunctionValueSource(object, inst, &object_chain);
   if (!matmul || matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW)
     return true;
+  if (!MatmulAllowsReassociation(matmul)) return true;
 
   Instruction* input_value = get_def_use_mgr()->GetDef(
       matmul->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
@@ -1812,6 +2839,13 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       input_load->opcode() != spv::Op::OpCooperativeVectorLoadHW ||
       matrix_load->opcode() != spv::Op::OpCooperativeMatrixLoadHW)
     return true;
+  uint32_t input_offset = 0;
+  if (!GetConstantU32(
+          input_load->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx),
+          &input_offset) ||
+      input_offset != 0) {
+    return true;
+  }
 
   const VectorTypeInfo* result = GetVectorType(matmul->type_id());
   const VectorTypeInfo* input = GetVectorType(input_load->type_id());
@@ -1988,6 +3022,10 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
       inst->NumInOperands() < 5) {
     return false;
   }
+  if (!MemoryAccessOperandsAreMovable(inst,
+                                      kHwMatrixStoreMemoryOperandsInIdx)) {
+    return true;
+  }
 
   Instruction* object = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx));
@@ -1997,6 +3035,7 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
       matmul->opcode() != spv::Op::OpCooperativeMatrixMulAddHW) {
     return true;
   }
+  if (!MatmulAllowsReassociation(matmul)) return true;
 
   Instruction* a_value = get_def_use_mgr()->GetDef(
       matmul->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
@@ -2238,6 +3277,7 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
       inst->opcode() != spv::Op::OpCooperativeMatrixMulAddHW) {
     return false;
   }
+  if (!MatmulAllowsReassociation(inst)) return true;
 
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
@@ -2594,6 +3634,7 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
        inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulAddHW)) {
     return false;
   }
+  if (!MatmulAllowsReassociation(inst)) return true;
 
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
@@ -2623,6 +3664,13 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
     Instruction* source =
         TraceFunctionValueSource(value_inst, inst, &candidate->chain);
     if (!source || source->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
+      return false;
+    }
+    uint32_t offset = 0;
+    if (!GetConstantU32(
+            source->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx),
+            &offset) ||
+        offset != 0) {
       return false;
     }
     candidate->source_load = source;
@@ -2977,7 +4025,9 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
 }
 
 bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
-                                                  bool has_bias) {
+                                                 bool has_bias) {
+  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
+  active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
@@ -2995,13 +4045,21 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
     ReportError(inst, "invalid HW vector matrix multiply");
+    active_fp_fast_math_mode_ = saved_fast_math_mode;
     return false;
   }
 
-  if (CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)) {
-    return LowerVectorMatrixMulPackedVec4(inst, has_bias);
-  }
-  return LowerVectorMatrixMulScalarFallback(inst, has_bias);
+  const uint64_t mac_count = static_cast<uint64_t>(result->length) *
+                             static_cast<uint64_t>(input->length);
+  bool lowered =
+      mac_count > max_unrolled_matmul_macs_
+          ? LowerVectorMatrixMulWithLoop(inst, has_bias)
+          : (CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)
+                 ? LowerVectorMatrixMulPackedVec4(inst, has_bias)
+                 : LowerVectorMatrixMulScalarFallback(inst, has_bias));
+  if (lowered) RemoveFPFastMathMode(inst->result_id());
+  active_fp_fast_math_mode_ = saved_fast_math_mode;
+  return lowered;
 }
 
 bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
@@ -3069,8 +4127,8 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   std::vector<uint32_t> scalar_ids(result->length, 0);
-  const uint32_t float_type_id = result->component_type_id;
-  const uint32_t zero_id = has_bias ? 0 : GetOrCreateZero(float_type_id);
+  const uint32_t accumulator_type_id = result->component_type_id;
+  const uint32_t zero_id = has_bias ? 0 : GetOrCreateZero(accumulator_type_id);
   if (!has_bias && zero_id == 0) return false;
 
   for (uint32_t col0 = 0; col0 < result->length;
@@ -3096,10 +4154,11 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
         const uint32_t w_id = ExtractMatrixScalar(
             &builder, *matrix, matrix_inst->result_id(), k, col);
         if (w_id == 0) return false;
-        const uint32_t fma =
-            BuildFma(&builder, float_type_id, x_id, w_id, acc[j]);
-        if (fma == 0) return false;
-        acc[j] = fma;
+        const uint32_t accumulated = BuildMatmulAccumulate(
+            &builder, accumulator_type_id, input->component_type_id, x_id,
+            matrix->component_type_id, w_id, acc[j]);
+        if (accumulated == 0) return false;
+        acc[j] = accumulated;
       }
     }
 
@@ -3134,12 +4193,291 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
   return true;
 }
 
+bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
+                                                         bool has_bias) {
+  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  Instruction* input_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
+  Instruction* matrix_inst = get_def_use_mgr()->GetDef(
+      inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
+  const VectorTypeInfo* input =
+      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
+  Instruction* bias_inst = nullptr;
+  const VectorTypeInfo* bias = nullptr;
+  if (has_bias) {
+    bias_inst = get_def_use_mgr()->GetDef(
+        inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
+    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+  }
+  BasicBlock* preheader_block = context()->get_instr_block(inst);
+  Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
+  if (!result || !input || !matrix || (has_bias && !bias) || !function) {
+    return false;
+  }
+
+  const uint32_t input_pointer_type_id = GetOrCreatePointerType(
+      input->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t matrix_pointer_type_id = GetOrCreatePointerType(
+      matrix->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t bias_pointer_type_id =
+      has_bias ? GetOrCreatePointerType(bias->lowered_type_id,
+                                        spv::StorageClass::Function)
+               : 0;
+  const uint32_t result_pointer_type_id = GetOrCreatePointerType(
+      result->lowered_type_id, spv::StorageClass::Function);
+  const uint32_t accumulator_pointer_type_id = GetOrCreatePointerType(
+      result->component_type_id, spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_index_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_id = GetOrCreateUIntConstant(1);
+  const uint32_t output_count_id = GetOrCreateUIntConstant(result->length);
+  const uint32_t inner_count_id = GetOrCreateUIntConstant(input->length);
+  const uint32_t accumulator_zero_id =
+      GetOrCreateZero(result->component_type_id);
+  const uint32_t result_zero_id = GetOrCreateZero(result->lowered_type_id);
+  if (input_pointer_type_id == 0 || matrix_pointer_type_id == 0 ||
+      (has_bias && bias_pointer_type_id == 0) || result_pointer_type_id == 0 ||
+      accumulator_pointer_type_id == 0 || uint_type_id == 0 ||
+      uint_pointer_type_id == 0 || bool_type_id == 0 || zero_index_id == 0 ||
+      one_id == 0 || output_count_id == 0 || inner_count_id == 0 ||
+      accumulator_zero_id == 0 || result_zero_id == 0) {
+    return false;
+  }
+
+  Instruction* input_variable =
+      AddFunctionVariable(function, input_pointer_type_id);
+  Instruction* matrix_variable =
+      AddFunctionVariable(function, matrix_pointer_type_id);
+  Instruction* bias_variable =
+      has_bias ? AddFunctionVariable(function, bias_pointer_type_id) : nullptr;
+  Instruction* result_variable =
+      AddFunctionVariable(function, result_pointer_type_id);
+  Instruction* output_index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* k_variable = AddFunctionVariable(function, uint_pointer_type_id);
+  Instruction* accumulator_variable =
+      AddFunctionVariable(function, accumulator_pointer_type_id);
+  if (!input_variable || !matrix_variable || (has_bias && !bias_variable) ||
+      !result_variable || !output_index_variable || !k_variable ||
+      !accumulator_variable) {
+    return false;
+  }
+
+  auto split_iter = preheader_block->begin();
+  while (split_iter != preheader_block->end() && &*split_iter != inst) {
+    ++split_iter;
+  }
+  if (split_iter == preheader_block->end()) return false;
+  std::unique_ptr<Instruction> enclosing_loop_merge;
+  if (Instruction* loop_merge = preheader_block->GetLoopMergeInst()) {
+    enclosing_loop_merge.reset(loop_merge->Clone(context()));
+  }
+  std::array<uint32_t, 8> labels;
+  for (uint32_t& label : labels) {
+    label = TakeNextId();
+    if (label == 0) return false;
+  }
+  const uint32_t merge_label = labels[0];
+  const uint32_t outer_header_label = labels[1];
+  const uint32_t outer_body_label = labels[2];
+  const uint32_t k_header_label = labels[3];
+  const uint32_t k_body_label = labels[4];
+  const uint32_t k_continue_label = labels[5];
+  const uint32_t k_merge_label = labels[6];
+  const uint32_t outer_continue_label = labels[7];
+  BasicBlock* merge_block =
+      preheader_block->SplitBasicBlock(context(), merge_label, split_iter);
+  BasicBlock* outer_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_header_label)),
+      preheader_block);
+  BasicBlock* outer_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_body_label)),
+      outer_header);
+  BasicBlock* k_header = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_header_label)), outer_body);
+  BasicBlock* k_body = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_body_label)), k_header);
+  BasicBlock* k_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_continue_label)), k_body);
+  BasicBlock* k_merge = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_merge_label)), k_continue);
+  BasicBlock* outer_continue = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(outer_continue_label)),
+      k_merge);
+  if (!merge_block || !outer_header || !outer_body || !k_header || !k_body ||
+      !k_continue || !k_merge || !outer_continue) {
+    return false;
+  }
+  if (enclosing_loop_merge) {
+    Instruction* moved_loop_merge = merge_block->GetLoopMergeInst();
+    if (!moved_loop_merge) return false;
+    context()->KillInst(moved_loop_merge);
+  }
+
+  InstructionBuilder preheader_builder(
+      context(), preheader_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  if (!preheader_builder.AddStore(input_variable->result_id(),
+                                  input_inst->result_id()) ||
+      !preheader_builder.AddStore(matrix_variable->result_id(),
+                                  matrix_inst->result_id()) ||
+      (has_bias && !preheader_builder.AddStore(bias_variable->result_id(),
+                                               bias_inst->result_id())) ||
+      !preheader_builder.AddStore(result_variable->result_id(),
+                                  result_zero_id) ||
+      !preheader_builder.AddStore(output_index_variable->result_id(),
+                                  zero_index_id) ||
+      (enclosing_loop_merge &&
+       !preheader_builder.AddInstruction(std::move(enclosing_loop_merge))) ||
+      !preheader_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_header_builder(
+      context(), outer_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* output_index = outer_header_builder.AddLoad(
+      uint_type_id, output_index_variable->result_id());
+  Instruction* outer_condition =
+      output_index ? outer_header_builder.AddBinaryOp(
+                         bool_type_id, spv::Op::OpULessThan,
+                         output_index->result_id(), output_count_id)
+                   : nullptr;
+  if (!output_index || !outer_condition ||
+      !outer_header_builder.AddLoopMerge(merge_label, outer_continue_label) ||
+      !outer_header_builder.AddConditionalBranch(
+          outer_condition->result_id(), outer_body_label, merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_body_builder(
+      context(), outer_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t initial_accumulator =
+      has_bias ? BuildLogicalAggregateLoad(
+                     &outer_body_builder, bias_variable->result_id(),
+                     bias->component_type_id, bias->packed_vec4_type_id,
+                     output_index->result_id())
+               : accumulator_zero_id;
+  if (initial_accumulator == 0 ||
+      !outer_body_builder.AddStore(accumulator_variable->result_id(),
+                                   initial_accumulator) ||
+      !outer_body_builder.AddStore(k_variable->result_id(), zero_index_id) ||
+      !outer_body_builder.AddBranch(k_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_header_builder(
+      context(), k_header,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* k =
+      k_header_builder.AddLoad(uint_type_id, k_variable->result_id());
+  Instruction* k_condition =
+      k ? k_header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                       k->result_id(), inner_count_id)
+        : nullptr;
+  if (!k || !k_condition ||
+      !k_header_builder.AddLoopMerge(k_merge_label, k_continue_label) ||
+      !k_header_builder.AddConditionalBranch(k_condition->result_id(),
+                                             k_body_label, k_merge_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_body_builder(
+      context(), k_body,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* matrix_row_base = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIMul, k->result_id(), output_count_id);
+  Instruction* matrix_index =
+      matrix_row_base
+          ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                       matrix_row_base->result_id(),
+                                       output_index->result_id())
+          : nullptr;
+  if (!matrix_index) return false;
+  const uint32_t input_value = BuildLogicalAggregateLoad(
+      &k_body_builder, input_variable->result_id(), input->component_type_id,
+      input->packed_vec4_type_id, k->result_id());
+  const uint32_t matrix_value = BuildLogicalAggregateLoad(
+      &k_body_builder, matrix_variable->result_id(), matrix->component_type_id,
+      matrix->packed_vec4_type_id, matrix_index->result_id());
+  Instruction* accumulator = k_body_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  const uint32_t accumulated =
+      accumulator
+          ? BuildMatmulAccumulate(&k_body_builder, result->component_type_id,
+                                  input->component_type_id, input_value,
+                                  matrix->component_type_id, matrix_value,
+                                  accumulator->result_id())
+          : 0;
+  if (accumulated == 0 ||
+      !k_body_builder.AddStore(accumulator_variable->result_id(),
+                               accumulated) ||
+      !k_body_builder.AddBranch(k_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_continue_builder(
+      context(), k_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_k = k_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, k->result_id(), one_id);
+  if (!next_k ||
+      !k_continue_builder.AddStore(k_variable->result_id(),
+                                   next_k->result_id()) ||
+      !k_continue_builder.AddBranch(k_header_label)) {
+    return false;
+  }
+
+  InstructionBuilder k_merge_builder(
+      context(), k_merge,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* final_accumulator = k_merge_builder.AddLoad(
+      result->component_type_id, accumulator_variable->result_id());
+  if (!final_accumulator ||
+      !BuildLogicalAggregateStore(
+          &k_merge_builder, result_variable->result_id(),
+          result->component_type_id, result->packed_vec4_type_id,
+          output_index->result_id(), final_accumulator->result_id()) ||
+      !k_merge_builder.AddBranch(outer_continue_label)) {
+    return false;
+  }
+
+  InstructionBuilder outer_continue_builder(
+      context(), outer_continue,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_output = outer_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, output_index->result_id(), one_id);
+  if (!next_output ||
+      !outer_continue_builder.AddStore(output_index_variable->result_id(),
+                                       next_output->result_id()) ||
+      !outer_continue_builder.AddBranch(outer_header_label)) {
+    return false;
+  }
+
+  inst->SetOpcode(spv::Op::OpLoad);
+  inst->SetResultType(result->lowered_type_id);
+  inst->SetInOperands({IdOperand(result_variable->result_id())});
+  context()->UpdateDefUse(inst);
+  return true;
+}
+
 bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
   const VectorTypeInfo* vector = GetVectorType(inst->type_id());
   if (!matrix && !vector) {
     ReportError(inst, "invalid HW OpCompositeConstruct result type");
     return false;
+  }
+
+  const uint32_t element_count =
+      matrix ? matrix->rows * matrix->cols : vector->length;
+  if (inst->NumInOperands() == 1 && element_count > max_unrolled_elements_) {
+    return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kBroadcast);
   }
 
   InstructionBuilder builder(
@@ -3505,9 +4843,11 @@ bool HwLowerToStandardPass::LowerAccessChain(Instruction* inst) {
             index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
         if (!index_type || index_type->opcode() != spv::Op::OpTypeInt ||
             index_type->NumInOperands() < 2 ||
-            index_type->GetSingleWordInOperand(0) > 32) {
+            index_type->GetSingleWordInOperand(0) == 0 ||
+            index_type->GetSingleWordInOperand(0) > 64) {
           ReportError(inst,
-                      "packed HW access chain requires a 32-bit integer index");
+                      "packed HW access chain requires an integer index of at "
+                      "most 64 bits");
           return false;
         }
         const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
@@ -3577,6 +4917,12 @@ bool HwLowerToStandardPass::LowerSelect(Instruction* inst) {
   if (!condition_type || condition_type->opcode() != spv::Op::OpTypeBool) {
     ReportError(inst, "HW OpSelect requires a scalar bool condition");
     return false;
+  }
+
+  const uint32_t element_count =
+      matrix ? matrix->rows * matrix->cols : vector->length;
+  if (element_count > max_unrolled_elements_) {
+    return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kSelect);
   }
 
   InstructionBuilder builder(
@@ -3695,8 +5041,8 @@ bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
     ReportError(inst, "invalid HW OpVectorInsertDynamic");
     return false;
   }
-  const uint32_t object_id = inst->GetSingleWordInOperand(0);
-  const uint32_t vector_id = inst->GetSingleWordInOperand(1);
+  const uint32_t vector_id = inst->GetSingleWordInOperand(0);
+  const uint32_t object_id = inst->GetSingleWordInOperand(1);
   const uint32_t index_id = inst->GetSingleWordInOperand(2);
   BasicBlock* block = context()->get_instr_block(inst);
   Function* function = block ? block->GetParent() : nullptr;
@@ -3997,6 +5343,33 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
         return false;
       }
     }
+  } else if (kind == ElementwiseLoopKind::kSelect) {
+    if (inst->NumInOperands() != 3) {
+      ReportError(inst, "invalid HW OpSelect");
+      return false;
+    }
+    for (uint32_t i = 1; i <= 2; ++i) {
+      ValueLayout layout;
+      const bool described =
+          result_vector ? DescribeVectorValue(original_operand_ids[i],
+                                              result_vector->length, &layout)
+                        : DescribeMatrixValue(original_operand_ids[i],
+                                              result_matrix->rows,
+                                              result_matrix->cols, &layout);
+      if (!described || !add_loop_operand(i, layout)) {
+        ReportError(inst, "invalid HW OpSelect object");
+        return false;
+      }
+    }
+  } else if (kind == ElementwiseLoopKind::kBroadcast) {
+    Instruction* scalar =
+        inst->NumInOperands() == 1
+            ? get_def_use_mgr()->GetDef(original_operand_ids[0])
+            : nullptr;
+    if (!scalar || scalar->type_id() != result_component_type_id) {
+      ReportError(inst, "invalid HW broadcast constituent");
+      return false;
+    }
   } else {
     const uint32_t loop_operand_count =
         kind == ElementwiseLoopKind::kArithmetic ? inst->NumInOperands() : 1;
@@ -4016,7 +5389,8 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
   }
 
   if (kind == ElementwiseLoopKind::kArithmetic ||
-      kind == ElementwiseLoopKind::kScale) {
+      kind == ElementwiseLoopKind::kScale ||
+      kind == ElementwiseLoopKind::kSelect) {
     for (const LoopOperand& operand : loop_operands) {
       if (operand.layout.component_type_id != result_component_type_id) {
         ReportError(inst,
@@ -4240,6 +5614,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
         operand_id ? body_builder.AddUnaryOp(result_piece_type_id,
                                              original_opcode, operand_id)
                    : nullptr;
+    ApplyActiveFPFastMathMode(converted);
     lowered_piece_id = converted ? converted->result_id() : 0;
   } else if (kind == ElementwiseLoopKind::kArithmetic) {
     const uint32_t lhs_id = load_for_result_piece(loop_operands[0]);
@@ -4254,6 +5629,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
                                            original_opcode, lhs_id, rhs_id);
       }
     }
+    ApplyActiveFPFastMathMode(lowered);
     lowered_piece_id = lowered ? lowered->result_id() : 0;
   } else if (kind == ElementwiseLoopKind::kScale) {
     const uint32_t input_id = load_for_result_piece(loop_operands[0]);
@@ -4267,8 +5643,26 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
       Instruction* scaled =
           body_builder.AddBinaryOp(result_piece_type_id, scale_opcode, input_id,
                                    original_operand_ids[1]);
+      ApplyActiveFPFastMathMode(scaled);
       lowered_piece_id = scaled ? scaled->result_id() : 0;
     }
+    if (lowered_piece_id != 0 && result_packed) {
+      ApplyActiveFPFastMathMode(get_def_use_mgr()->GetDef(lowered_piece_id));
+    }
+  } else if (kind == ElementwiseLoopKind::kSelect) {
+    const uint32_t lhs_id = load_for_result_piece(loop_operands[0]);
+    const uint32_t rhs_id = load_for_result_piece(loop_operands[1]);
+    Instruction* selected =
+        lhs_id && rhs_id
+            ? body_builder.AddTernaryOp(result_piece_type_id, spv::Op::OpSelect,
+                                        original_operand_ids[0], lhs_id, rhs_id)
+            : nullptr;
+    lowered_piece_id = selected ? selected->result_id() : 0;
+  } else if (kind == ElementwiseLoopKind::kBroadcast) {
+    lowered_piece_id =
+        result_packed ? BuildScalarSplat(&body_builder, result_piece_type_id,
+                                         original_operand_ids[0])
+                      : original_operand_ids[0];
   } else {
     std::vector<Operand> operands;
     operands.push_back(IdOperand(original_operand_ids[0]));
@@ -4291,6 +5685,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
         context(), spv::Op::OpExtInst, result_piece_type_id, result_id,
         std::move(operands));
     Instruction* added = body_builder.AddInstruction(std::move(ext_inst));
+    ApplyActiveFPFastMathMode(added);
     lowered_piece_id = added ? added->result_id() : 0;
   }
   if (lowered_piece_id == 0) return false;
@@ -4450,6 +5845,25 @@ uint32_t HwLowerToStandardPass::GetOrCreateUIntType() {
   return result_id;
 }
 
+uint32_t HwLowerToStandardPass::GetOrCreateIntegerType(uint32_t width,
+                                                       bool is_signed) {
+  for (Instruction& inst : get_module()->types_values()) {
+    if (inst.opcode() == spv::Op::OpTypeInt && inst.NumInOperands() >= 2 &&
+        inst.GetSingleWordInOperand(0) == width &&
+        (inst.GetSingleWordInOperand(1) != 0) == is_signed) {
+      return inst.result_id();
+    }
+  }
+  const uint32_t result_id = TakeNextId();
+  if (result_id == 0) return 0;
+  context()->AddType(MakeUnique<Instruction>(
+      context(), spv::Op::OpTypeInt, 0, result_id,
+      std::initializer_list<Operand>{
+          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {width}},
+          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {is_signed ? 1u : 0u}}}));
+  return result_id;
+}
+
 uint32_t HwLowerToStandardPass::GetOrCreateUIntConstant(uint32_t value) {
   const uint32_t uint_type_id = GetOrCreateUIntType();
   if (uint_type_id == 0) return 0;
@@ -4463,10 +5877,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateUIntConstantAfter(
 
   bool can_reuse = true;
   for (Instruction& inst : get_module()->types_values()) {
-    if (can_reuse &&
-        (inst.opcode() == spv::Op::OpConstant ||
-         inst.opcode() == spv::Op::OpSpecConstant) &&
-        inst.type_id() == uint_type_id &&
+    if (can_reuse && inst.opcode() == spv::Op::OpConstant &&
+        inst.type_id() == uint_type_id && inst.NumInOperands() == 1 &&
         inst.GetSingleWordInOperand(0) == value) {
       return inst.result_id();
     }
@@ -4513,15 +5925,20 @@ uint32_t HwLowerToStandardPass::GetOrCreateConstant(uint32_t type_id,
                                                      uint32_t value) {
   Instruction* type = get_def_use_mgr()->GetDef(type_id);
   if (!type || type->opcode() != spv::Op::OpTypeInt ||
-      type->GetSingleWordInOperand(0) != 32) {
+      type->NumInOperands() < 2 || type->GetSingleWordInOperand(0) == 0 ||
+      type->GetSingleWordInOperand(0) > 64) {
     return 0;
   }
+  const uint32_t word_count = type->GetSingleWordInOperand(0) > 32 ? 2 : 1;
 
   for (Instruction& inst : get_module()->types_values()) {
-    if ((inst.opcode() == spv::Op::OpConstant ||
-         inst.opcode() == spv::Op::OpSpecConstant) &&
-        inst.type_id() == type_id && inst.GetSingleWordInOperand(0) == value) {
-      return inst.result_id();
+    if (inst.opcode() == spv::Op::OpConstant && inst.type_id() == type_id &&
+        inst.NumInOperands() == 1) {
+      const Operand& literal = inst.GetInOperand(0);
+      if (literal.words.size() == word_count && literal.words[0] == value &&
+          (word_count == 1 || literal.words[1] == 0)) {
+        return inst.result_id();
+      }
     }
     if (value == 0 && inst.opcode() == spv::Op::OpConstantNull &&
         inst.type_id() == type_id) {
@@ -4531,20 +5948,28 @@ uint32_t HwLowerToStandardPass::GetOrCreateConstant(uint32_t type_id,
 
   const uint32_t result_id = TakeNextId();
   if (result_id == 0) return 0;
+  std::vector<uint32_t> words = {value};
+  if (word_count == 2) words.push_back(0);
   context()->AddGlobalValue(MakeUnique<Instruction>(
       context(), spv::Op::OpConstant, type_id, result_id,
       std::initializer_list<Operand>{
-          {SPV_OPERAND_TYPE_LITERAL_INTEGER, {value}}}));
+          {SPV_OPERAND_TYPE_TYPED_LITERAL_NUMBER, std::move(words)}}));
   return result_id;
 }
 
 uint32_t HwLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
   for (Instruction& inst : get_module()->types_values()) {
-    if (inst.type_id() == type_id &&
-        (inst.opcode() == spv::Op::OpConstantNull ||
-         (inst.opcode() == spv::Op::OpConstant && inst.NumInOperands() > 0 &&
-          inst.GetSingleWordInOperand(0) == 0))) {
+    if (inst.type_id() != type_id) continue;
+    if (inst.opcode() == spv::Op::OpConstantNull) {
       return inst.result_id();
+    }
+    if (inst.opcode() == spv::Op::OpConstant && inst.NumInOperands() == 1) {
+      const Operand& literal = inst.GetInOperand(0);
+      if (!literal.words.empty() &&
+          std::all_of(literal.words.begin(), literal.words.end(),
+                      [](uint32_t word) { return word == 0; })) {
+        return inst.result_id();
+      }
     }
   }
 
@@ -4682,6 +6107,120 @@ uint32_t HwLowerToStandardPass::BuildMatrixElementIndex(
   return index ? index->result_id() : 0;
 }
 
+uint32_t HwLowerToStandardPass::BuildDynamicMatrixElementIndex(
+    InstructionBuilder* builder, Instruction* user, uint32_t shape_id,
+    uint32_t offset_id, uint32_t layout, uint32_t matrix_cols,
+    uint32_t flat_index_id) {
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t cols_id = GetOrCreateUIntConstant(matrix_cols);
+  if (uint_type_id == 0 || cols_id == 0 || flat_index_id == 0) return 0;
+  Instruction* row = builder->AddBinaryOp(uint_type_id, spv::Op::OpUDiv,
+                                          flat_index_id, cols_id);
+  Instruction* col = builder->AddBinaryOp(uint_type_id, spv::Op::OpUMod,
+                                          flat_index_id, cols_id);
+  if (!row || !col) return 0;
+
+  const uint32_t shape_rows =
+      BuildPairComponentAsUInt(builder, user, shape_id, 0);
+  const uint32_t shape_cols =
+      BuildPairComponentAsUInt(builder, user, shape_id, 1);
+  const uint32_t offset_row =
+      BuildPairComponentAsUInt(builder, user, offset_id, 0);
+  const uint32_t offset_col =
+      BuildPairComponentAsUInt(builder, user, offset_id, 1);
+  if (shape_rows == 0 || shape_cols == 0 || offset_row == 0 ||
+      offset_col == 0) {
+    return 0;
+  }
+  Instruction* global_row = builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                 offset_row, row->result_id());
+  Instruction* global_col = builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                 offset_col, col->result_id());
+  if (!global_row || !global_col) return 0;
+  const bool row_major =
+      layout ==
+      static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR);
+  Instruction* major = builder->AddBinaryOp(
+      uint_type_id, spv::Op::OpIMul,
+      row_major ? global_row->result_id() : global_col->result_id(),
+      row_major ? shape_cols : shape_rows);
+  Instruction* index =
+      major ? builder->AddBinaryOp(
+                  uint_type_id, spv::Op::OpIAdd, major->result_id(),
+                  row_major ? global_col->result_id() : global_row->result_id())
+            : nullptr;
+  return index ? index->result_id() : 0;
+}
+
+uint32_t HwLowerToStandardPass::BuildVectorElementIndex(
+    InstructionBuilder* builder, Instruction* user, uint32_t offset_id,
+    uint32_t logical_index_id) {
+  Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
+  Instruction* offset_type =
+      offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+  Instruction* logical_index = get_def_use_mgr()->GetDef(logical_index_id);
+  if (!builder || !offset || !offset_type || !logical_index ||
+      offset_type->opcode() != spv::Op::OpTypeInt ||
+      offset_type->NumInOperands() < 2 ||
+      offset_type->GetSingleWordInOperand(0) == 0 ||
+      offset_type->GetSingleWordInOperand(0) > 64) {
+    ReportError(user,
+                "HW cooperative vector offset must be an integer of at most "
+                "64 bits");
+    return 0;
+  }
+  if (offset_type->GetSingleWordInOperand(0) == 32) {
+    const uint32_t uint_type_id = GetOrCreateUIntType();
+    uint32_t unsigned_offset_id = offset_id;
+    if (offset->type_id() != uint_type_id) {
+      Instruction* converted =
+          builder->AddUnaryOp(uint_type_id, spv::Op::OpBitcast, offset_id);
+      if (!converted) return 0;
+      unsigned_offset_id = converted->result_id();
+    }
+    Instruction* index = builder->AddBinaryOp(
+        uint_type_id, spv::Op::OpIAdd, unsigned_offset_id, logical_index_id);
+    return index ? index->result_id() : 0;
+  }
+  uint32_t converted_logical_index_id = logical_index_id;
+  if (logical_index->type_id() != offset->type_id()) {
+    Instruction* logical_type =
+        get_def_use_mgr()->GetDef(logical_index->type_id());
+    if (!logical_type || logical_type->opcode() != spv::Op::OpTypeInt ||
+        logical_type->NumInOperands() < 2) {
+      return 0;
+    }
+    const uint32_t source_width = logical_type->GetSingleWordInOperand(0);
+    const uint32_t target_width = offset_type->GetSingleWordInOperand(0);
+    const bool target_is_signed = offset_type->GetSingleWordInOperand(1) != 0;
+    if (source_width == target_width) {
+      Instruction* converted = builder->AddUnaryOp(
+          offset->type_id(), spv::Op::OpBitcast, logical_index_id);
+      if (!converted) return 0;
+      converted_logical_index_id = converted->result_id();
+    } else {
+      const uint32_t unsigned_target_type_id =
+          target_is_signed
+              ? GetOrCreateIntegerType(target_width, /*is_signed=*/false)
+              : offset->type_id();
+      Instruction* converted = builder->AddUnaryOp(
+          unsigned_target_type_id, spv::Op::OpUConvert, logical_index_id);
+      if (!converted) return 0;
+      converted_logical_index_id = converted->result_id();
+      if (target_is_signed) {
+        Instruction* bitcast = builder->AddUnaryOp(
+            offset->type_id(), spv::Op::OpBitcast, converted_logical_index_id);
+        if (!bitcast) return 0;
+        converted_logical_index_id = bitcast->result_id();
+      }
+    }
+  }
+  Instruction* index =
+      builder->AddBinaryOp(offset->type_id(), spv::Op::OpIAdd, offset_id,
+                           converted_logical_index_id);
+  return index ? index->result_id() : 0;
+}
+
 uint32_t HwLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
                                                     Instruction* user,
                                                     uint32_t pointer_id,
@@ -4795,6 +6334,85 @@ Instruction* HwLowerToStandardPass::AddFunctionVariable(
     if (!builder.AddStore(var_id, initializer_id)) return nullptr;
   }
   return variable_ptr;
+}
+
+uint32_t HwLowerToStandardPass::BuildLogicalAggregateLoad(
+    InstructionBuilder* builder, uint32_t aggregate_pointer_id,
+    uint32_t component_type_id, uint32_t packed_vec4_type_id,
+    uint32_t logical_index_id) {
+  if (!builder || aggregate_pointer_id == 0 || component_type_id == 0 ||
+      logical_index_id == 0) {
+    return 0;
+  }
+  uint32_t piece_index_id = logical_index_id;
+  uint32_t lane_id = 0;
+  uint32_t piece_type_id = component_type_id;
+  if (packed_vec4_type_id != 0) {
+    const uint32_t uint_type_id = GetOrCreateUIntType();
+    const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+    Instruction* piece_index = builder->AddBinaryOp(
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
+    Instruction* lane = builder->AddBinaryOp(uint_type_id, spv::Op::OpUMod,
+                                             logical_index_id, four_id);
+    if (!piece_index || !lane) return 0;
+    piece_index_id = piece_index->result_id();
+    lane_id = lane->result_id();
+    piece_type_id = packed_vec4_type_id;
+  }
+  const uint32_t piece_pointer_type_id =
+      GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
+  Instruction* pointer = builder->AddAccessChain(
+      piece_pointer_type_id, aggregate_pointer_id, {piece_index_id});
+  Instruction* piece =
+      pointer ? builder->AddLoad(piece_type_id, pointer->result_id()) : nullptr;
+  if (!piece) return 0;
+  if (packed_vec4_type_id == 0) return piece->result_id();
+  Instruction* value =
+      builder->AddBinaryOp(component_type_id, spv::Op::OpVectorExtractDynamic,
+                           piece->result_id(), lane_id);
+  return value ? value->result_id() : 0;
+}
+
+bool HwLowerToStandardPass::BuildLogicalAggregateStore(
+    InstructionBuilder* builder, uint32_t aggregate_pointer_id,
+    uint32_t component_type_id, uint32_t packed_vec4_type_id,
+    uint32_t logical_index_id, uint32_t value_id) {
+  if (!builder || aggregate_pointer_id == 0 || component_type_id == 0 ||
+      logical_index_id == 0 || value_id == 0) {
+    return false;
+  }
+  uint32_t piece_index_id = logical_index_id;
+  uint32_t lane_id = 0;
+  uint32_t piece_type_id = component_type_id;
+  if (packed_vec4_type_id != 0) {
+    const uint32_t uint_type_id = GetOrCreateUIntType();
+    const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+    Instruction* piece_index = builder->AddBinaryOp(
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
+    Instruction* lane = builder->AddBinaryOp(uint_type_id, spv::Op::OpUMod,
+                                             logical_index_id, four_id);
+    if (!piece_index || !lane) return false;
+    piece_index_id = piece_index->result_id();
+    lane_id = lane->result_id();
+    piece_type_id = packed_vec4_type_id;
+  }
+  const uint32_t piece_pointer_type_id =
+      GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
+  Instruction* pointer = builder->AddAccessChain(
+      piece_pointer_type_id, aggregate_pointer_id, {piece_index_id});
+  if (!pointer) return false;
+  uint32_t stored_id = value_id;
+  if (packed_vec4_type_id != 0) {
+    Instruction* old_piece =
+        builder->AddLoad(piece_type_id, pointer->result_id());
+    Instruction* inserted =
+        old_piece ? builder->AddTernaryOp(
+                        piece_type_id, spv::Op::OpVectorInsertDynamic,
+                        old_piece->result_id(), value_id, lane_id)
+                  : nullptr;
+    stored_id = inserted ? inserted->result_id() : 0;
+  }
+  return stored_id != 0 && builder->AddStore(pointer->result_id(), stored_id);
 }
 
 BasicBlock* HwLowerToStandardPass::MakeBasicBlock(uint32_t label_id) {
@@ -5125,8 +6743,8 @@ bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
 
 bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
-    uint32_t pointer_type_id, const std::vector<Operand>& memory_operands,
-    uint32_t* result_id) {
+    uint32_t pointer_type_id, uint32_t offset_id,
+    const std::vector<Operand>& memory_operands, uint32_t* result_id) {
   if (!insert_before || !result_id || !IsPackedVec4(info)) return false;
   BasicBlock* preheader_block = context()->get_instr_block(insert_before);
   Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
@@ -5218,8 +6836,12 @@ bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
   InstructionBuilder body_builder(
       context(), body_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  Instruction* vec = body_builder.AddFunctionCall(
-      info.packed_vec4_type_id, load_function_id, {base_load->result_id()});
+  const uint32_t memory_base_id = BuildVectorElementIndex(
+      &body_builder, insert_before, offset_id, base_load->result_id());
+  Instruction* vec = memory_base_id ? body_builder.AddFunctionCall(
+                                          info.packed_vec4_type_id,
+                                          load_function_id, {memory_base_id})
+                                    : nullptr;
   if (!vec) return false;
   Instruction* packed_index = body_builder.AddBinaryOp(
       uint_type_id, spv::Op::OpUDiv, base_load->result_id(), four_uint_id);
@@ -5256,7 +6878,7 @@ bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
 
 bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
-    uint32_t pointer_type_id, uint32_t object_id,
+    uint32_t pointer_type_id, uint32_t offset_id, uint32_t object_id,
     const std::vector<Operand>& memory_operands) {
   if (!insert_before || object_id == 0 || !IsPackedVec4(info)) return false;
   BasicBlock* preheader_block = context()->get_instr_block(insert_before);
@@ -5364,9 +6986,11 @@ bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
   Instruction* vec = body_builder.AddLoad(info.packed_vec4_type_id,
                                           value_elem_ptr->result_id());
   if (!vec) return false;
-  if (!body_builder.AddFunctionCall(
-          void_type_id, store_function_id,
-          {base_load->result_id(), vec->result_id()})) {
+  const uint32_t memory_base_id = BuildVectorElementIndex(
+      &body_builder, insert_before, offset_id, base_load->result_id());
+  if (memory_base_id == 0 ||
+      !body_builder.AddFunctionCall(void_type_id, store_function_id,
+                                    {memory_base_id, vec->result_id()})) {
     return false;
   }
   if (!body_builder.AddBranch(continue_label_id)) return false;
@@ -5381,6 +7005,212 @@ bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
     return false;
   }
   if (!continue_builder.AddBranch(header_label_id)) return false;
+  return true;
+}
+
+bool HwLowerToStandardPass::BuildScalarMemoryLoop(
+    Instruction* insert_before, uint32_t lowered_type_id,
+    uint32_t component_type_id, uint32_t element_count, uint32_t pointer_id,
+    uint32_t object_id, uint32_t shape_id, uint32_t offset_id,
+    uint32_t matrix_cols, uint32_t layout, bool is_matrix,
+    uint32_t packed_vec4_type_id, const std::vector<Operand>& memory_operands,
+    uint32_t* result_id) {
+  const bool is_load = object_id == 0;
+  if (!insert_before || lowered_type_id == 0 || component_type_id == 0 ||
+      element_count == 0 || pointer_id == 0 || (is_load && !result_id)) {
+    return false;
+  }
+  BasicBlock* preheader_block = context()->get_instr_block(insert_before);
+  Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
+  if (!preheader_block || !function) return false;
+
+  const uint32_t aggregate_pointer_type_id =
+      GetOrCreatePointerType(lowered_type_id, spv::StorageClass::Function);
+  const uint32_t component_pointer_type_id =
+      GetOrCreatePointerType(component_type_id, spv::StorageClass::Function);
+  const uint32_t piece_pointer_type_id =
+      packed_vec4_type_id == 0
+          ? component_pointer_type_id
+          : GetOrCreatePointerType(packed_vec4_type_id,
+                                   spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_id = GetOrCreateUIntConstant(1);
+  const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t element_count_id = GetOrCreateUIntConstant(element_count);
+  if (aggregate_pointer_type_id == 0 || component_pointer_type_id == 0 ||
+      piece_pointer_type_id == 0 || uint_type_id == 0 ||
+      uint_pointer_type_id == 0 || bool_type_id == 0 || zero_id == 0 ||
+      one_id == 0 || four_id == 0 || element_count_id == 0) {
+    return false;
+  }
+
+  Instruction* aggregate_variable =
+      AddFunctionVariable(function, aggregate_pointer_type_id);
+  Instruction* index_variable =
+      AddFunctionVariable(function, uint_pointer_type_id);
+  if (!aggregate_variable || !index_variable) return false;
+
+  auto split_iter = preheader_block->begin();
+  while (split_iter != preheader_block->end() &&
+         &*split_iter != insert_before) {
+    ++split_iter;
+  }
+  if (split_iter == preheader_block->end()) return false;
+
+  std::unique_ptr<Instruction> enclosing_loop_merge;
+  if (Instruction* loop_merge = preheader_block->GetLoopMergeInst()) {
+    enclosing_loop_merge.reset(loop_merge->Clone(context()));
+  }
+
+  const uint32_t merge_label_id = TakeNextId();
+  const uint32_t header_label_id = TakeNextId();
+  const uint32_t body_label_id = TakeNextId();
+  const uint32_t continue_label_id = TakeNextId();
+  if (merge_label_id == 0 || header_label_id == 0 || body_label_id == 0 ||
+      continue_label_id == 0) {
+    return false;
+  }
+  BasicBlock* merge_block =
+      preheader_block->SplitBasicBlock(context(), merge_label_id, split_iter);
+  BasicBlock* header_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(header_label_id)),
+      preheader_block);
+  BasicBlock* body_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(body_label_id)), header_block);
+  BasicBlock* continue_block = function->InsertBasicBlockAfter(
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(continue_label_id)),
+      body_block);
+  if (!merge_block || !header_block || !body_block || !continue_block) {
+    return false;
+  }
+  if (enclosing_loop_merge) {
+    Instruction* moved_loop_merge = merge_block->GetLoopMergeInst();
+    if (!moved_loop_merge) return false;
+    context()->KillInst(moved_loop_merge);
+  }
+
+  InstructionBuilder preheader_builder(
+      context(), preheader_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t aggregate_initializer_id =
+      is_load && packed_vec4_type_id != 0 ? GetOrCreateZero(lowered_type_id)
+                                          : object_id;
+  if (((!is_load || packed_vec4_type_id != 0) &&
+       (aggregate_initializer_id == 0 ||
+        !preheader_builder.AddStore(aggregate_variable->result_id(),
+                                    aggregate_initializer_id))) ||
+      !preheader_builder.AddStore(index_variable->result_id(), zero_id) ||
+      (enclosing_loop_merge &&
+       !preheader_builder.AddInstruction(std::move(enclosing_loop_merge))) ||
+      !preheader_builder.AddBranch(header_label_id)) {
+    return false;
+  }
+
+  InstructionBuilder header_builder(
+      context(), header_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* index =
+      header_builder.AddLoad(uint_type_id, index_variable->result_id());
+  Instruction* condition =
+      index ? header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                         index->result_id(), element_count_id)
+            : nullptr;
+  if (!index || !condition ||
+      !header_builder.AddLoopMerge(merge_label_id, continue_label_id) ||
+      !header_builder.AddConditionalBranch(condition->result_id(),
+                                           body_label_id, merge_label_id)) {
+    return false;
+  }
+
+  InstructionBuilder body_builder(
+      context(), body_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  const uint32_t memory_index_id =
+      is_matrix ? BuildDynamicMatrixElementIndex(
+                      &body_builder, insert_before, shape_id, offset_id, layout,
+                      matrix_cols, index->result_id())
+                : BuildVectorElementIndex(&body_builder, insert_before,
+                                          offset_id, index->result_id());
+  const uint32_t external_pointer_id =
+      BuildElementAccess(&body_builder, insert_before, pointer_id,
+                         component_type_id, memory_index_id);
+  uint32_t piece_index_id = index->result_id();
+  uint32_t lane_id = 0;
+  if (packed_vec4_type_id != 0) {
+    Instruction* piece_index = body_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpUDiv, index->result_id(), four_id);
+    Instruction* lane = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUMod,
+                                                 index->result_id(), four_id);
+    if (!piece_index || !lane) return false;
+    piece_index_id = piece_index->result_id();
+    lane_id = lane->result_id();
+  }
+  Instruction* aggregate_pointer = body_builder.AddAccessChain(
+      piece_pointer_type_id, aggregate_variable->result_id(), {piece_index_id});
+  if (memory_index_id == 0 || external_pointer_id == 0 || !aggregate_pointer) {
+    return false;
+  }
+  if (is_load) {
+    const uint32_t value_id = AddLoad(&body_builder, component_type_id,
+                                      external_pointer_id, memory_operands);
+    uint32_t stored_id = value_id;
+    if (value_id != 0 && packed_vec4_type_id != 0) {
+      Instruction* old_piece = body_builder.AddLoad(
+          packed_vec4_type_id, aggregate_pointer->result_id());
+      Instruction* inserted =
+          old_piece ? body_builder.AddTernaryOp(
+                          packed_vec4_type_id, spv::Op::OpVectorInsertDynamic,
+                          old_piece->result_id(), value_id, lane_id)
+                    : nullptr;
+      stored_id = inserted ? inserted->result_id() : 0;
+    }
+    if (stored_id == 0 ||
+        !body_builder.AddStore(aggregate_pointer->result_id(), stored_id)) {
+      return false;
+    }
+  } else {
+    Instruction* piece = body_builder.AddLoad(
+        packed_vec4_type_id != 0 ? packed_vec4_type_id : component_type_id,
+        aggregate_pointer->result_id());
+    uint32_t value_id = piece ? piece->result_id() : 0;
+    if (piece && packed_vec4_type_id != 0) {
+      Instruction* extracted = body_builder.AddBinaryOp(
+          component_type_id, spv::Op::OpVectorExtractDynamic,
+          piece->result_id(), lane_id);
+      value_id = extracted ? extracted->result_id() : 0;
+    }
+    if (value_id == 0 || !AddStore(&body_builder, external_pointer_id, value_id,
+                                   memory_operands, component_type_id)) {
+      return false;
+    }
+  }
+  if (!body_builder.AddBranch(continue_label_id)) return false;
+
+  InstructionBuilder continue_builder(
+      context(), continue_block,
+      IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+  Instruction* next_index = continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, index->result_id(), one_id);
+  if (!next_index ||
+      !continue_builder.AddStore(index_variable->result_id(),
+                                 next_index->result_id()) ||
+      !continue_builder.AddBranch(header_label_id)) {
+    return false;
+  }
+
+  if (is_load) {
+    InstructionBuilder merge_builder(
+        context(), insert_before,
+        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+    Instruction* result =
+        merge_builder.AddLoad(lowered_type_id, aggregate_variable->result_id());
+    if (!result) return false;
+    *result_id = result->result_id();
+  }
   return true;
 }
 
@@ -6007,6 +7837,7 @@ uint32_t HwLowerToStandardPass::BuildFusedMatrixMatmulStoreFunctionPackedVec4(
     Instruction* add = k_merge_builder.AddBinaryOp(
         result.component_type_id, spv::Op::OpFAdd, bias_value, reduced);
     if (!add) return 0;
+    ApplyActiveFPFastMathMode(add);
     lane_ids.push_back(add->result_id());
   }
   Instruction* result_vec = k_merge_builder.AddCompositeConstruct(
@@ -6542,6 +8373,7 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
                                              result_vec->result_id(),
                                              bias_vec_id);
     if (!result_vec) return 0;
+    ApplyActiveFPFastMathMode(result_vec);
   }
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(
       vec4_function_ptr_type_id, result_var->result_id(),
@@ -7126,6 +8958,7 @@ uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
     Instruction* add = k_merge_builder.AddBinaryOp(
         result.component_type_id, spv::Op::OpFAdd, bias_value, reduced);
     if (!add) return 0;
+    ApplyActiveFPFastMathMode(add);
     lane_ids.push_back(add->result_id());
   }
   Instruction* result_vec = k_merge_builder.AddCompositeConstruct(
@@ -7270,11 +9103,16 @@ uint32_t HwLowerToStandardPass::ExtractCompositeElement(
 uint32_t HwLowerToStandardPass::AddLoad(
     InstructionBuilder* builder, uint32_t type_id, uint32_t pointer_id,
     const std::vector<Operand>& memory_operands) {
+  std::vector<Operand> normalized_memory_operands;
+  if (!NormalizeMemoryOperandsForAccess(pointer_id, type_id, memory_operands,
+                                        &normalized_memory_operands)) {
+    return 0;
+  }
   std::vector<Operand> operands;
-  operands.reserve(1 + memory_operands.size());
+  operands.reserve(1 + normalized_memory_operands.size());
   operands.push_back(IdOperand(pointer_id));
-  operands.insert(operands.end(), memory_operands.begin(),
-                  memory_operands.end());
+  operands.insert(operands.end(), normalized_memory_operands.begin(),
+                  normalized_memory_operands.end());
   std::unique_ptr<Instruction> load = MakeUnique<Instruction>(
       context(), spv::Op::OpLoad, type_id, TakeNextId(), operands);
   Instruction* added = builder->AddInstruction(std::move(load));
@@ -7283,13 +9121,27 @@ uint32_t HwLowerToStandardPass::AddLoad(
 
 bool HwLowerToStandardPass::AddStore(
     InstructionBuilder* builder, uint32_t pointer_id, uint32_t object_id,
-    const std::vector<Operand>& memory_operands) {
+    const std::vector<Operand>& memory_operands, uint32_t accessed_type_id) {
+  if (accessed_type_id == 0 && !memory_operands.empty()) {
+    Instruction* object = get_def_use_mgr()->GetDef(object_id);
+    if (!object || object->type_id() == 0) {
+      ReportError(nullptr, "cannot determine HW store object type");
+      return false;
+    }
+    accessed_type_id = object->type_id();
+  }
+  std::vector<Operand> normalized_memory_operands;
+  if (!NormalizeMemoryOperandsForAccess(pointer_id, accessed_type_id,
+                                        memory_operands,
+                                        &normalized_memory_operands)) {
+    return false;
+  }
   std::vector<Operand> operands;
-  operands.reserve(2 + memory_operands.size());
+  operands.reserve(2 + normalized_memory_operands.size());
   operands.push_back(IdOperand(pointer_id));
   operands.push_back(IdOperand(object_id));
-  operands.insert(operands.end(), memory_operands.begin(),
-                  memory_operands.end());
+  operands.insert(operands.end(), normalized_memory_operands.begin(),
+                  normalized_memory_operands.end());
   std::unique_ptr<Instruction> store =
       MakeUnique<Instruction>(context(), spv::Op::OpStore, 0, 0, operands);
   return builder->AddInstruction(std::move(store)) != nullptr;
@@ -7298,7 +9150,22 @@ bool HwLowerToStandardPass::AddStore(
 std::vector<Operand> HwLowerToStandardPass::CopyMemoryOperands(
     const Instruction* inst, uint32_t first_in_operand) const {
   std::vector<Operand> operands;
-  if (inst->NumInOperands() <= first_in_operand) return operands;
+  if (!inst) return operands;
+  if (inst->NumInOperands() <= first_in_operand) {
+    uint32_t storage_class = 0;
+    const uint32_t pointer_id =
+        inst->NumInOperands() == 0 ? 0 : inst->GetSingleWordInOperand(0);
+    if (GetPointerStorageClass(pointer_id, &storage_class) &&
+        storage_class ==
+            static_cast<uint32_t>(spv::StorageClass::PhysicalStorageBuffer)) {
+      ReportError(inst,
+                  "PhysicalStorageBuffer HW access requires an Aligned "
+                  "memory operand");
+      return {{SPV_OPERAND_TYPE_MEMORY_ACCESS,
+               {std::numeric_limits<uint32_t>::max()}}};
+    }
+    return operands;
+  }
   operands.reserve(inst->NumInOperands() - first_in_operand);
   for (uint32_t i = first_in_operand; i < inst->NumInOperands(); ++i) {
     operands.push_back(inst->GetInOperand(i));
@@ -7306,9 +9173,321 @@ std::vector<Operand> HwLowerToStandardPass::CopyMemoryOperands(
   return operands;
 }
 
-uint32_t HwLowerToStandardPass::ExtractVectorScalar(
-    InstructionBuilder* builder, const VectorTypeInfo& info, uint32_t vector_id,
-    uint32_t index) {
+bool HwLowerToStandardPass::NormalizeMemoryOperandsForAccess(
+    uint32_t pointer_id, uint32_t accessed_type_id,
+    const std::vector<Operand>& memory_operands,
+    std::vector<Operand>* normalized) const {
+  if (!normalized) return false;
+  normalized->clear();
+
+  uint32_t storage_class = 0;
+  const bool has_storage_class =
+      GetPointerStorageClass(pointer_id, &storage_class);
+  const bool physical_storage =
+      has_storage_class &&
+      storage_class ==
+          static_cast<uint32_t>(spv::StorageClass::PhysicalStorageBuffer);
+  if (memory_operands.empty()) {
+    if (physical_storage) {
+      ReportError(nullptr,
+                  "PhysicalStorageBuffer lowered access requires Aligned");
+      return false;
+    }
+    return true;
+  }
+
+  const Operand& access = memory_operands.front();
+  if (access.type != SPV_OPERAND_TYPE_MEMORY_ACCESS ||
+      access.words.size() != 1) {
+    ReportError(nullptr, "malformed HW memory access operand");
+    return false;
+  }
+
+  const uint32_t mask = access.words[0];
+  const uint32_t aligned = uint32_t(spv::MemoryAccessMask::Aligned);
+  const uint32_t make_available =
+      uint32_t(spv::MemoryAccessMask::MakePointerAvailable);
+  const uint32_t make_visible =
+      uint32_t(spv::MemoryAccessMask::MakePointerVisible);
+  const uint32_t alias_scope =
+      uint32_t(spv::MemoryAccessMask::AliasScopeINTELMask);
+  const uint32_t no_alias = uint32_t(spv::MemoryAccessMask::NoAliasINTELMask);
+  const uint32_t known_mask =
+      uint32_t(spv::MemoryAccessMask::Volatile) | aligned |
+      uint32_t(spv::MemoryAccessMask::Nontemporal) | make_available |
+      make_visible | uint32_t(spv::MemoryAccessMask::NonPrivatePointer) |
+      alias_scope | no_alias;
+  if ((mask & ~known_mask) != 0) {
+    ReportError(nullptr, "unsupported HW memory access operand mask");
+    return false;
+  }
+
+  size_t expected_operands = 1;
+  expected_operands += (mask & aligned) != 0;
+  expected_operands += (mask & make_available) != 0;
+  expected_operands += (mask & make_visible) != 0;
+  expected_operands += (mask & alias_scope) != 0;
+  expected_operands += (mask & no_alias) != 0;
+  if (memory_operands.size() != expected_operands) {
+    ReportError(nullptr, "malformed HW memory access operand parameters");
+    return false;
+  }
+  if (physical_storage && (mask & aligned) == 0) {
+    ReportError(nullptr,
+                "PhysicalStorageBuffer lowered access requires Aligned");
+    return false;
+  }
+
+  *normalized = memory_operands;
+  if ((mask & aligned) == 0) return true;
+  Operand& alignment_operand = (*normalized)[1];
+  if (alignment_operand.words.size() != 1) {
+    ReportError(nullptr, "malformed Aligned memory operand");
+    return false;
+  }
+  const uint32_t base_alignment = alignment_operand.words[0];
+  if (base_alignment == 0 || (base_alignment & (base_alignment - 1)) != 0) {
+    ReportError(nullptr, "Aligned memory operand must be a power of two");
+    return false;
+  }
+
+  const uint32_t natural_alignment = GetTypeNaturalAlignment(accessed_type_id);
+  if (natural_alignment == 0) {
+    ReportError(nullptr, "cannot determine lowered memory access alignment");
+    return false;
+  }
+
+  uint64_t byte_offset = 0;
+  uint32_t access_alignment = std::min(base_alignment, natural_alignment);
+  if (GetKnownAccessByteOffset(pointer_id, accessed_type_id, &byte_offset)) {
+    const uint64_t gcd = std::gcd(uint64_t(base_alignment), byte_offset);
+    if (gcd == 0 || gcd > std::numeric_limits<uint32_t>::max()) return false;
+    access_alignment = static_cast<uint32_t>(gcd);
+  }
+  alignment_operand.words[0] = access_alignment;
+  return true;
+}
+
+bool HwLowerToStandardPass::GetKnownAccessByteOffset(
+    uint32_t pointer_id, uint32_t accessed_type_id,
+    uint64_t* byte_offset) const {
+  if (!byte_offset) return false;
+  *byte_offset = 0;
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  if (!pointer) return false;
+  if (pointer->opcode() != spv::Op::OpAccessChain &&
+      pointer->opcode() != spv::Op::OpInBoundsAccessChain) {
+    return true;
+  }
+  if (pointer->NumInOperands() != 2) return true;
+
+  Instruction* base =
+      get_def_use_mgr()->GetDef(pointer->GetSingleWordInOperand(0));
+  Instruction* base_pointer_type =
+      base ? get_def_use_mgr()->GetDef(base->type_id()) : nullptr;
+  if (!base_pointer_type ||
+      base_pointer_type->opcode() != spv::Op::OpTypePointer ||
+      base_pointer_type->NumInOperands() < 2) {
+    return false;
+  }
+  Instruction* pointee =
+      get_def_use_mgr()->GetDef(base_pointer_type->GetSingleWordInOperand(1));
+  if (!pointee ||
+      (pointee->opcode() != spv::Op::OpTypeArray &&
+       pointee->opcode() != spv::Op::OpTypeRuntimeArray) ||
+      pointee->NumInOperands() == 0 ||
+      pointee->GetSingleWordInOperand(0) != accessed_type_id) {
+    // The access chain produced the pointer passed to the original HW
+    // operation.  Its Aligned promise is relative to that pointer, not to the
+    // module variable at the root of the chain.
+    return true;
+  }
+
+  uint32_t element_index = 0;
+  if (!TryEvaluateConstantU32Expression(pointer->GetSingleWordInOperand(1),
+                                        &element_index)) {
+    return false;
+  }
+  uint32_t stride = GetArrayStride(pointee->result_id());
+  if (stride == 0) stride = GetTypeNaturalAlignment(accessed_type_id);
+  if (stride == 0) return false;
+  *byte_offset = uint64_t(element_index) * uint64_t(stride);
+  return true;
+}
+
+bool HwLowerToStandardPass::TryEvaluateConstantFloat32(uint32_t id,
+                                                       float* value,
+                                                       uint32_t depth) const {
+  if (!value || depth > 16) return false;
+  Instruction* inst = get_def_use_mgr()->GetDef(id);
+  if (!inst) return false;
+  if (inst->opcode() == spv::Op::OpConstantNull) {
+    *value = 0.0f;
+    return true;
+  }
+  if (inst->opcode() == spv::Op::OpConstant) {
+    Instruction* type = get_def_use_mgr()->GetDef(inst->type_id());
+    if (!type || type->opcode() != spv::Op::OpTypeFloat ||
+        type->GetSingleWordInOperand(0) != 32 || inst->NumInOperands() != 1) {
+      return false;
+    }
+    const uint32_t bits = inst->GetSingleWordInOperand(0);
+    static_assert(sizeof(bits) == sizeof(*value), "unexpected float size");
+    std::memcpy(value, &bits, sizeof(bits));
+    return true;
+  }
+  if (inst->opcode() == spv::Op::OpCopyObject && inst->NumInOperands() == 1) {
+    return TryEvaluateConstantFloat32(inst->GetSingleWordInOperand(0), value,
+                                      depth + 1);
+  }
+  if (inst->opcode() == spv::Op::OpCompositeExtract &&
+      inst->NumInOperands() == 2) {
+    Instruction* composite =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    if (!composite || composite->opcode() != spv::Op::OpConstantComposite) {
+      return false;
+    }
+    const uint32_t index = inst->GetSingleWordInOperand(1);
+    if (index >= composite->NumInOperands()) return false;
+    return TryEvaluateConstantFloat32(composite->GetSingleWordInOperand(index),
+                                      value, depth + 1);
+  }
+  return false;
+}
+
+bool HwLowerToStandardPass::TryEvaluateConstantU32Expression(
+    uint32_t id, uint32_t* value, uint32_t depth) const {
+  if (!value || depth > 16) return false;
+  Instruction* inst = get_def_use_mgr()->GetDef(id);
+  if (!inst) return false;
+  if (inst->opcode() == spv::Op::OpConstantNull) {
+    *value = 0;
+    return true;
+  }
+  if (inst->opcode() == spv::Op::OpConstant) {
+    Instruction* type = get_def_use_mgr()->GetDef(inst->type_id());
+    if (!type || type->opcode() != spv::Op::OpTypeInt ||
+        type->GetSingleWordInOperand(0) > 32 || inst->NumInOperands() != 1) {
+      return false;
+    }
+    *value = inst->GetSingleWordInOperand(0);
+    return true;
+  }
+  if ((inst->opcode() == spv::Op::OpCopyObject ||
+       inst->opcode() == spv::Op::OpBitcast ||
+       inst->opcode() == spv::Op::OpSConvert ||
+       inst->opcode() == spv::Op::OpUConvert) &&
+      inst->NumInOperands() == 1) {
+    return TryEvaluateConstantU32Expression(inst->GetSingleWordInOperand(0),
+                                            value, depth + 1);
+  }
+  if (inst->opcode() == spv::Op::OpConvertFToU && inst->NumInOperands() == 1) {
+    float float_value = 0.0f;
+    if (!TryEvaluateConstantFloat32(inst->GetSingleWordInOperand(0),
+                                    &float_value, depth + 1) ||
+        !std::isfinite(float_value) || float_value < 0.0f ||
+        double(float_value) > double(std::numeric_limits<uint32_t>::max())) {
+      return false;
+    }
+    *value = static_cast<uint32_t>(float_value);
+    return true;
+  }
+  if (inst->opcode() == spv::Op::OpCompositeExtract &&
+      inst->NumInOperands() == 2) {
+    Instruction* composite =
+        get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+    if (!composite || composite->opcode() != spv::Op::OpConstantComposite) {
+      return false;
+    }
+    const uint32_t index = inst->GetSingleWordInOperand(1);
+    if (index >= composite->NumInOperands()) return false;
+    return TryEvaluateConstantU32Expression(
+        composite->GetSingleWordInOperand(index), value, depth + 1);
+  }
+  if (inst->NumInOperands() != 2) return false;
+  uint32_t lhs = 0;
+  uint32_t rhs = 0;
+  if (!TryEvaluateConstantU32Expression(inst->GetSingleWordInOperand(0), &lhs,
+                                        depth + 1) ||
+      !TryEvaluateConstantU32Expression(inst->GetSingleWordInOperand(1), &rhs,
+                                        depth + 1)) {
+    return false;
+  }
+  switch (inst->opcode()) {
+    case spv::Op::OpIAdd:
+      *value = lhs + rhs;
+      return true;
+    case spv::Op::OpISub:
+      *value = lhs - rhs;
+      return true;
+    case spv::Op::OpIMul:
+      *value = lhs * rhs;
+      return true;
+    case spv::Op::OpUDiv:
+      if (rhs == 0) return false;
+      *value = lhs / rhs;
+      return true;
+    case spv::Op::OpUMod:
+      if (rhs == 0) return false;
+      *value = lhs % rhs;
+      return true;
+    default:
+      return false;
+  }
+}
+
+uint32_t HwLowerToStandardPass::GetTypeNaturalAlignment(
+    uint32_t type_id) const {
+  Instruction* type = get_def_use_mgr()->GetDef(type_id);
+  if (!type) return 0;
+  switch (type->opcode()) {
+    case spv::Op::OpTypeBool:
+      return 1;
+    case spv::Op::OpTypeInt:
+    case spv::Op::OpTypeFloat: {
+      if (type->NumInOperands() == 0) return 0;
+      const uint32_t width = type->GetSingleWordInOperand(0);
+      return width != 0 && width % 8 == 0 ? width / 8 : 0;
+    }
+    case spv::Op::OpTypeVector: {
+      if (type->NumInOperands() < 2) return 0;
+      const uint32_t component_alignment =
+          GetTypeNaturalAlignment(type->GetSingleWordInOperand(0));
+      const uint32_t count = type->GetSingleWordInOperand(1);
+      if (component_alignment == 0 || count < 2 || count > 4) return 0;
+      return component_alignment * (count == 2 ? 2 : 4);
+    }
+    case spv::Op::OpTypeArray:
+    case spv::Op::OpTypeRuntimeArray:
+      return type->NumInOperands() == 0
+                 ? 0
+                 : GetTypeNaturalAlignment(type->GetSingleWordInOperand(0));
+    default:
+      return 0;
+  }
+}
+
+uint32_t HwLowerToStandardPass::GetArrayStride(uint32_t array_type_id) const {
+  uint32_t stride = 0;
+  get_decoration_mgr()->WhileEachDecoration(
+      array_type_id, uint32_t(spv::Decoration::ArrayStride),
+      [&stride](const Instruction& decoration) {
+        if (decoration.opcode() == spv::Op::OpDecorate &&
+            decoration.NumInOperands() >= 3) {
+          stride = decoration.GetSingleWordInOperand(2);
+        } else if (decoration.opcode() == spv::Op::OpMemberDecorate &&
+                   decoration.NumInOperands() >= 4) {
+          stride = decoration.GetSingleWordInOperand(3);
+        }
+        return false;
+      });
+  return stride;
+}
+
+uint32_t HwLowerToStandardPass::ExtractVectorScalar(InstructionBuilder* builder,
+                                                    const VectorTypeInfo& info,
+                                                    uint32_t vector_id,
+                                                    uint32_t index) {
   if (!IsPackedVec4(info)) {
     return ExtractCompositeElement(builder, info.component_type_id, vector_id,
                                    index);
@@ -7650,7 +9829,79 @@ uint32_t HwLowerToStandardPass::BuildFma(InstructionBuilder* builder,
           IdOperand(multiplier_id),
           IdOperand(addend_id)});
   Instruction* added = builder->AddInstruction(std::move(fma));
+  ApplyActiveFPFastMathMode(added);
   return added ? added->result_id() : 0;
+}
+
+uint32_t HwLowerToStandardPass::BuildMatmulAccumulate(
+    InstructionBuilder* builder, uint32_t accumulator_type_id,
+    uint32_t lhs_type_id, uint32_t lhs_id, uint32_t rhs_type_id,
+    uint32_t rhs_id, uint32_t accumulator_id) {
+  if (!builder || lhs_id == 0 || rhs_id == 0 || accumulator_id == 0) return 0;
+  Instruction* accumulator_type =
+      get_def_use_mgr()->GetDef(accumulator_type_id);
+  const NumericScalarInfo accumulator =
+      DescribeNumericScalarType(accumulator_type);
+  const NumericScalarInfo lhs =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(lhs_type_id));
+  const NumericScalarInfo rhs =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(rhs_type_id));
+  if (!accumulator.valid || !lhs.valid || !rhs.valid ||
+      accumulator.is_float != lhs.is_float ||
+      accumulator.is_float != rhs.is_float || accumulator.width < lhs.width ||
+      accumulator.width < rhs.width) {
+    return 0;
+  }
+
+  auto widen = [&](uint32_t source_type_id, uint32_t value_id,
+                   const NumericScalarInfo& source) -> uint32_t {
+    if (source_type_id == accumulator_type_id) return value_id;
+    if (source.width == accumulator.width) {
+      Instruction* converted = builder->AddUnaryOp(
+          accumulator_type_id, spv::Op::OpBitcast, value_id);
+      return converted ? converted->result_id() : 0;
+    }
+    if (source.is_float) {
+      Instruction* converted = builder->AddUnaryOp(
+          accumulator_type_id, spv::Op::OpFConvert, value_id);
+      ApplyActiveFPFastMathMode(converted);
+      return converted ? converted->result_id() : 0;
+    }
+
+    // OpSConvert and OpUConvert require a result type with the matching
+    // signedness.  Widen in that domain first, then preserve the resulting bit
+    // pattern with OpBitcast when the accumulator has the opposite signedness.
+    const uint32_t widened_type_id =
+        GetOrCreateIntegerType(accumulator.width, source.is_signed);
+    Instruction* widened =
+        widened_type_id
+            ? builder->AddUnaryOp(
+                  widened_type_id,
+                  source.is_signed ? spv::Op::OpSConvert : spv::Op::OpUConvert,
+                  value_id)
+            : nullptr;
+    if (!widened) return 0;
+    if (widened_type_id == accumulator_type_id) return widened->result_id();
+    Instruction* converted = builder->AddUnaryOp(
+        accumulator_type_id, spv::Op::OpBitcast, widened->result_id());
+    return converted ? converted->result_id() : 0;
+  };
+
+  const uint32_t widened_lhs = widen(lhs_type_id, lhs_id, lhs);
+  const uint32_t widened_rhs = widen(rhs_type_id, rhs_id, rhs);
+  if (widened_lhs == 0 || widened_rhs == 0) return 0;
+  if (accumulator.is_float) {
+    return BuildFma(builder, accumulator_type_id, widened_lhs, widened_rhs,
+                    accumulator_id);
+  }
+
+  Instruction* product = builder->AddBinaryOp(
+      accumulator_type_id, spv::Op::OpIMul, widened_lhs, widened_rhs);
+  Instruction* sum =
+      product ? builder->AddBinaryOp(accumulator_type_id, spv::Op::OpIAdd,
+                                     product->result_id(), accumulator_id)
+              : nullptr;
+  return sum ? sum->result_id() : 0;
 }
 
 uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
@@ -7666,6 +9917,7 @@ uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
     Instruction* add =
         builder->AddBinaryOp(component_type_id, spv::Op::OpFAdd, sum, value);
     if (!add) return 0;
+    ApplyActiveFPFastMathMode(add);
     sum = add->result_id();
   }
   return sum;
@@ -7686,6 +9938,7 @@ uint32_t HwLowerToStandardPass::BuildReduceCombine(InstructionBuilder* builder,
                                    : spv::Op::OpIAdd;
     Instruction* add =
         builder->AddBinaryOp(component_type_id, add_opcode, lhs_id, rhs_id);
+    if (add_opcode == spv::Op::OpFAdd) ApplyActiveFPFastMathMode(add);
     return add ? add->result_id() : 0;
   }
 
@@ -7715,6 +9968,7 @@ uint32_t HwLowerToStandardPass::BuildReduceCombine(InstructionBuilder* builder,
           IdOperand(lhs_id),
           IdOperand(rhs_id)});
   Instruction* added = builder->AddInstruction(std::move(ext_inst));
+  ApplyActiveFPFastMathMode(added);
   return added ? added->result_id() : 0;
 }
 
@@ -7766,86 +10020,24 @@ bool HwLowerToStandardPass::BuildMatmulPatternPackedVec4(
   element_ids->assign(result.rows * result.packed_cols, 0);
 
   const uint32_t vec4_type_id = result.packed_vec4_type_id;
-  const uint32_t zero4_id = GetOrCreateZero(vec4_type_id);
-  if (zero4_id == 0) return false;
-  const uint32_t tile_weight_function_id =
-      GetOrCreateMatmulTileWeightFunctionPackedVec4(b);
-  Instruction* insertion_point = get_def_use_mgr()->GetDef(b.lowered_type_id);
-  if (tile_weight_function_id == 0 || !insertion_point) return false;
-  const uint32_t weight_array_type_id = GetOrCreatePackedArrayType(
-      b.packed_vec4_type_id, kPackedVec4Width, insertion_point);
-  if (weight_array_type_id == 0) return false;
-
-  for (uint32_t row0 = 0; row0 < result.rows; row0 += kPackedVec4Width) {
-    const uint32_t tile_m = std::min(kPackedVec4Width, result.rows - row0);
+  if (vec4_type_id == 0) return false;
+  for (uint32_t row = 0; row < result.rows; ++row) {
     for (uint32_t col_pack = 0; col_pack < result.packed_cols; ++col_pack) {
       const uint32_t col0 = col_pack * kPackedVec4Width;
-      std::vector<uint32_t> acc(tile_m * kPackedVec4Width, zero4_id);
-      const uint32_t col_pack_id = GetOrCreateUIntConstant(col_pack);
-      if (col_pack_id == 0) return false;
-      const bool full_col_tile = col0 + kPackedVec4Width <= b.cols;
-
-      for (uint32_t k0 = 0; k0 < a.cols; k0 += kPackedVec4Width) {
-        Instruction* weights = nullptr;
-        const bool full_k_tile = k0 + kPackedVec4Width <= a.cols;
-        if (full_k_tile && full_col_tile) {
-          const uint32_t k0_id = GetOrCreateUIntConstant(k0);
-          if (k0_id == 0) return false;
-          weights = builder->AddFunctionCall(weight_array_type_id,
-                                             tile_weight_function_id,
-                                             {b_id, k0_id, col_pack_id});
-          if (!weights) return false;
-        }
-
-        std::vector<uint32_t> weight(kPackedVec4Width, 0);
-        for (uint32_t col_lane = 0; col_lane < kPackedVec4Width; ++col_lane) {
-          if (weights) {
-            weight[col_lane] = ExtractCompositeElement(
-                builder, vec4_type_id, weights->result_id(), col_lane);
-          } else {
-            weight[col_lane] = BuildMatrixColumnVector(
-                builder, b, b_id, k0, col0 + col_lane, vec4_type_id);
-          }
-          if (weight[col_lane] == 0) return false;
-        }
-
-        for (uint32_t row_lane = 0; row_lane < tile_m; ++row_lane) {
-          const uint32_t v = BuildMatrixRowVector(
-              builder, a, a_id, row0 + row_lane, k0, vec4_type_id);
-          if (v == 0) return false;
-
-          for (uint32_t col_lane = 0; col_lane < kPackedVec4Width; ++col_lane) {
-            const uint32_t index = row_lane * kPackedVec4Width + col_lane;
-            acc[index] = BuildFma(builder, vec4_type_id, v, weight[col_lane],
-                                  acc[index]);
-            if (acc[index] == 0) return false;
-          }
-        }
+      uint32_t acc = ExtractCompositeElement(
+          builder, vec4_type_id, c_id, MatrixPackedIndex(c, row, col_pack));
+      if (acc == 0) return false;
+      for (uint32_t k = 0; k < a.cols; ++k) {
+        const uint32_t scalar = ExtractMatrixScalar(builder, a, a_id, row, k);
+        const uint32_t weights =
+            BuildMatrixRowVector(builder, b, b_id, k, col0, vec4_type_id);
+        const uint32_t scalar_vec =
+            scalar ? BuildScalarSplat(builder, vec4_type_id, scalar) : 0;
+        if (weights == 0 || scalar_vec == 0) return false;
+        acc = BuildFma(builder, vec4_type_id, scalar_vec, weights, acc);
+        if (acc == 0) return false;
       }
-
-      for (uint32_t row_lane = 0; row_lane < tile_m; ++row_lane) {
-        const uint32_t row = row0 + row_lane;
-        std::vector<uint32_t> lane_ids;
-        lane_ids.reserve(kPackedVec4Width);
-        for (uint32_t col_lane = 0; col_lane < kPackedVec4Width; ++col_lane) {
-          const uint32_t col = col0 + col_lane;
-          const uint32_t reduced = BuildHorizontalReduce(
-              builder, result.component_type_id,
-              acc[row_lane * kPackedVec4Width + col_lane]);
-          const uint32_t bias = ExtractMatrixScalar(builder, c, c_id, row, col);
-          if (reduced == 0 || bias == 0) return false;
-          Instruction* add = builder->AddBinaryOp(
-              result.component_type_id, spv::Op::OpFAdd, bias, reduced);
-          if (!add) return false;
-          lane_ids.push_back(add->result_id());
-        }
-
-        Instruction* vec =
-            builder->AddCompositeConstruct(vec4_type_id, lane_ids);
-        if (!vec) return false;
-        (*element_ids)[MatrixPackedIndex(result, row, col_pack)] =
-            vec->result_id();
-      }
+      (*element_ids)[MatrixPackedIndex(result, row, col_pack)] = acc;
     }
   }
 
@@ -8079,7 +10271,10 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
     const uint32_t value_id = ExtractCompositeElement(
         &builder, component_type_id, value_param_id, lane);
     if (elem_ptr_id == 0 || value_id == 0) return 0;
-    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands)) return 0;
+    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
+                  component_type_id)) {
+      return 0;
+    }
   }
 
   if (!builder.AddNullaryOp(0, spv::Op::OpReturn)) return 0;
@@ -8332,7 +10527,12 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
   auto cached = vector_matmul_pattern_functions_.find(key);
   if (cached != vector_matmul_pattern_functions_.end()) return cached->second;
 
-  const bool use_loop_path = true;
+  // The packed loop below groups four K terms and horizontally reduces them.
+  // That changes the specified K-order unless reassociation is explicitly
+  // allowed.  Small operations use the strict, K-ordered builder here; large
+  // operations have already been redirected to the generic structured-loop
+  // lowering by LowerVectorMatrixMul.
+  const bool use_loop_path = false;
 
   std::vector<uint32_t> param_type_ids = {input.lowered_type_id,
                                           matrix.lowered_type_id};
@@ -8660,6 +10860,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
         vec4_type_id, spv::Op::OpFAdd, result_vec->result_id(),
         bias_vec->result_id());
     if (!result_vec) return 0;
+    ApplyActiveFPFastMathMode(result_vec);
   }
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(
       vec4_function_ptr_type_id, result_var->result_id(),
@@ -8990,6 +11191,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
       Instruction* add = k_merge_builder.AddBinaryOp(
           result.component_type_id, spv::Op::OpFAdd, reduced, bias_value);
       if (!add) return 0;
+      ApplyActiveFPFastMathMode(add);
       reduced = add->result_id();
     }
     lane_ids.push_back(reduced);
@@ -9087,7 +11289,12 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
                               std::initializer_list<Operand>{}));
 
-  if (!IsPackedVec4(a)) {
+  // The legacy packed loop below reduces groups of four K terms before adding
+  // C, which reassociates the source expression.  Use the strict K-ordered
+  // builder for the ordinary helper path.  Large operations are handled by
+  // LowerMatrixMulAddWithLoop before reaching this function.
+  const bool use_loop_path = false;
+  if (!use_loop_path || !IsPackedVec4(a)) {
     InstructionBuilder builder(context(), entry_block.get());
     std::vector<uint32_t> element_ids;
     if (!BuildMatmulPatternPackedVec4(&builder, result, a, b, c, a_param_id,
@@ -9409,6 +11616,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
     Instruction* add = k_merge_builder.AddBinaryOp(
         result.component_type_id, spv::Op::OpFAdd, bias, reduced);
     if (!add) return 0;
+    ApplyActiveFPFastMathMode(add);
     lane_ids.push_back(add->result_id());
   }
   Instruction* result_vec = k_merge_builder.AddCompositeConstruct(
@@ -9549,6 +11757,8 @@ std::string HwLowerToStandardPass::VectorMatmulPatternFunctionKey(
     key += '|';
     append_vector(*bias);
   }
+  key += "|fm:";
+  key += std::to_string(active_fp_fast_math_mode_);
   return key;
 }
 
@@ -9579,6 +11789,8 @@ std::string HwLowerToStandardPass::MatmulPatternFunctionKey(
   append_matrix(b);
   key += '|';
   append_matrix(c);
+  key += "|fm:";
+  key += std::to_string(active_fp_fast_math_mode_);
   return key;
 }
 
@@ -9667,6 +11879,46 @@ uint32_t HwLowerToStandardPass::GetOrCreateGLSLStd450Import() {
 
   context()->AddExtInstImport("GLSL.std.450");
   return context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450();
+}
+
+uint32_t HwLowerToStandardPass::GetFPFastMathMode(uint32_t result_id) const {
+  if (result_id == 0) return 0;
+  for (const Instruction* decoration :
+       context()->get_decoration_mgr()->GetDecorationsFor(
+           result_id, /*include_linkage=*/false)) {
+    if (decoration && decoration->NumInOperands() >= 3 &&
+        decoration->GetSingleWordInOperand(1) ==
+            uint32_t(spv::Decoration::FPFastMathMode)) {
+      return decoration->GetSingleWordInOperand(2);
+    }
+  }
+  return 0;
+}
+
+void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
+  if (!inst || inst->result_id() == 0 || active_fp_fast_math_mode_ == 0) {
+    return;
+  }
+  context()->get_decoration_mgr()->AddDecorationVal(
+      inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode),
+      active_fp_fast_math_mode_);
+}
+
+bool HwLowerToStandardPass::MatmulAllowsReassociation(
+    const Instruction* inst) const {
+  const uint32_t mode = inst ? GetFPFastMathMode(inst->result_id()) : 0;
+  return inst && (mode & (uint32_t(spv::FPFastMathModeMask::AllowReassoc) |
+                          uint32_t(spv::FPFastMathModeMask::Fast))) != 0;
+}
+
+void HwLowerToStandardPass::RemoveFPFastMathMode(uint32_t result_id) {
+  if (result_id == 0) return;
+  context()->get_decoration_mgr()->RemoveDecorationsFrom(
+      result_id, [](const Instruction& decoration) {
+        return decoration.NumInOperands() >= 2 &&
+               decoration.GetSingleWordInOperand(1) ==
+                   uint32_t(spv::Decoration::FPFastMathMode);
+      });
 }
 
 const HwLowerToStandardPass::MatrixTypeInfo*
@@ -10153,12 +12405,43 @@ bool HwLowerToStandardPass::MemoryAccessOperandsAreMovable(
     const Instruction* inst, uint32_t first_in_operand) const {
   if (!inst || inst->NumInOperands() <= first_in_operand) return true;
   const Operand& access = inst->GetInOperand(first_in_operand);
-  if (access.type != SPV_OPERAND_TYPE_MEMORY_ACCESS || access.words.empty()) {
+  if (access.type != SPV_OPERAND_TYPE_MEMORY_ACCESS ||
+      access.words.size() != 1) {
     return false;
   }
   const uint32_t mask = access.words[0];
-  const uint32_t allowed = uint32_t(spv::MemoryAccessMask::Aligned);
-  return (mask & ~allowed) == 0;
+  const uint32_t aligned = uint32_t(spv::MemoryAccessMask::Aligned);
+  const uint32_t alias_scope =
+      uint32_t(spv::MemoryAccessMask::AliasScopeINTELMask);
+  const uint32_t no_alias = uint32_t(spv::MemoryAccessMask::NoAliasINTELMask);
+  const uint32_t allowed = aligned |
+                           uint32_t(spv::MemoryAccessMask::Nontemporal) |
+                           uint32_t(spv::MemoryAccessMask::NonPrivatePointer) |
+                           alias_scope | no_alias;
+  if ((mask & ~allowed) != 0) return false;
+
+  uint32_t parameter_count = 0;
+  uint32_t parameter_index = first_in_operand + 1;
+  if ((mask & aligned) != 0) {
+    ++parameter_count;
+    ++parameter_index;
+  }
+  if ((mask & alias_scope) != 0) {
+    if (parameter_index >= inst->NumInOperands() ||
+        !IsModuleVisibleValue(inst->GetSingleWordInOperand(parameter_index))) {
+      return false;
+    }
+    ++parameter_count;
+    ++parameter_index;
+  }
+  if ((mask & no_alias) != 0) {
+    if (parameter_index >= inst->NumInOperands() ||
+        !IsModuleVisibleValue(inst->GetSingleWordInOperand(parameter_index))) {
+      return false;
+    }
+    ++parameter_count;
+  }
+  return first_in_operand + 1 + parameter_count == inst->NumInOperands();
 }
 
 Instruction* HwLowerToStandardPass::TraceFunctionValueSource(
@@ -10261,16 +12544,17 @@ bool HwLowerToStandardPass::GetConstantU32(uint32_t id,
     *value = 0;
     return true;
   }
-  if (inst->opcode() != spv::Op::OpConstant &&
-      inst->opcode() != spv::Op::OpSpecConstant) {
+  if (inst->opcode() != spv::Op::OpConstant || inst->NumInOperands() != 1)
     return false;
-  }
   Instruction* type = get_def_use_mgr()->GetDef(inst->type_id());
+  const Operand& literal = inst->GetInOperand(0);
   if (!type || type->opcode() != spv::Op::OpTypeInt ||
-      type->GetSingleWordInOperand(0) > 32 || inst->NumInOperands() == 0) {
+      type->GetSingleWordInOperand(0) > 64 || literal.words.empty() ||
+      (type->GetSingleWordInOperand(0) > 32 &&
+       (literal.words.size() < 2 || literal.words[1] != 0))) {
     return false;
   }
-  *value = inst->GetSingleWordInOperand(0);
+  *value = literal.words[0];
   return true;
 }
 
@@ -10539,10 +12823,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateModuleConstantFromCompositeConstruct(
     // Check if operand is a module-scope constant
     const spv::Op op = operand_def->opcode();
     if (op != spv::Op::OpConstant && op != spv::Op::OpConstantNull &&
-        op != spv::Op::OpConstantComposite && op != spv::Op::OpSpecConstant &&
-        op != spv::Op::OpSpecConstantTrue &&
-        op != spv::Op::OpSpecConstantFalse &&
-        op != spv::Op::OpConstantTrue && op != spv::Op::OpConstantFalse) {
+        op != spv::Op::OpConstantComposite && op != spv::Op::OpConstantTrue &&
+        op != spv::Op::OpConstantFalse) {
       return 0;  // Not all operands are constants
     }
     const_operands.push_back(IdOperand(operand_id));

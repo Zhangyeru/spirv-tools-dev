@@ -38,6 +38,57 @@ bool HaveSameLayoutDecorations(ValidationState_t&, const Instruction*,
 bool HasConflictingMemberOffsets(const std::set<Decoration>&,
                                  const std::set<Decoration>&);
 
+bool IsSupportedHwMatMulComponentType(ValidationState_t& _, uint32_t type_id) {
+  const uint32_t bit_width = _.GetBitWidth(type_id);
+  if (_.IsFloatScalarType(type_id)) {
+    return bit_width == 16 || bit_width == 32;
+  }
+  if (_.IsIntScalarType(type_id)) {
+    return bit_width == 8 || bit_width == 16 || bit_width == 32;
+  }
+  return false;
+}
+
+spv_result_t ValidateHwMatMulComponentTypes(ValidationState_t& _,
+                                            const Instruction* inst,
+                                            uint32_t a_type_id,
+                                            uint32_t b_type_id,
+                                            uint32_t accumulator_type_id) {
+  const auto opcode_name = spvOpcodeString(inst->opcode());
+  if (!IsSupportedHwMatMulComponentType(_, a_type_id) ||
+      !IsSupportedHwMatMulComponentType(_, b_type_id) ||
+      !IsSupportedHwMatMulComponentType(_, accumulator_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name
+           << " component types must be 16/32-bit floating-point or "
+              "8/16/32-bit integer scalar types.";
+  }
+
+  const bool all_float = _.IsFloatScalarType(a_type_id) &&
+                         _.IsFloatScalarType(b_type_id) &&
+                         _.IsFloatScalarType(accumulator_type_id);
+  const bool all_integer = _.IsIntScalarType(a_type_id) &&
+                           _.IsIntScalarType(b_type_id) &&
+                           _.IsIntScalarType(accumulator_type_id);
+  if (!all_float && !all_integer) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name
+           << " input vector, matrix, and accumulator component types must "
+              "all be floating-point or all be integer.";
+  }
+
+  const uint32_t accumulator_width = _.GetBitWidth(accumulator_type_id);
+  if (accumulator_width < _.GetBitWidth(a_type_id) ||
+      accumulator_width < _.GetBitWidth(b_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opcode_name
+           << " accumulator component bit width must be at least the bit "
+              "width of both input vector and matrix component types.";
+  }
+
+  return SPV_SUCCESS;
+}
+
 bool IsAllowedTypeOrArrayOfSame(ValidationState_t& _, const Instruction* type,
                                 std::initializer_list<spv::Op> allowed) {
   if (std::find(allowed.begin(), allowed.end(), type->opcode()) !=
@@ -3058,22 +3109,17 @@ spv_result_t ValidateCooperativeVectorMatrixMulHW(ValidationState_t& _,
                                  "bias number of components")) {
       return error;
     }
+
+    if (result_type_id != bias->type_id()) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opcode_name << " result and bias types must match exactly.";
+    }
   }
 
-  if (input_component_type_id != matrix_component_type_id) {
-    return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << opcode_name << " input vector and matrix component types must match.";
-  }
-
-  if (!(_.IsIntScalarType(result_component_type_id) &&
-        _.GetBitWidth(result_component_type_id) == 32) &&
-      !(_.IsFloatScalarType(result_component_type_id) &&
-        (_.GetBitWidth(result_component_type_id) == 32 ||
-         _.GetBitWidth(result_component_type_id) == 16))) {
-    return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << opcode_name << " result component type <id> "
-           << _.getIdName(result_component_type_id)
-           << " is not a 32 bit int or 16/32 bit float.";
+  if (auto error = ValidateHwMatMulComponentTypes(
+          _, inst, input_component_type_id, matrix_component_type_id,
+          result_component_type_id)) {
+    return error;
   }
 
   if (auto error = check_equal(result_type->GetOperandAs<uint32_t>(2u),

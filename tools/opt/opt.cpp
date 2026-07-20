@@ -102,18 +102,23 @@ Options (in lexicographical order):)",
                and VK_AMD_shader_trinary_minmax with equivalent code using core
                instructions and capabilities.)");
   printf(R"(
-  --hw-lower-to-standard[=pack|scalar]
+  --hw-lower-to-standard[=<options>]
                Lowers supported HW cooperative matrix/vector ops and types to
                ordinary SPIR-V arrays while retaining other HW extension
                features. Defaults to pack, which uses packed vec4 arrays for
                f16/f32 types and scalar arrays otherwise. Use scalar to force
-               scalar arrays.)");
+               scalar arrays. Options are a comma-separated list containing an
+               optional pack or scalar mode and any of:
+                 max-elements=N,max-macs=N,
+                 unroll-elements=N,unroll-macs=N
+               Values must be positive and each unroll limit must not exceed
+               its corresponding hard limit.)");
   printf(R"(
-  --hw-lower-to-standard-extension-free[=pack|scalar]
+  --hw-lower-to-standard-extension-free[=<options>]
                Lowers supported HW cooperative matrix/vector ops and types and
                requires that no HW extension feature remain. Fails if an HW
                feature has no equivalent lowering. The pack and scalar modes
-               behave as for --hw-lower-to-standard.)");
+               and numeric options behave as for --hw-lower-to-standard.)");
   printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help

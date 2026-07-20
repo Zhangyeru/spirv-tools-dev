@@ -2103,6 +2103,183 @@ TEST_F(ValidateArithmetics, HwCoopMatIntegerRejectsFloatOperand) {
               HasSubstr("Expected arithmetic operands to be of Result Type"));
 }
 
+std::string GenerateHwCoopMatMulTypeCode(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability Int8
+OpCapability Int16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%s8 = OpTypeInt 8 1
+%u16 = OpTypeInt 16 0
+%s32 = OpTypeInt 32 1
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%f16_a = OpTypeCooperativeMatrixHW %f16 %c2 %c3 MatrixUseAHW
+%f32_a = OpTypeCooperativeMatrixHW %f32 %c2 %c3 MatrixUseAHW
+%f16_b = OpTypeCooperativeMatrixHW %f16 %c3 %c4 MatrixUseBHW
+%f32_b = OpTypeCooperativeMatrixHW %f32 %c3 %c4 MatrixUseBHW
+%f16_acc = OpTypeCooperativeMatrixHW %f16 %c2 %c4 MatrixAccumulatorHW
+%f32_acc = OpTypeCooperativeMatrixHW %f32 %c2 %c4 MatrixAccumulatorHW
+%s8_a = OpTypeCooperativeMatrixHW %s8 %c2 %c3 MatrixUseAHW
+%u16_b = OpTypeCooperativeMatrixHW %u16 %c3 %c4 MatrixUseBHW
+%s32_acc = OpTypeCooperativeMatrixHW %s32 %c2 %c4 MatrixAccumulatorHW
+%f16_a_value = OpUndef %f16_a
+%f32_a_value = OpUndef %f32_a
+%f16_b_value = OpUndef %f16_b
+%f32_b_value = OpUndef %f32_b
+%f16_acc_value = OpUndef %f16_acc
+%f32_acc_value = OpUndef %f32_acc
+%s8_a_value = OpUndef %s8_a
+%u16_b_value = OpUndef %u16_b
+%s32_acc_value = OpUndef %s32_acc
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+std::string GenerateUnsupported64BitHwCoopMatMulTypeCode(
+    const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Float64
+OpCapability Int64
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f64 = OpTypeFloat 64
+%s64 = OpTypeInt 64 1
+%u64 = OpTypeInt 64 0
+%c2 = OpConstant %u32 2
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%f64_a = OpTypeCooperativeMatrixHW %f64 %c2 %c3 MatrixUseAHW
+%f64_b = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseBHW
+%f64_acc = OpTypeCooperativeMatrixHW %f64 %c2 %c4 MatrixAccumulatorHW
+%s64_a = OpTypeCooperativeMatrixHW %s64 %c2 %c3 MatrixUseAHW
+%u64_b = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseBHW
+%u64_acc = OpTypeCooperativeMatrixHW %u64 %c2 %c4 MatrixAccumulatorHW
+%f64_a_value = OpUndef %f64_a
+%f64_b_value = OpUndef %f64_b
+%f64_acc_value = OpUndef %f64_acc
+%s64_a_value = OpUndef %s64_a
+%u64_b_value = OpUndef %u64_b
+%u64_acc_value = OpUndef %u64_acc
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulRejectsFloat64Components) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %f64_acc %f64_a_value %f64_b_value %f64_acc_value
+)";
+
+  CompileSuccessfully(
+      GenerateUnsupported64BitHwCoopMatMulTypeCode(body).c_str(),
+      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("component types must be 16/32-bit floating-point"));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulRejectsInt64Components) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %u64_acc %s64_a_value %u64_b_value %u64_acc_value
+)";
+
+  CompileSuccessfully(
+      GenerateUnsupported64BitHwCoopMatMulTypeCode(body).c_str(),
+      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("8/16/32-bit integer scalar types"));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulAllowsMixedFloatWidening) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %f32_acc %f16_a_value %f32_b_value %f32_acc_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatMulTypeCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulAllowsMixedIntegerWidening) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %s32_acc %s8_a_value %u16_b_value %s32_acc_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatMulTypeCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulRejectsAccumulatorTypeMismatch) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %f32_acc %f16_a_value %f32_b_value %f16_acc_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatMulTypeCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("C and result types must match exactly"));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulRejectsCrossNumericDomain) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %s32_acc %f16_a_value %f32_b_value %s32_acc_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatMulTypeCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must all be floating-point or all be integer"));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatMulRejectsNarrowingAccumulator) {
+  const std::string body = R"(
+%result = OpCooperativeMatrixMulAddHW %f16_acc %f32_a_value %f16_b_value %f16_acc_value
+)";
+
+  CompileSuccessfully(GenerateHwCoopMatMulTypeCode(body).c_str(),
+                      SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("accumulator component bit width must be at least"));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

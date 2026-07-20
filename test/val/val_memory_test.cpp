@@ -8574,6 +8574,170 @@ TEST_F(ValidateMemory, CoopVecHWMatMulResultColumnMismatchFail) {
                         "components 100 does not match matrix column count 20"));
 }
 
+std::string GenCoopVecHWMatMulTypeShader(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability Int8
+OpCapability Int16
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%s8 = OpTypeInt 8 1
+%u16 = OpTypeInt 16 0
+%s32 = OpTypeInt 32 1
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%f16_input = OpTypeCooperativeVectorHW %f16 %c3
+%f32_input = OpTypeCooperativeVectorHW %f32 %c3
+%f16_matrix = OpTypeCooperativeMatrixHW %f16 %c3 %c4 MatrixUseAHW
+%f32_matrix = OpTypeCooperativeMatrixHW %f32 %c3 %c4 MatrixUseAHW
+%f16_result = OpTypeCooperativeVectorHW %f16 %c4
+%f32_result = OpTypeCooperativeVectorHW %f32 %c4
+%s8_input = OpTypeCooperativeVectorHW %s8 %c3
+%u16_matrix = OpTypeCooperativeMatrixHW %u16 %c3 %c4 MatrixUseAHW
+%s32_result = OpTypeCooperativeVectorHW %s32 %c4
+%f16_input_value = OpUndef %f16_input
+%f32_input_value = OpUndef %f32_input
+%f16_matrix_value = OpUndef %f16_matrix
+%f32_matrix_value = OpUndef %f32_matrix
+%f16_bias_value = OpUndef %f16_result
+%f32_bias_value = OpUndef %f32_result
+%s8_input_value = OpUndef %s8_input
+%u16_matrix_value = OpUndef %u16_matrix
+%s32_bias_value = OpUndef %s32_result
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+std::string GenUnsupported64BitCoopVecHWMatMulTypeShader(
+    const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Float64
+OpCapability Int64
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%f64 = OpTypeFloat 64
+%s64 = OpTypeInt 64 1
+%u64 = OpTypeInt 64 0
+%c3 = OpConstant %u32 3
+%c4 = OpConstant %u32 4
+%f64_input = OpTypeCooperativeVectorHW %f64 %c3
+%f64_matrix = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseAHW
+%f64_result = OpTypeCooperativeVectorHW %f64 %c4
+%s64_input = OpTypeCooperativeVectorHW %s64 %c3
+%u64_matrix = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseAHW
+%u64_result = OpTypeCooperativeVectorHW %u64 %c4
+%f64_input_value = OpUndef %f64_input
+%f64_matrix_value = OpUndef %f64_matrix
+%f64_bias_value = OpUndef %f64_result
+%s64_input_value = OpUndef %s64_input
+%u64_matrix_value = OpUndef %u64_matrix
+%u64_bias_value = OpUndef %u64_result
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulRejectsFloat64Components) {
+  const std::string spirv = GenUnsupported64BitCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulAddHW %f64_result %f64_input_value %f64_matrix_value %f64_bias_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("component types must be 16/32-bit floating-point"));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulRejectsInt64Components) {
+  const std::string spirv = GenUnsupported64BitCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulAddHW %u64_result %s64_input_value %u64_matrix_value %u64_bias_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("8/16/32-bit integer scalar types"));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulAllowsMixedFloatWidening) {
+  const std::string spirv = GenCoopVecHWMatMulTypeShader(R"(
+%result0 = OpCooperativeVectorMatrixMulHW %f32_result %f16_input_value %f32_matrix_value
+%result1 = OpCooperativeVectorMatrixMulAddHW %f32_result %f16_input_value %f32_matrix_value %f32_bias_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulAllowsMixedIntegerWidening) {
+  const std::string spirv = GenCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulAddHW %s32_result %s8_input_value %u16_matrix_value %s32_bias_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulRejectsCrossNumericDomain) {
+  const std::string spirv = GenCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulHW %s32_result %f16_input_value %f32_matrix_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must all be floating-point or all be integer"));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulRejectsNarrowingAccumulator) {
+  const std::string spirv = GenCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulHW %f16_result %f32_input_value %f16_matrix_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("accumulator component bit width must be at least"));
+}
+
+TEST_F(ValidateMemory, CoopVecHWMatMulRejectsBiasTypeMismatch) {
+  const std::string spirv = GenCoopVecHWMatMulTypeShader(R"(
+%result = OpCooperativeVectorMatrixMulAddHW %f32_result %f16_input_value %f32_matrix_value %f16_bias_value
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("result and bias component types must match"));
+}
+
 TEST_F(ValidateMemory, CoopMatHWLoadFromUniformSuccess) {
   const std::string spirv = R"(
 OpCapability Shader

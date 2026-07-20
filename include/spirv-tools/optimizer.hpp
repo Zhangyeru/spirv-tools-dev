@@ -15,6 +15,7 @@
 #ifndef INCLUDE_SPIRV_TOOLS_OPTIMIZER_HPP_
 #define INCLUDE_SPIRV_TOOLS_OPTIMIZER_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <ostream>
 #include <string>
@@ -40,6 +41,28 @@ enum class HwLoweringCompleteness {
   // Require all HW extension features to be removed. The pass fails when it
   // encounters an HW feature for which no equivalent lowering is available.
   kExtensionFree,
+};
+
+// Configuration for the HW cooperative matrix/vector lowering pass.
+struct HwLowerToStandardOptions {
+  // Use scalar arrays for every lowered value instead of preferring packed
+  // vec4 arrays for naturally aligned f16/f32 values.
+  bool force_scalar_lowering = false;
+
+  // Controls whether unsupported, non-cooperative HW extension features may
+  // remain in the module.
+  HwLoweringCompleteness completeness =
+      HwLoweringCompleteness::kCooperativeOnly;
+
+  // Hard ceilings that protect the pass from unexpectedly large lowered
+  // values and matrix multiplications.
+  uint32_t max_elements = 1048576;
+  uint64_t max_matmul_macs = 16777216;
+
+  // Operations above these thresholds are emitted as structured loops rather
+  // than being fully unrolled.
+  uint32_t max_unrolled_elements = 4096;
+  uint64_t max_unrolled_matmul_macs = 4096;
 };
 
 // C++ interface for SPIR-V optimization functionalities. It wraps the context
@@ -853,7 +876,10 @@ Optimizer::PassToken CreateAmdExtToKhrPass();
 // Creates an HW cooperative matrix/vector lowering pass.
 // This pass lowers supported HW cooperative types and operations to ordinary
 // SPIR-V arrays. The no-argument and bool-only overloads use cooperative-only
-// completeness.
+// completeness and all legacy overloads otherwise use the defaults in
+// HwLowerToStandardOptions.
+Optimizer::PassToken CreateHwLowerToStandardPass(
+    const HwLowerToStandardOptions& options);
 Optimizer::PassToken CreateHwLowerToStandardPass();
 Optimizer::PassToken CreateHwLowerToStandardPass(bool force_scalar_lowering);
 Optimizer::PassToken CreateHwLowerToStandardPass(

@@ -23,6 +23,60 @@
 
 namespace spvtools {
 namespace val {
+namespace {
+
+bool IsSupportedHwMatMulComponentType(ValidationState_t& _, uint32_t type_id) {
+  const uint32_t bit_width = _.GetBitWidth(type_id);
+  if (_.IsFloatScalarType(type_id)) {
+    return bit_width == 16 || bit_width == 32;
+  }
+  if (_.IsIntScalarType(type_id)) {
+    return bit_width == 8 || bit_width == 16 || bit_width == 32;
+  }
+  return false;
+}
+
+spv_result_t ValidateHwMatMulComponentTypes(ValidationState_t& _,
+                                            const Instruction* inst,
+                                            uint32_t a_type_id,
+                                            uint32_t b_type_id,
+                                            uint32_t accumulator_type_id) {
+  const auto opcode_name = spvOpcodeString(inst->opcode());
+  if (!IsSupportedHwMatMulComponentType(_, a_type_id) ||
+      !IsSupportedHwMatMulComponentType(_, b_type_id) ||
+      !IsSupportedHwMatMulComponentType(_, accumulator_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_DATA, inst)
+           << opcode_name
+           << " component types must be 16/32-bit floating-point or "
+              "8/16/32-bit integer scalar types.";
+  }
+
+  const bool all_float = _.IsFloatScalarType(a_type_id) &&
+                         _.IsFloatScalarType(b_type_id) &&
+                         _.IsFloatScalarType(accumulator_type_id);
+  const bool all_integer = _.IsIntScalarType(a_type_id) &&
+                           _.IsIntScalarType(b_type_id) &&
+                           _.IsIntScalarType(accumulator_type_id);
+  if (!all_float && !all_integer) {
+    return _.diag(SPV_ERROR_INVALID_DATA, inst)
+           << opcode_name
+           << " A, B, and accumulator component types must all be "
+              "floating-point or all be integer.";
+  }
+
+  const uint32_t accumulator_width = _.GetBitWidth(accumulator_type_id);
+  if (accumulator_width < _.GetBitWidth(a_type_id) ||
+      accumulator_width < _.GetBitWidth(b_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_DATA, inst)
+           << opcode_name
+           << " accumulator component bit width must be at least the bit "
+              "width of both A and B component types.";
+  }
+
+  return SPV_SUCCESS;
+}
+
+}  // namespace
 
 // Validates correctness of arithmetic instructions.
 spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
@@ -752,6 +806,22 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       const auto B = _.FindDef(B_type_id);
       const auto C = _.FindDef(C_type_id);
       const auto D = _.FindDef(D_type_id);
+
+      const uint32_t A_component_type_id = A->GetOperandAs<uint32_t>(1);
+      const uint32_t B_component_type_id = B->GetOperandAs<uint32_t>(1);
+      const uint32_t D_component_type_id = D->GetOperandAs<uint32_t>(1);
+
+      if (C_type_id != D_type_id) {
+        return _.diag(SPV_ERROR_INVALID_DATA, inst)
+               << spvOpcodeString(opcode)
+               << " C and result types must match exactly.";
+      }
+
+      if (auto error = ValidateHwMatMulComponentTypes(
+              _, inst, A_component_type_id, B_component_type_id,
+              D_component_type_id)) {
+        return error;
+      }
 
       std::tuple<bool, bool, uint32_t> A_rows, B_rows, C_rows, D_rows, A_cols,
           B_cols, C_cols, D_cols;

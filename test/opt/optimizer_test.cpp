@@ -207,6 +207,19 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       opt.RegisterPassFromFlag("--hw-lower-to-standard-extension-free=pack"));
   EXPECT_TRUE(
       opt.RegisterPassFromFlag("--hw-lower-to-standard-extension-free=scalar"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag(
+      "--hw-lower-to-standard=max-elements=8192,max-macs=32768,"
+      "unroll-elements=1024,unroll-macs=2048"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag(
+      "--hw-lower-to-standard=scalar,max-elements=8192,max-macs=32768,"
+      "unroll-elements=1024,unroll-macs=2048"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag(
+      "--hw-lower-to-standard-extension-free=max-elements=8192,"
+      "unroll-elements=1024"));
+  EXPECT_TRUE(opt.RegisterPassFromFlag(
+      "--hw-lower-to-standard=pack,max-elements=4294967295,"
+      "max-macs=18446744073709551615,unroll-elements=4294967295,"
+      "unroll-macs=18446744073709551615"));
 
   // Test some invalid flags.
   EXPECT_FALSE(opt.RegisterPassFromFlag("-O2"));
@@ -236,6 +249,87 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
   EXPECT_FALSE(
       opt.RegisterPassFromFlag("--hw-lower-to-standard-extension-free=bad"));
   EXPECT_EQ(msg_level, SPV_MSG_ERROR);
+
+  const std::vector<std::string> invalid_hw_lower_flags = {
+      "--hw-lower-to-standard=",
+      "--hw-lower-to-standard=pack,",
+      "--hw-lower-to-standard=,pack",
+      "--hw-lower-to-standard=pack,scalar",
+      "--hw-lower-to-standard=pack,pack",
+      "--hw-lower-to-standard=max-elements=1,max-elements=2",
+      "--hw-lower-to-standard=max-elements=0",
+      "--hw-lower-to-standard=max-macs=0",
+      "--hw-lower-to-standard=unroll-elements=0",
+      "--hw-lower-to-standard=unroll-macs=0",
+      "--hw-lower-to-standard=max-elements=-1",
+      "--hw-lower-to-standard=max-elements=abc",
+      "--hw-lower-to-standard=max-elements=4294967296",
+      "--hw-lower-to-standard=max-macs=18446744073709551616",
+      "--hw-lower-to-standard=unroll-elements=4294967296",
+      "--hw-lower-to-standard=unroll-macs=18446744073709551616",
+      "--hw-lower-to-standard=max-elements=1024,unroll-elements=1025",
+      "--hw-lower-to-standard=max-macs=1024,unroll-macs=1025",
+      "--hw-lower-to-standard=unknown=1",
+      "--hw-lower-to-standard=scalar=1",
+      "--hw-lower-to-standard=max-elements=1=2",
+      "--hw-lower-to-standard-extension-free=pack,max-macs=1,"
+      "unroll-macs=2",
+  };
+  for (const auto& flag : invalid_hw_lower_flags) {
+    EXPECT_FALSE(opt.RegisterPassFromFlag(flag)) << flag;
+    EXPECT_EQ(msg_level, SPV_MSG_ERROR) << flag;
+  }
+}
+
+TEST(Optimizer, HwLowerToStandardOptionsHaveStableDefaults) {
+  const HwLowerToStandardOptions options;
+  EXPECT_FALSE(options.force_scalar_lowering);
+  EXPECT_EQ(options.completeness, HwLoweringCompleteness::kCooperativeOnly);
+  EXPECT_EQ(options.max_elements, 1048576u);
+  EXPECT_EQ(options.max_matmul_macs, 16777216u);
+  EXPECT_EQ(options.max_unrolled_elements, 4096u);
+  EXPECT_EQ(options.max_unrolled_matmul_macs, 4096u);
+
+  Optimizer optimizer(SPV_ENV_UNIVERSAL_1_0);
+  optimizer.RegisterPass(CreateHwLowerToStandardPass(options));
+}
+
+TEST(Optimizer, HwLowerToStandardLimitsReachPassFromApiAndFlag) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_0);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(text, &binary));
+
+  HwLowerToStandardOptions options;
+  options.max_elements = 4;
+  options.max_unrolled_elements = 4;
+  Optimizer api_optimizer(SPV_ENV_UNIVERSAL_1_0);
+  api_optimizer.RegisterPass(CreateHwLowerToStandardPass(options));
+  std::vector<uint32_t> output;
+  EXPECT_FALSE(api_optimizer.Run(binary.data(), binary.size(), &output));
+
+  Optimizer flag_optimizer(SPV_ENV_UNIVERSAL_1_0);
+  EXPECT_TRUE(flag_optimizer.RegisterPassFromFlag(
+      "--hw-lower-to-standard=max-elements=4,unroll-elements=4"));
+  EXPECT_FALSE(flag_optimizer.Run(binary.data(), binary.size(), &output));
 }
 
 TEST(Optimizer, RemoveNop) {

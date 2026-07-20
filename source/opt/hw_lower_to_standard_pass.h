@@ -49,8 +49,16 @@ class HwLowerToStandardPass : public Pass {
 
   explicit HwLowerToStandardPass(
       LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4,
-      CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly)
-      : lowering_mode_(lowering_mode), completeness_mode_(completeness_mode) {}
+      CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly,
+      uint32_t max_elements = 1048576, uint64_t max_matmul_macs = 16777216,
+      uint32_t max_unrolled_elements = 4096,
+      uint64_t max_unrolled_matmul_macs = 4096)
+      : lowering_mode_(lowering_mode),
+        completeness_mode_(completeness_mode),
+        max_elements_(max_elements),
+        max_matmul_macs_(max_matmul_macs),
+        max_unrolled_elements_(max_unrolled_elements),
+        max_unrolled_matmul_macs_(max_unrolled_matmul_macs) {}
 
   const char* name() const override { return "hw-lower-to-standard"; }
   Status Process() override;
@@ -91,9 +99,12 @@ class HwLowerToStandardPass : public Pass {
     kArithmetic,
     kScale,
     kExtInst,
+    kSelect,
+    kBroadcast,
   };
 
   bool CollectHwTypes();
+  bool MaterializeLoweredTypes();
   bool PreflightExtensionFreeMode() const;
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
@@ -109,8 +120,12 @@ class HwLowerToStandardPass : public Pass {
   bool LowerMatrixMulAdd(Instruction* inst);
   bool LowerMatrixMulAddPackedVec4(Instruction* inst);
   bool LowerMatrixMulAddScalarFallback(Instruction* inst);
+  bool LowerMatrixMulAddWithLoop(Instruction* inst);
   bool LowerMatrixLength(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerMatrixReduce(Instruction* inst);
+  bool LowerMatrixReduceImpl(Instruction* inst);
+  bool LowerMatrixReduceWithLoop(Instruction* inst, uint32_t reduce_axis,
+                                 uint32_t combine_op);
   bool LowerVectorLoad(Instruction* inst);
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
@@ -121,6 +136,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
+  bool LowerVectorMatrixMulWithLoop(Instruction* inst, bool has_bias);
   bool LowerConstantComposite(Instruction* inst);
   bool LowerCompositeConstruct(Instruction* inst);
   bool LowerCompositeExtract(Instruction* inst);
@@ -148,6 +164,7 @@ class HwLowerToStandardPass : public Pass {
   uint32_t GetOrCreateVoidType();
   uint32_t GetOrCreateBoolType();
   uint32_t GetOrCreateUIntType();
+  uint32_t GetOrCreateIntegerType(uint32_t width, bool is_signed);
   uint32_t GetOrCreateUIntConstant(uint32_t value);
   uint32_t GetOrCreateUIntTypeAfter(Instruction** insert_after);
   uint32_t GetOrCreateUIntConstantAfter(uint32_t value,
@@ -168,6 +185,14 @@ class HwLowerToStandardPass : public Pass {
                                    const MatrixTypeInfo& info,
                                    uint32_t shape_id, uint32_t offset_id,
                                    uint32_t layout, uint32_t row, uint32_t col);
+  uint32_t BuildDynamicMatrixElementIndex(InstructionBuilder* builder,
+                                          Instruction* user, uint32_t shape_id,
+                                          uint32_t offset_id, uint32_t layout,
+                                          uint32_t matrix_cols,
+                                          uint32_t flat_index_id);
+  uint32_t BuildVectorElementIndex(InstructionBuilder* builder,
+                                   Instruction* user, uint32_t offset_id,
+                                   uint32_t logical_index_id);
   uint32_t BuildElementAccess(InstructionBuilder* builder, Instruction* user,
                               uint32_t pointer_id, uint32_t component_type_id,
                               uint32_t element_index_id);
@@ -178,6 +203,16 @@ class HwLowerToStandardPass : public Pass {
                                              uint32_t element_index_id);
   Instruction* AddFunctionVariable(Function* function, uint32_t pointer_type_id,
                                    uint32_t initializer_id = 0);
+  uint32_t BuildLogicalAggregateLoad(InstructionBuilder* builder,
+                                     uint32_t aggregate_pointer_id,
+                                     uint32_t component_type_id,
+                                     uint32_t packed_vec4_type_id,
+                                     uint32_t logical_index_id);
+  bool BuildLogicalAggregateStore(InstructionBuilder* builder,
+                                  uint32_t aggregate_pointer_id,
+                                  uint32_t component_type_id,
+                                  uint32_t packed_vec4_type_id,
+                                  uint32_t logical_index_id, uint32_t value_id);
   BasicBlock* MakeBasicBlock(uint32_t label_id);
   bool BuildPackedMatrixLoadOuterLoop(
       Instruction* insert_before, const MatrixTypeInfo& info,
@@ -191,12 +226,21 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& memory_operands);
   bool BuildPackedVectorLoadOuterLoop(
       Instruction* insert_before, const VectorTypeInfo& info,
-      uint32_t pointer_id, uint32_t pointer_type_id,
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t offset_id,
       const std::vector<Operand>& memory_operands, uint32_t* result_id);
   bool BuildPackedVectorStoreOuterLoop(
       Instruction* insert_before, const VectorTypeInfo& info,
-      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t object_id,
-      const std::vector<Operand>& memory_operands);
+      uint32_t pointer_id, uint32_t pointer_type_id, uint32_t offset_id,
+      uint32_t object_id, const std::vector<Operand>& memory_operands);
+  bool BuildScalarMemoryLoop(Instruction* insert_before,
+                             uint32_t lowered_type_id,
+                             uint32_t component_type_id, uint32_t element_count,
+                             uint32_t pointer_id, uint32_t object_id,
+                             uint32_t shape_id, uint32_t offset_id,
+                             uint32_t matrix_cols, uint32_t layout,
+                             bool is_matrix, uint32_t packed_vec4_type_id,
+                             const std::vector<Operand>& memory_operands,
+                             uint32_t* result_id);
   uint32_t BuildFusedVectorMatmulStoreFunctionPackedVec4(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, uint32_t input_pointer_id,
@@ -261,10 +305,22 @@ class HwLowerToStandardPass : public Pass {
                    uint32_t pointer_id,
                    const std::vector<Operand>& memory_operands);
   bool AddStore(InstructionBuilder* builder, uint32_t pointer_id,
-                uint32_t object_id,
-                const std::vector<Operand>& memory_operands);
+                uint32_t object_id, const std::vector<Operand>& memory_operands,
+                uint32_t accessed_type_id = 0);
   std::vector<Operand> CopyMemoryOperands(const Instruction* inst,
                                           uint32_t first_in_operand) const;
+  bool NormalizeMemoryOperandsForAccess(
+      uint32_t pointer_id, uint32_t accessed_type_id,
+      const std::vector<Operand>& memory_operands,
+      std::vector<Operand>* normalized) const;
+  bool GetKnownAccessByteOffset(uint32_t pointer_id, uint32_t accessed_type_id,
+                                uint64_t* byte_offset) const;
+  bool TryEvaluateConstantU32Expression(uint32_t id, uint32_t* value,
+                                        uint32_t depth = 0) const;
+  bool TryEvaluateConstantFloat32(uint32_t id, float* value,
+                                  uint32_t depth = 0) const;
+  uint32_t GetTypeNaturalAlignment(uint32_t type_id) const;
+  uint32_t GetArrayStride(uint32_t array_type_id) const;
   uint32_t ExtractVectorScalar(InstructionBuilder* builder,
                                const VectorTypeInfo& info, uint32_t vector_id,
                                uint32_t index);
@@ -307,6 +363,11 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildFma(InstructionBuilder* builder, uint32_t type_id,
                     uint32_t multiplicand_id, uint32_t multiplier_id,
                     uint32_t addend_id);
+  uint32_t BuildMatmulAccumulate(InstructionBuilder* builder,
+                                 uint32_t accumulator_type_id,
+                                 uint32_t lhs_type_id, uint32_t lhs_id,
+                                 uint32_t rhs_type_id, uint32_t rhs_id,
+                                 uint32_t accumulator_id);
   uint32_t BuildHorizontalReduce(InstructionBuilder* builder,
                                  uint32_t component_type_id,
                                  uint32_t vector_id);
@@ -452,6 +513,10 @@ class HwLowerToStandardPass : public Pass {
   uint32_t VectorPackedIndex(uint32_t scalar_index) const;
   uint32_t PackedLane(uint32_t scalar_index) const;
   uint32_t GetOrCreateGLSLStd450Import();
+  uint32_t GetFPFastMathMode(uint32_t result_id) const;
+  void ApplyActiveFPFastMathMode(Instruction* inst);
+  bool MatmulAllowsReassociation(const Instruction* inst) const;
+  void RemoveFPFastMathMode(uint32_t result_id);
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const MatrixTypeInfo* GetMatrixTypeForValue(
@@ -502,6 +567,11 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
+  uint32_t max_elements_ = 1048576;
+  uint64_t max_matmul_macs_ = 16777216;
+  uint32_t max_unrolled_elements_ = 4096;
+  uint64_t max_unrolled_matmul_macs_ = 4096;
+  uint32_t active_fp_fast_math_mode_ = 0;
 };
 
 }  // namespace opt

@@ -16,10 +16,12 @@
 
 #include <cassert>
 #include <charconv>
+#include <limits>
 #include <memory>
 #include <string>
 #include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -33,6 +35,97 @@
 #include "source/util/string_utils.h"
 
 namespace spvtools {
+
+namespace {
+
+bool ParsePositiveUint64(const std::string& text, uint64_t* value) {
+  if (text.empty()) return false;
+  const char* begin = text.data();
+  const char* end = begin + text.size();
+  const auto result = std::from_chars(begin, end, *value);
+  return result.ec == std::errc() && result.ptr == end && *value != 0;
+}
+
+bool ParseHwLowerOptions(const std::string& pass_args,
+                         HwLowerToStandardOptions* options,
+                         std::string* error) {
+  if (pass_args.empty()) return true;
+
+  std::unordered_set<std::string> seen;
+  size_t begin = 0;
+  while (begin <= pass_args.size()) {
+    const size_t end = pass_args.find(',', begin);
+    const std::string argument = pass_args.substr(begin, end - begin);
+    if (argument.empty()) {
+      *error = "empty argument";
+      return false;
+    }
+
+    if (argument == "pack" || argument == "scalar") {
+      if (!seen.insert("mode").second) {
+        *error = "duplicate mode";
+        return false;
+      }
+      options->force_scalar_lowering = argument == "scalar";
+    } else {
+      const size_t equals = argument.find('=');
+      if (equals == std::string::npos || equals == 0 ||
+          equals + 1 == argument.size() ||
+          argument.find('=', equals + 1) != std::string::npos) {
+        *error = "unknown argument '" + argument + "'";
+        return false;
+      }
+
+      const std::string name = argument.substr(0, equals);
+      if (!seen.insert(name).second) {
+        *error = "duplicate argument '" + name + "'";
+        return false;
+      }
+
+      uint64_t value = 0;
+      if (!ParsePositiveUint64(argument.substr(equals + 1), &value)) {
+        *error = "invalid value for '" + name + "'";
+        return false;
+      }
+
+      if (name == "max-elements") {
+        if (value > std::numeric_limits<uint32_t>::max()) {
+          *error = "value for 'max-elements' is out of range";
+          return false;
+        }
+        options->max_elements = static_cast<uint32_t>(value);
+      } else if (name == "max-macs") {
+        options->max_matmul_macs = value;
+      } else if (name == "unroll-elements") {
+        if (value > std::numeric_limits<uint32_t>::max()) {
+          *error = "value for 'unroll-elements' is out of range";
+          return false;
+        }
+        options->max_unrolled_elements = static_cast<uint32_t>(value);
+      } else if (name == "unroll-macs") {
+        options->max_unrolled_matmul_macs = value;
+      } else {
+        *error = "unknown argument '" + name + "'";
+        return false;
+      }
+    }
+
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+
+  if (options->max_unrolled_elements > options->max_elements) {
+    *error = "unroll-elements must not exceed max-elements";
+    return false;
+  }
+  if (options->max_unrolled_matmul_macs > options->max_matmul_macs) {
+    *error = "unroll-macs must not exceed max-macs";
+    return false;
+  }
+  return true;
+}
+
+}  // namespace
 
 std::vector<std::string> GetVectorOfStrings(const char** strings,
                                             const size_t string_count) {
@@ -321,18 +414,19 @@ bool Optimizer::RegisterPassFromFlag(const std::string& flag,
   // can be invoked without creating a pass instance.
   if (pass_name == "hw-lower-to-standard" ||
       pass_name == "hw-lower-to-standard-extension-free") {
-    const auto completeness = pass_name == "hw-lower-to-standard-extension-free"
-                                  ? HwLoweringCompleteness::kExtensionFree
-                                  : HwLoweringCompleteness::kCooperativeOnly;
-    if (pass_args.empty() || pass_args == "pack") {
-      RegisterPass(CreateHwLowerToStandardPass(false, completeness));
-    } else if (pass_args == "scalar") {
-      RegisterPass(CreateHwLowerToStandardPass(true, completeness));
-    } else {
-      Errorf(consumer(), nullptr, {}, "Invalid argument for --%s: %s",
-             pass_name.c_str(), pass_args.c_str());
+    HwLowerToStandardOptions options;
+    options.completeness = pass_name == "hw-lower-to-standard-extension-free"
+                               ? HwLoweringCompleteness::kExtensionFree
+                               : HwLoweringCompleteness::kCooperativeOnly;
+    std::string error;
+    if ((pass_args.empty() && flag.find('=') != std::string::npos) ||
+        !ParseHwLowerOptions(pass_args, &options, &error)) {
+      if (error.empty()) error = "empty argument";
+      Errorf(consumer(), nullptr, {}, "Invalid argument for --%s: %s (%s)",
+             pass_name.c_str(), pass_args.c_str(), error.c_str());
       return false;
     }
+    RegisterPass(CreateHwLowerToStandardPass(options));
   } else if (pass_name == "strip-debug") {
     RegisterPass(CreateStripDebugInfoPass());
   } else if (pass_name == "strip-reflect") {
@@ -1111,27 +1205,38 @@ Optimizer::PassToken CreateAmdExtToKhrPass() {
 }
 
 Optimizer::PassToken CreateHwLowerToStandardPass() {
-  return CreateHwLowerToStandardPass(false,
-                                     HwLoweringCompleteness::kCooperativeOnly);
+  return CreateHwLowerToStandardPass(HwLowerToStandardOptions{});
 }
 
 Optimizer::PassToken CreateHwLowerToStandardPass(bool force_scalar_lowering) {
-  return CreateHwLowerToStandardPass(force_scalar_lowering,
-                                     HwLoweringCompleteness::kCooperativeOnly);
+  HwLowerToStandardOptions options;
+  options.force_scalar_lowering = force_scalar_lowering;
+  return CreateHwLowerToStandardPass(options);
 }
 
 Optimizer::PassToken CreateHwLowerToStandardPass(
     bool force_scalar_lowering, HwLoweringCompleteness completeness) {
+  HwLowerToStandardOptions options;
+  options.force_scalar_lowering = force_scalar_lowering;
+  options.completeness = completeness;
+  return CreateHwLowerToStandardPass(options);
+}
+
+Optimizer::PassToken CreateHwLowerToStandardPass(
+    const HwLowerToStandardOptions& options) {
   const auto mode =
-      force_scalar_lowering
+      options.force_scalar_lowering
           ? opt::HwLowerToStandardPass::LoweringMode::kForceScalar
           : opt::HwLowerToStandardPass::LoweringMode::kPreferPackedVec4;
   const auto completeness_mode =
-      completeness == HwLoweringCompleteness::kExtensionFree
+      options.completeness == HwLoweringCompleteness::kExtensionFree
           ? opt::HwLowerToStandardPass::CompletenessMode::kExtensionFree
           : opt::HwLowerToStandardPass::CompletenessMode::kCooperativeOnly;
   return MakeUnique<Optimizer::PassToken::Impl>(
-      MakeUnique<opt::HwLowerToStandardPass>(mode, completeness_mode));
+      MakeUnique<opt::HwLowerToStandardPass>(
+          mode, completeness_mode, options.max_elements,
+          options.max_matmul_macs, options.max_unrolled_elements,
+          options.max_unrolled_matmul_macs));
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {
