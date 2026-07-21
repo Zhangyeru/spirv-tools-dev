@@ -75,6 +75,7 @@ constexpr uint32_t kDefaultMatrixTileM = 2;
 constexpr uint32_t kDefaultMatrixTileN = 4;
 constexpr uint32_t kDefaultVectorMatmulTileN = 4;
 constexpr uint32_t kPackedVec4Width = 4;
+constexpr uint32_t kMaxFusedConstantBiasPacks = 4;
 constexpr uint32_t kMaxCompositeConstituents = 65532;
 
 struct DirectVectorLoadCandidate {
@@ -1688,6 +1689,14 @@ bool HwLowerToStandardPass::LegalizeModule() {
     }
 
     if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
+      if (context()->get_decoration_mgr()->HasDecoration(
+              inst->result_id(), spv::Decoration::NoContraction)) {
+        ReportError(inst,
+                    "NoContraction HW cooperative matrix multiply cannot be "
+                    "lowered");
+        ok = false;
+        return;
+      }
       const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
       const MatrixTypeInfo* a = nullptr;
       const MatrixTypeInfo* b = nullptr;
@@ -1737,6 +1746,14 @@ bool HwLowerToStandardPass::LegalizeModule() {
 
     if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulHW ||
         inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW) {
+      if (context()->get_decoration_mgr()->HasDecoration(
+              inst->result_id(), spv::Decoration::NoContraction)) {
+        ReportError(inst,
+                    "NoContraction HW cooperative vector matrix multiply "
+                    "cannot be lowered");
+        ok = false;
+        return;
+      }
       const VectorTypeInfo* result = GetVectorType(inst->type_id());
       Instruction* input_inst =
           inst->NumInOperands() > kHwVectorMatrixMulInputInIdx
@@ -3571,9 +3588,14 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
   std::vector<Instruction*> object_chain;
   Instruction* matmul = TraceFunctionValueSource(object, inst, &object_chain);
-  if (!matmul || matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW)
+  if (!matmul ||
+      (matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW &&
+       matmul->opcode() != spv::Op::OpCooperativeVectorMatrixMulAddHW)) {
     return true;
+  }
   if (!MatmulAllowsReassociation(matmul)) return true;
+  const bool has_bias =
+      matmul->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW;
 
   Instruction* input_value = get_def_use_mgr()->GetDef(
       matmul->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
@@ -3600,8 +3622,25 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   const VectorTypeInfo* result = GetVectorType(matmul->type_id());
   const VectorTypeInfo* input = GetVectorType(input_load->type_id());
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_load);
+  const VectorTypeInfo* bias = nullptr;
+  Instruction* bias_source = nullptr;
+  std::vector<Instruction*> bias_chain;
+  uint32_t bias_constant_id = 0;
+  if (has_bias) {
+    Instruction* bias_value = get_def_use_mgr()->GetDef(
+        matmul->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
+    bias = bias_value ? GetVectorType(bias_value->type_id()) : nullptr;
+    bias_source = TraceFunctionValueSource(bias_value, matmul, &bias_chain);
+    if (!bias || !bias_source ||
+        bias_source->opcode() != spv::Op::OpConstantComposite ||
+        bias_source->type_id() != bias_value->type_id()) {
+      return true;
+    }
+    if (bias->packed_length > kMaxFusedConstantBiasPacks) return true;
+    bias_constant_id = bias_source->result_id();
+  }
   if (!result || !input || !matrix ||
-      !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, nullptr)) {
+      !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)) {
     return true;
   }
 
@@ -3624,6 +3663,25 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       matrix_load->GetSingleWordInOperand(kHwMatrixLoadOffsetInIdx);
   const uint32_t output_pointer_id =
       inst->GetSingleWordInOperand(kHwVectorStorePointerInIdx);
+  const uint32_t input_root_id = GetRootModulePointerId(input_pointer_id);
+  const uint32_t matrix_root_id = GetRootModulePointerId(matrix_pointer_id);
+  const uint32_t output_root_id = GetRootModulePointerId(output_pointer_id);
+  auto root_may_alias = [this](uint32_t root_id) {
+    auto* decoration_mgr = context()->get_decoration_mgr();
+    return decoration_mgr &&
+           (decoration_mgr->HasDecoration(root_id,
+                                          uint32_t(spv::Decoration::Aliased)) ||
+            decoration_mgr->HasDecoration(
+                root_id, uint32_t(spv::Decoration::AliasedPointer)));
+  };
+  if (input_root_id == 0 || matrix_root_id == 0 || output_root_id == 0 ||
+      output_root_id == input_root_id || output_root_id == matrix_root_id) {
+    return true;
+  }
+  if (root_may_alias(input_root_id) || root_may_alias(matrix_root_id) ||
+      root_may_alias(output_root_id)) {
+    return true;
+  }
   const uint32_t input_pointer_type_id = GetPointerTypeId(input_pointer_id);
   const uint32_t matrix_pointer_type_id = GetPointerTypeId(matrix_pointer_id);
   const uint32_t output_pointer_type_id = GetPointerTypeId(output_pointer_id);
@@ -3700,12 +3758,14 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
   for (Instruction* kill : object_chain) add_kill(kill);
   for (Instruction* kill : input_chain) add_kill(kill);
   for (Instruction* kill : matrix_chain) add_kill(kill);
+  for (Instruction* kill : bias_chain) add_kill(kill);
   add_kill(matmul);
   add_kill(input_load);
   add_kill(matrix_load);
   if (!add_dead_function_store_users(matmul) ||
       !add_dead_function_store_users(input_load) ||
-      !add_dead_function_store_users(matrix_load)) {
+      !add_dead_function_store_users(matrix_load) ||
+      (has_bias && !add_dead_function_store_users(bias_source))) {
     return true;
   }
 
@@ -3741,14 +3801,26 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
     }
   }
 
-  const uint32_t function_id = BuildFusedVectorMatmulStoreFunctionPackedVec4(
-      *result, *input, *matrix, input_pointer_id, input_pointer_type_id,
-      CopyMemoryOperands(input_load, kHwVectorLoadMemoryOperandsInIdx),
-      matrix_pointer_id, matrix_pointer_type_id, matrix_shape_id,
-      matrix_offset_id,
-      CopyMemoryOperands(matrix_load, kHwMatrixLoadMemoryOperandsInIdx),
-      output_pointer_id, output_pointer_type_id,
-      CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx));
+  const std::vector<Operand> input_memory_operands =
+      CopyMemoryOperands(input_load, kHwVectorLoadMemoryOperandsInIdx);
+  const std::vector<Operand> matrix_memory_operands =
+      CopyMemoryOperands(matrix_load, kHwMatrixLoadMemoryOperandsInIdx);
+  const std::vector<Operand> output_memory_operands =
+      CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx);
+  const uint32_t function_id =
+      has_bias
+          ? BuildFusedVectorMatmulAddStoreFunctionPackedVec4(
+                *result, *input, *matrix, bias, has_bias, bias_constant_id,
+                input_pointer_id, input_pointer_type_id, input_memory_operands,
+                matrix_pointer_id, matrix_pointer_type_id, matrix_shape_id,
+                matrix_offset_id, matrix_memory_operands, output_pointer_id,
+                output_pointer_type_id, output_memory_operands)
+          : BuildFusedVectorMatmulStoreFunctionPackedVec4(
+                *result, *input, *matrix, input_pointer_id,
+                input_pointer_type_id, input_memory_operands,
+                matrix_pointer_id, matrix_pointer_type_id, matrix_shape_id,
+                matrix_offset_id, matrix_memory_operands, output_pointer_id,
+                output_pointer_type_id, output_memory_operands);
   if (function_id == 0) return false;
 
   const uint32_t void_type_id = GetOrCreateVoidType();
@@ -4401,14 +4473,25 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
     bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
   }
-  if (!result || !input || !matrix ||
-      (has_bias && !bias) ||
+  if (!result || !input || !matrix || (has_bias && !bias) ||
       !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)) {
     return true;
   }
 
-  auto resolve_vector_load = [this, inst](Instruction* value_inst,
-                                          DirectVectorLoadCandidate* candidate) {
+  auto trace_changes_type = [this, inst](Instruction* value_inst) {
+    if (!value_inst) return true;
+    std::vector<Instruction*> chain;
+    Instruction* source = TraceFunctionValueSource(value_inst, inst, &chain);
+    return source && source->type_id() != value_inst->type_id();
+  };
+  if (trace_changes_type(input_inst) || trace_changes_type(matrix_inst) ||
+      (has_bias && trace_changes_type(bias_inst))) {
+    return true;
+  }
+
+  auto resolve_vector_load = [this, inst](
+                                 Instruction* value_inst,
+                                 DirectVectorLoadCandidate* candidate) {
     if (!candidate) return false;
     *candidate = {};
     Instruction* source =
@@ -7996,23 +8079,42 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
       result.packed_vec4_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
-  const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
   const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
-  const uint32_t result_packed_length_id =
-      GetOrCreateUIntConstant(result.packed_length);
-  const uint32_t input_packed_length_id =
-      GetOrCreateUIntConstant(input.packed_length);
+  const uint32_t result_length_id = GetOrCreateUIntConstant(result.length);
+  const uint32_t input_length_id = GetOrCreateUIntConstant(input.length);
   const uint32_t matrix_cols_id = GetOrCreateUIntConstant(matrix.cols);
   const uint32_t zero4_id = GetOrCreateZero(result.packed_vec4_type_id);
   if (input_load_function_id == 0 || matrix_load_function_id == 0 ||
       output_store_function_id == 0 || void_type_id == 0 ||
       function_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || vec4_function_ptr_type_id == 0 ||
-      bool_type_id == 0 || zero_uint_id == 0 || one_uint_id == 0 ||
-      four_uint_id == 0 || result_packed_length_id == 0 ||
-      input_packed_length_id == 0 || matrix_cols_id == 0 || zero4_id == 0) {
+      bool_type_id == 0 || zero_uint_id == 0 || four_uint_id == 0 ||
+      result_length_id == 0 || input_length_id == 0 || matrix_cols_id == 0 ||
+      zero4_id == 0) {
     return 0;
   }
+
+  auto get_constant_pair_component = [this](uint32_t pair_id, uint32_t index,
+                                            uint32_t* value) {
+    if (!value || index >= 2) return false;
+    Instruction* pair = get_def_use_mgr()->GetDef(pair_id);
+    if (!pair) return false;
+    if (pair->opcode() == spv::Op::OpConstantNull) {
+      *value = 0;
+      return true;
+    }
+    return pair->opcode() == spv::Op::OpConstantComposite &&
+           pair->NumInOperands() > index &&
+           GetConstantU32(pair->GetSingleWordInOperand(index), value);
+  };
+  uint32_t shape_cols = 0;
+  uint32_t offset_row = 0;
+  uint32_t offset_col = 0;
+  const bool direct_matrix_index =
+      get_constant_pair_component(matrix_shape_id, 1, &shape_cols) &&
+      get_constant_pair_component(matrix_offset_id, 0, &offset_row) &&
+      get_constant_pair_component(matrix_offset_id, 1, &offset_col) &&
+      shape_cols == matrix.cols && offset_row == 0 && offset_col == 0;
 
   const uint32_t function_id = TakeNextId();
   if (function_id == 0) return 0;
@@ -8093,9 +8195,9 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
   if (!out_pack_load) return 0;
   Instruction* out_cond = out_header_builder.AddBinaryOp(
       bool_type_id, spv::Op::OpULessThan, out_pack_load->result_id(),
-      result_packed_length_id);
-  if (!out_cond) return 0;
-  if (!out_header_builder.AddLoopMerge(out_merge_label_id,
+      result_length_id);
+  if (!out_cond ||
+      !out_header_builder.AddLoopMerge(out_merge_label_id,
                                        out_continue_label_id) ||
       !out_header_builder.AddConditionalBranch(
           out_cond->result_id(), out_body_label_id, out_merge_label_id)) {
@@ -8115,45 +8217,41 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
   Instruction* k_base_load =
       k_header_builder.AddLoad(uint_type_id, k_base_var->result_id());
   if (!k_base_load) return 0;
-  Instruction* k_cond =
-      k_header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
-                                   k_base_load->result_id(),
-                                   input_packed_length_id);
-  if (!k_cond) return 0;
-  if (!k_header_builder.AddLoopMerge(k_merge_label_id, k_continue_label_id) ||
+  Instruction* k_cond = k_header_builder.AddBinaryOp(
+      bool_type_id, spv::Op::OpULessThan, k_base_load->result_id(),
+      input_length_id);
+  if (!k_cond ||
+      !k_header_builder.AddLoopMerge(k_merge_label_id, k_continue_label_id) ||
       !k_header_builder.AddConditionalBranch(
           k_cond->result_id(), k_body_label_id, k_merge_label_id)) {
     return 0;
   }
 
   InstructionBuilder k_body_builder(context(), k_body_block.get());
-  Instruction* k_element_base = k_body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, k_base_load->result_id(), four_uint_id);
-  if (!k_element_base) return 0;
   Instruction* input_vec = k_body_builder.AddFunctionCall(
       input.packed_vec4_type_id, input_load_function_id,
-      {k_element_base->result_id()});
+      {k_base_load->result_id()});
   if (!input_vec) return 0;
-  Instruction* output_col_base = k_body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(), four_uint_id);
-  if (!output_col_base) return 0;
   std::array<uint32_t, kPackedVec4Width> weight_row_ids = {};
   for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
     const uint32_t lane_id = GetOrCreateUIntConstant(row_lane);
     if (lane_id == 0) return 0;
     Instruction* matrix_row = k_body_builder.AddBinaryOp(
-        uint_type_id, spv::Op::OpIAdd, k_element_base->result_id(), lane_id);
+        uint_type_id, spv::Op::OpIAdd, k_base_load->result_id(), lane_id);
     if (!matrix_row) return 0;
     Instruction* matrix_row_offset = k_body_builder.AddBinaryOp(
         uint_type_id, spv::Op::OpIMul, matrix_row->result_id(), matrix_cols_id);
     if (!matrix_row_offset) return 0;
     Instruction* matrix_local_base = k_body_builder.AddBinaryOp(
         uint_type_id, spv::Op::OpIAdd, matrix_row_offset->result_id(),
-        output_col_base->result_id());
+        out_pack_load->result_id());
     if (!matrix_local_base) return 0;
-    const uint32_t matrix_memory_base_id = BuildRowMajorMatrixMemoryIndex(
-        &k_body_builder, nullptr, matrix_shape_id, matrix_offset_id,
-        matrix.cols, matrix_local_base->result_id());
+    const uint32_t matrix_memory_base_id =
+        direct_matrix_index
+            ? matrix_local_base->result_id()
+            : BuildRowMajorMatrixMemoryIndex(
+                  &k_body_builder, nullptr, matrix_shape_id, matrix_offset_id,
+                  matrix.cols, matrix_local_base->result_id());
     if (matrix_memory_base_id == 0) return 0;
     Instruction* weight_row = k_body_builder.AddFunctionCall(
         matrix.packed_vec4_type_id, matrix_load_function_id,
@@ -8173,24 +8271,25 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
     }
     Instruction* weight = k_body_builder.AddCompositeConstruct(
         result.packed_vec4_type_id, weight_lane_ids);
-    Instruction* acc =
-        k_body_builder.AddLoad(result.packed_vec4_type_id,
-                               acc_vars[lane]->result_id());
+    Instruction* acc = k_body_builder.AddLoad(result.packed_vec4_type_id,
+                                               acc_vars[lane]->result_id());
     if (!weight || !acc) return 0;
     const uint32_t fma =
         BuildFma(&k_body_builder, result.packed_vec4_type_id,
                  input_vec->result_id(), weight->result_id(),
                  acc->result_id());
-    if (fma == 0) return 0;
-    if (!k_body_builder.AddStore(acc_vars[lane]->result_id(), fma)) return 0;
+    if (fma == 0 ||
+        !k_body_builder.AddStore(acc_vars[lane]->result_id(), fma)) {
+      return 0;
+    }
   }
   if (!k_body_builder.AddBranch(k_continue_label_id)) return 0;
 
   InstructionBuilder k_continue_builder(context(), k_continue_block.get());
   Instruction* next_k = k_continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, k_base_load->result_id(), one_uint_id);
-  if (!next_k) return 0;
-  if (!k_continue_builder.AddStore(k_base_var->result_id(),
+      uint_type_id, spv::Op::OpIAdd, k_base_load->result_id(), four_uint_id);
+  if (!next_k ||
+      !k_continue_builder.AddStore(k_base_var->result_id(),
                                    next_k->result_id()) ||
       !k_continue_builder.AddBranch(k_header_label_id)) {
     return 0;
@@ -8200,22 +8299,457 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
   std::vector<uint32_t> lane_ids;
   lane_ids.reserve(kPackedVec4Width);
   for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-    Instruction* acc =
-        k_merge_builder.AddLoad(result.packed_vec4_type_id,
-                                acc_vars[lane]->result_id());
+    Instruction* acc = k_merge_builder.AddLoad(result.packed_vec4_type_id,
+                                                acc_vars[lane]->result_id());
     if (!acc) return 0;
-    uint32_t reduced = BuildHorizontalReduce(&k_merge_builder,
-                                             result.component_type_id,
-                                             acc->result_id());
+    const uint32_t reduced = BuildHorizontalReduce(
+        &k_merge_builder, result.component_type_id, acc->result_id());
     if (reduced == 0) return 0;
     lane_ids.push_back(reduced);
   }
   Instruction* result_vec = k_merge_builder.AddCompositeConstruct(
       result.packed_vec4_type_id, lane_ids);
-  if (!result_vec) return 0;
-  Instruction* output_base = k_merge_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(), four_uint_id);
+  if (!result_vec ||
+      !k_merge_builder.AddFunctionCall(
+          void_type_id, output_store_function_id,
+          {out_pack_load->result_id(), result_vec->result_id()}) ||
+      !k_merge_builder.AddBranch(out_continue_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder out_continue_builder(context(), out_continue_block.get());
+  Instruction* next_out = out_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, out_pack_load->result_id(), four_uint_id);
+  if (!next_out ||
+      !out_continue_builder.AddStore(out_pack_var->result_id(),
+                                     next_out->result_id()) ||
+      !out_continue_builder.AddBranch(out_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder out_merge_builder(context(), out_merge_block.get());
+  if (!out_merge_builder.AddNullaryOp(0, spv::Op::OpReturn)) return 0;
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(entry_block));
+  function->AddBasicBlock(std::move(out_header_block));
+  function->AddBasicBlock(std::move(out_body_block));
+  function->AddBasicBlock(std::move(k_header_block));
+  function->AddBasicBlock(std::move(k_body_block));
+  function->AddBasicBlock(std::move(k_continue_block));
+  function->AddBasicBlock(std::move(k_merge_block));
+  function->AddBasicBlock(std::move(out_continue_block));
+  function->AddBasicBlock(std::move(out_merge_block));
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/true);
+  return function_id;
+}
+
+uint32_t HwLowerToStandardPass::BuildConstantPackedVectorSelectFunction(
+    const VectorTypeInfo& vector, uint32_t constant_id) {
+  if (!IsPackedVec4(vector) || vector.packed_length == 0 ||
+      vector.packed_length > kMaxFusedConstantBiasPacks || constant_id == 0) {
+    return 0;
+  }
+
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(vector.packed_vec4_type_id, {uint_type_id});
+  if (uint_type_id == 0 || bool_type_id == 0 || function_type_id == 0) {
+    return 0;
+  }
+
+  const uint32_t function_id = TakeNextId();
+  const uint32_t index_param_id = TakeNextId();
+  if (function_id == 0 || index_param_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, vector.packed_vec4_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+  function->AddParameter(MakeUnique<Instruction>(
+      context(), spv::Op::OpFunctionParameter, uint_type_id, index_param_id,
+      std::initializer_list<Operand>{}));
+
+  std::vector<uint32_t> check_label_ids;
+  check_label_ids.reserve(vector.packed_length - 1);
+  for (uint32_t pack = 0; pack + 1 < vector.packed_length; ++pack) {
+    const uint32_t label_id = TakeNextId();
+    if (label_id == 0) return 0;
+    check_label_ids.push_back(label_id);
+  }
+  std::vector<uint32_t> return_label_ids;
+  return_label_ids.reserve(vector.packed_length);
+  for (uint32_t pack = 0; pack < vector.packed_length; ++pack) {
+    const uint32_t label_id = TakeNextId();
+    if (label_id == 0) return 0;
+    return_label_ids.push_back(label_id);
+  }
+
+  std::vector<std::unique_ptr<BasicBlock>> check_blocks;
+  check_blocks.reserve(check_label_ids.size());
+  for (uint32_t label_id : check_label_ids) {
+    check_blocks.emplace_back(MakeBasicBlock(label_id));
+    if (!check_blocks.back()) return 0;
+  }
+  std::vector<std::unique_ptr<BasicBlock>> return_blocks;
+  return_blocks.reserve(return_label_ids.size());
+  for (uint32_t label_id : return_label_ids) {
+    return_blocks.emplace_back(MakeBasicBlock(label_id));
+    if (!return_blocks.back()) return 0;
+  }
+
+  for (uint32_t pack = 0; pack < check_blocks.size(); ++pack) {
+    InstructionBuilder builder(context(), check_blocks[pack].get());
+    const uint32_t pack_base_id =
+        GetOrCreateUIntConstant(pack * kPackedVec4Width);
+    Instruction* is_pack =
+        pack_base_id ? builder.AddBinaryOp(bool_type_id, spv::Op::OpIEqual,
+                                           index_param_id, pack_base_id)
+                     : nullptr;
+    const uint32_t next_check_label_id = pack + 1 < check_label_ids.size()
+                                             ? check_label_ids[pack + 1]
+                                             : return_label_ids.back();
+    if (!is_pack || !builder.AddSelectionMerge(next_check_label_id) ||
+        !builder.AddConditionalBranch(is_pack->result_id(),
+                                      return_label_ids[pack],
+                                      next_check_label_id)) {
+      return 0;
+    }
+  }
+
+  Instruction* constant = get_def_use_mgr()->GetDef(constant_id);
+  for (uint32_t pack = 0; pack < return_blocks.size(); ++pack) {
+    InstructionBuilder builder(context(), return_blocks[pack].get());
+    uint32_t value_id = 0;
+    if (constant && constant->opcode() == spv::Op::OpConstantComposite &&
+        constant->NumInOperands() == vector.packed_length) {
+      const uint32_t operand_id = constant->GetSingleWordInOperand(pack);
+      Instruction* operand = get_def_use_mgr()->GetDef(operand_id);
+      if (operand && operand->type_id() == vector.packed_vec4_type_id) {
+        value_id = operand_id;
+      }
+    }
+    if (value_id == 0) {
+      value_id = ExtractCompositeElement(&builder, vector.packed_vec4_type_id,
+                                         constant_id, pack);
+    }
+    if (value_id == 0 ||
+        !builder.AddUnaryOp(0, spv::Op::OpReturnValue, value_id)) {
+      return 0;
+    }
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  if (check_blocks.empty()) {
+    function->AddBasicBlock(std::move(return_blocks[0]));
+  } else {
+    for (uint32_t pack = 0; pack < check_blocks.size(); ++pack) {
+      function->AddBasicBlock(std::move(check_blocks[pack]));
+      function->AddBasicBlock(std::move(return_blocks[pack]));
+    }
+    function->AddBasicBlock(std::move(return_blocks.back()));
+  }
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
+  return function_id;
+}
+
+uint32_t
+HwLowerToStandardPass::BuildFusedVectorMatmulAddStoreFunctionPackedVec4(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+    uint32_t bias_constant_id, uint32_t input_pointer_id,
+    uint32_t input_pointer_type_id,
+    const std::vector<Operand>& input_memory_operands,
+    uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
+    uint32_t matrix_shape_id, uint32_t matrix_offset_id,
+    const std::vector<Operand>& matrix_memory_operands,
+    uint32_t output_pointer_id, uint32_t output_pointer_type_id,
+    const std::vector<Operand>& output_memory_operands) {
+  if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
+      input.length != matrix.rows || result.length != matrix.cols ||
+      (has_bias && (!bias || !IsSamePackedVec4Kind(result, *bias) ||
+                    bias_constant_id == 0))) {
+    return 0;
+  }
+
+  const uint32_t input_load_function_id = GetOrCreatePackedLoadChunkFunction(
+      input_pointer_id, input_pointer_type_id, input.component_type_id,
+      input.packed_vec4_type_id, input_memory_operands);
+  const uint32_t output_store_function_id = GetOrCreatePackedStoreChunkFunction(
+      output_pointer_id, output_pointer_type_id, result.component_type_id,
+      result.packed_vec4_type_id, output_memory_operands);
+  const uint32_t void_type_id = GetOrCreateVoidType();
+  const uint32_t function_type_id = GetOrCreateFunctionType(void_type_id, {});
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_function_ptr_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
+      result.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
+  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t result_length_id = GetOrCreateUIntConstant(result.length);
+  const uint32_t input_length_id = GetOrCreateUIntConstant(input.length);
+  const uint32_t matrix_cols_id = GetOrCreateUIntConstant(matrix.cols);
+  const uint32_t zero4_id = GetOrCreateZero(result.packed_vec4_type_id);
+  const uint32_t bias_select_function_id =
+      has_bias
+          ? BuildConstantPackedVectorSelectFunction(*bias, bias_constant_id)
+          : 0;
+  if (input_load_function_id == 0 || output_store_function_id == 0 ||
+      void_type_id == 0 || function_type_id == 0 || uint_type_id == 0 ||
+      uint_function_ptr_type_id == 0 || vec4_function_ptr_type_id == 0 ||
+      bool_type_id == 0 || zero_uint_id == 0 || four_uint_id == 0 ||
+      result_length_id == 0 || input_length_id == 0 || matrix_cols_id == 0 ||
+      zero4_id == 0 || (has_bias && bias_select_function_id == 0)) {
+    return 0;
+  }
+
+  auto get_constant_pair_component = [this](uint32_t pair_id, uint32_t index,
+                                            uint32_t* value) {
+    if (!value || index >= 2) return false;
+    Instruction* pair = get_def_use_mgr()->GetDef(pair_id);
+    if (!pair) return false;
+    if (pair->opcode() == spv::Op::OpConstantNull) {
+      *value = 0;
+      return true;
+    }
+    return pair->opcode() == spv::Op::OpConstantComposite &&
+           pair->NumInOperands() > index &&
+           GetConstantU32(pair->GetSingleWordInOperand(index), value);
+  };
+  uint32_t shape_cols = 0;
+  uint32_t offset_row = 0;
+  uint32_t offset_col = 0;
+  const bool direct_matrix_index =
+      get_constant_pair_component(matrix_shape_id, 1, &shape_cols) &&
+      get_constant_pair_component(matrix_offset_id, 0, &offset_row) &&
+      get_constant_pair_component(matrix_offset_id, 1, &offset_col) &&
+      shape_cols == matrix.cols && offset_row == 0 && offset_col == 0;
+
+  const uint32_t function_id = TakeNextId();
+  if (function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start =
+      MakeUnique<Instruction>(context(), spv::Op::OpFunction, void_type_id,
+                              function_id, std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  const uint32_t entry_label_id = TakeNextId();
+  const uint32_t out_header_label_id = TakeNextId();
+  const uint32_t out_body_label_id = TakeNextId();
+  const uint32_t out_continue_label_id = TakeNextId();
+  const uint32_t out_merge_label_id = TakeNextId();
+  const uint32_t k_header_label_id = TakeNextId();
+  const uint32_t k_body_label_id = TakeNextId();
+  const uint32_t k_continue_label_id = TakeNextId();
+  const uint32_t k_merge_label_id = TakeNextId();
+  if (entry_label_id == 0 || out_header_label_id == 0 ||
+      out_body_label_id == 0 || out_continue_label_id == 0 ||
+      out_merge_label_id == 0 || k_header_label_id == 0 ||
+      k_body_label_id == 0 || k_continue_label_id == 0 ||
+      k_merge_label_id == 0) {
+    return 0;
+  }
+
+  std::unique_ptr<BasicBlock> entry_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(entry_label_id));
+  std::unique_ptr<BasicBlock> out_header_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(out_header_label_id));
+  std::unique_ptr<BasicBlock> out_body_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(out_body_label_id));
+  std::unique_ptr<BasicBlock> out_continue_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(out_continue_label_id));
+  std::unique_ptr<BasicBlock> out_merge_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(out_merge_label_id));
+  std::unique_ptr<BasicBlock> k_header_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_header_label_id));
+  std::unique_ptr<BasicBlock> k_body_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_body_label_id));
+  std::unique_ptr<BasicBlock> k_continue_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_continue_label_id));
+  std::unique_ptr<BasicBlock> k_merge_block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(k_merge_label_id));
+  if (!entry_block || !out_header_block || !out_body_block ||
+      !out_continue_block || !out_merge_block || !k_header_block ||
+      !k_body_block || !k_continue_block || !k_merge_block) {
+    return 0;
+  }
+
+  InstructionBuilder entry_builder(context(), entry_block.get());
+  Instruction* output_base_var = entry_builder.AddVariable(
+      uint_function_ptr_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* k_base_var = entry_builder.AddVariable(
+      uint_function_ptr_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* acc_var = entry_builder.AddVariable(
+      vec4_function_ptr_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  if (!output_base_var || !k_base_var || !acc_var) return 0;
+  const uint32_t captured_matrix_pointer_id =
+      BuildCapturedPointer(&entry_builder, matrix_pointer_id);
+  if (captured_matrix_pointer_id == 0 ||
+      !entry_builder.AddStore(output_base_var->result_id(), zero_uint_id) ||
+      !entry_builder.AddBranch(out_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder out_header_builder(context(), out_header_block.get());
+  Instruction* output_base =
+      out_header_builder.AddLoad(uint_type_id, output_base_var->result_id());
   if (!output_base) return 0;
+  Instruction* out_cond = out_header_builder.AddBinaryOp(
+      bool_type_id, spv::Op::OpULessThan, output_base->result_id(),
+      result_length_id);
+  if (!out_cond) return 0;
+  if (!out_header_builder.AddLoopMerge(out_merge_label_id,
+                                       out_continue_label_id) ||
+      !out_header_builder.AddConditionalBranch(
+          out_cond->result_id(), out_body_label_id, out_merge_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder out_body_builder(context(), out_body_block.get());
+  if (!out_body_builder.AddStore(acc_var->result_id(), zero4_id) ||
+      !out_body_builder.AddStore(k_base_var->result_id(), zero_uint_id) ||
+      !out_body_builder.AddBranch(k_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_header_builder(context(), k_header_block.get());
+  Instruction* k_base_load =
+      k_header_builder.AddLoad(uint_type_id, k_base_var->result_id());
+  if (!k_base_load) return 0;
+  Instruction* k_cond =
+      k_header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                   k_base_load->result_id(), input_length_id);
+  if (!k_cond) return 0;
+  if (!k_header_builder.AddLoopMerge(k_merge_label_id, k_continue_label_id) ||
+      !k_header_builder.AddConditionalBranch(
+          k_cond->result_id(), k_body_label_id, k_merge_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_body_builder(context(), k_body_block.get());
+  Instruction* input_vec = k_body_builder.AddFunctionCall(
+      input.packed_vec4_type_id, input_load_function_id,
+      {k_base_load->result_id()});
+  if (!input_vec) return 0;
+  std::vector<uint32_t> dot_ids;
+  dot_ids.reserve(kPackedVec4Width);
+  for (uint32_t output_lane = 0; output_lane < kPackedVec4Width;
+       ++output_lane) {
+    std::vector<uint32_t> weight_column_ids;
+    weight_column_ids.reserve(kPackedVec4Width);
+    for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+      const uint32_t row_lane_id = GetOrCreateUIntConstant(row_lane);
+      const uint32_t output_lane_id = GetOrCreateUIntConstant(output_lane);
+      if (row_lane_id == 0 || output_lane_id == 0) return 0;
+      Instruction* matrix_row = k_body_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIAdd, k_base_load->result_id(), row_lane_id);
+      Instruction* matrix_row_offset =
+          matrix_row ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIMul,
+                                                  matrix_row->result_id(),
+                                                  matrix_cols_id)
+                     : nullptr;
+      Instruction* matrix_output_base =
+          matrix_row_offset
+              ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                           matrix_row_offset->result_id(),
+                                           output_base->result_id())
+              : nullptr;
+      Instruction* matrix_local_index =
+          matrix_output_base
+              ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                           matrix_output_base->result_id(),
+                                           output_lane_id)
+              : nullptr;
+      if (!matrix_local_index) return 0;
+      const uint32_t matrix_memory_index_id =
+          direct_matrix_index
+              ? matrix_local_index->result_id()
+              : BuildRowMajorMatrixMemoryIndex(
+                    &k_body_builder, nullptr, matrix_shape_id, matrix_offset_id,
+                    matrix.cols, matrix_local_index->result_id());
+      const uint32_t matrix_element_pointer_id =
+          matrix_memory_index_id
+              ? BuildElementAccessFromPointerType(
+                    &k_body_builder, matrix_pointer_type_id,
+                    captured_matrix_pointer_id, matrix.component_type_id,
+                    matrix_memory_index_id)
+              : 0;
+      const uint32_t weight_scalar_id =
+          matrix_element_pointer_id
+              ? AddLoad(&k_body_builder, matrix.component_type_id,
+                        matrix_element_pointer_id, matrix_memory_operands)
+              : 0;
+      if (weight_scalar_id == 0) return 0;
+      weight_column_ids.push_back(weight_scalar_id);
+    }
+    Instruction* weight_column = k_body_builder.AddCompositeConstruct(
+        result.packed_vec4_type_id, weight_column_ids);
+    Instruction* dot =
+        weight_column ? k_body_builder.AddBinaryOp(
+                            result.component_type_id, spv::Op::OpDot,
+                            input_vec->result_id(), weight_column->result_id())
+                      : nullptr;
+    if (!dot) return 0;
+    ApplyActiveFPFastMathMode(dot);
+    dot_ids.push_back(dot->result_id());
+  }
+  Instruction* dot_vec =
+      k_body_builder.AddCompositeConstruct(result.packed_vec4_type_id, dot_ids);
+  Instruction* acc =
+      k_body_builder.AddLoad(result.packed_vec4_type_id, acc_var->result_id());
+  Instruction* next_acc = dot_vec && acc
+                              ? k_body_builder.AddBinaryOp(
+                                    result.packed_vec4_type_id, spv::Op::OpFAdd,
+                                    acc->result_id(), dot_vec->result_id())
+                              : nullptr;
+  if (!next_acc ||
+      !k_body_builder.AddStore(acc_var->result_id(), next_acc->result_id())) {
+    return 0;
+  }
+  ApplyActiveFPFastMathMode(next_acc);
+  if (!k_body_builder.AddBranch(k_continue_label_id)) return 0;
+
+  InstructionBuilder k_continue_builder(context(), k_continue_block.get());
+  Instruction* next_k = k_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, k_base_load->result_id(), four_uint_id);
+  if (!next_k ||
+      !k_continue_builder.AddStore(k_base_var->result_id(),
+                                   next_k->result_id()) ||
+      !k_continue_builder.AddBranch(k_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_merge_builder(context(), k_merge_block.get());
+  Instruction* result_vec =
+      k_merge_builder.AddLoad(result.packed_vec4_type_id, acc_var->result_id());
+  if (!result_vec) return 0;
+  if (has_bias) {
+    Instruction* bias_vec = k_merge_builder.AddFunctionCall(
+        bias->packed_vec4_type_id, bias_select_function_id,
+        {output_base->result_id()});
+    if (!bias_vec) return 0;
+    result_vec = k_merge_builder.AddBinaryOp(
+        result.packed_vec4_type_id, spv::Op::OpFAdd, result_vec->result_id(),
+        bias_vec->result_id());
+    if (!result_vec) return 0;
+    ApplyActiveFPFastMathMode(result_vec);
+  }
   if (!k_merge_builder.AddFunctionCall(
           void_type_id, output_store_function_id,
           {output_base->result_id(), result_vec->result_id()}) ||
@@ -8225,9 +8759,9 @@ uint32_t HwLowerToStandardPass::BuildFusedVectorMatmulStoreFunctionPackedVec4(
 
   InstructionBuilder out_continue_builder(context(), out_continue_block.get());
   Instruction* next_out = out_continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, out_pack_load->result_id(), one_uint_id);
+      uint_type_id, spv::Op::OpIAdd, output_base->result_id(), four_uint_id);
   if (!next_out) return 0;
-  if (!out_continue_builder.AddStore(out_pack_var->result_id(),
+  if (!out_continue_builder.AddStore(output_base_var->result_id(),
                                      next_out->result_id()) ||
       !out_continue_builder.AddBranch(out_header_label_id)) {
     return 0;
@@ -12681,9 +13215,67 @@ void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
 
 bool HwLowerToStandardPass::MatmulAllowsReassociation(
     const Instruction* inst) const {
-  const uint32_t mode = inst ? GetFPFastMathMode(inst->result_id()) : 0;
-  return inst && (mode & (uint32_t(spv::FPFastMathModeMask::AllowReassoc) |
-                          uint32_t(spv::FPFastMathModeMask::Fast))) != 0;
+  if (!inst || inst->result_id() == 0) return false;
+
+  const auto* decoration_mgr = context()->get_decoration_mgr();
+  if (decoration_mgr->HasDecoration(inst->result_id(),
+                                    spv::Decoration::NoContraction)) {
+    return false;
+  }
+
+  bool has_explicit_mode = false;
+  uint32_t mode = 0;
+  for (const Instruction* decoration : decoration_mgr->GetDecorationsFor(
+           inst->result_id(), /*include_linkage=*/false)) {
+    if (decoration && decoration->NumInOperands() >= 3 &&
+        decoration->GetSingleWordInOperand(1) ==
+            uint32_t(spv::Decoration::FPFastMathMode)) {
+      has_explicit_mode = true;
+      mode = decoration->GetSingleWordInOperand(2);
+      break;
+    }
+  }
+
+  const uint32_t reassociation_modes =
+      uint32_t(spv::FPFastMathModeMask::AllowReassoc) |
+      uint32_t(spv::FPFastMathModeMask::Fast);
+  if (has_explicit_mode) return (mode & reassociation_modes) != 0;
+
+  uint32_t component_type_id = 0;
+  if (const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id())) {
+    component_type_id = matrix->component_type_id;
+  } else if (const VectorTypeInfo* vector = GetVectorType(inst->type_id())) {
+    component_type_id = vector->component_type_id;
+  }
+
+  std::unordered_set<uint32_t> default_entry_points;
+  std::unordered_set<uint32_t> reassoc_entry_points;
+  for (const Instruction& execution_mode : get_module()->execution_modes()) {
+    if (execution_mode.opcode() != spv::Op::OpExecutionModeId ||
+        execution_mode.NumInOperands() < 4 ||
+        execution_mode.GetSingleWordInOperand(1) !=
+            uint32_t(spv::ExecutionMode::FPFastMathDefault)) {
+      continue;
+    }
+    const uint32_t entry_point_id = execution_mode.GetSingleWordInOperand(0);
+    default_entry_points.insert(entry_point_id);
+    if (execution_mode.GetSingleWordInOperand(2) != component_type_id) continue;
+
+    uint32_t default_mode = 0;
+    if (!GetConstantU32(execution_mode.GetSingleWordInOperand(3),
+                        &default_mode) ||
+        (default_mode & uint32_t(spv::FPFastMathModeMask::AllowReassoc)) == 0) {
+      return false;
+    }
+    reassoc_entry_points.insert(entry_point_id);
+  }
+  for (uint32_t entry_point_id : default_entry_points) {
+    if (reassoc_entry_points.count(entry_point_id) == 0) return false;
+  }
+
+  // With no explicit per-instruction or module default, this pass deliberately
+  // uses its relaxed matmul contract and permits K-direction reassociation.
+  return true;
 }
 
 void HwLowerToStandardPass::RemoveFPFastMathMode(uint32_t result_id) {
