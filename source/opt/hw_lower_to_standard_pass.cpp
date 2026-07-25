@@ -30,6 +30,7 @@
 #include "source/opt/decoration_manager.h"
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
+#include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
 #include "source/opt/ir_context.h"
@@ -401,6 +402,12 @@ Pass::Status HwLowerToStandardPass::Process() {
   if (completeness_mode_ == CompletenessMode::kExtensionFree &&
       !PreflightExtensionFreeMode()) {
     return Status::Failure;
+  }
+
+  if (lowering_mode_ == LoweringMode::kPreferPackedVec4) {
+    HwFuseTwoLayerVectorMatmulPass fusion(max_unrolled_matmul_macs_);
+    fusion.SetMessageConsumer(consumer());
+    if (fusion.Run(context()) == Status::Failure) return Status::Failure;
   }
 
   if (!CollectHwTypes()) return Status::Failure;

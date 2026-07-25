@@ -20,6 +20,7 @@ add_spvtools_unittest(TARGET opt
        amd_ext_to_khr.cpp
        analyze_live_input_test.cpp
        assembly_builder_test.cpp
+       hw_fuse_two_layer_vector_matmul_test.cpp
        hw_lower_to_standard_test.cpp
        block_merge_test.cpp
        c_interface_test.cpp
