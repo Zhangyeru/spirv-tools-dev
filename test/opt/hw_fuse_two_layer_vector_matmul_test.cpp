@@ -240,6 +240,112 @@ std::string MakeMulAddChain(uint32_t middle_length, uint32_t output_length,
          "OpFunctionEnd\n";
 }
 
+std::string MakeMultiLayerMulAddChain(bool include_odd_tail) {
+  const std::string prefix = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpName %vec4 "vec4"
+OpName %vec8 "vec8"
+OpName %vec48 "vec48"
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%uint_8 = OpConstant %uint 8
+%uint_48 = OpConstant %uint 48
+%half = OpTypeFloat 16
+%vec4 = OpTypeCooperativeVectorHW %half %uint_4
+%vec8 = OpTypeCooperativeVectorHW %half %uint_8
+%vec48 = OpTypeCooperativeVectorHW %half %uint_48
+%mat8x4 = OpTypeCooperativeMatrixHW %half %uint_8 %uint_4
+%mat8x48 = OpTypeCooperativeMatrixHW %half %uint_8 %uint_48
+%mat48x4 = OpTypeCooperativeMatrixHW %half %uint_48 %uint_4
+%mat48x8 = OpTypeCooperativeMatrixHW %half %uint_48 %uint_8
+%ptr_fn_vec4 = OpTypePointer Function %vec4
+%ptr_fn_vec8 = OpTypePointer Function %vec8
+%ptr_fn_vec48 = OpTypePointer Function %vec48
+%input = OpUndef %vec8
+%matrix0 = OpUndef %mat8x48
+%matrix1 = OpUndef %mat48x8
+%matrix2 = OpUndef %mat8x48
+%matrix3_4 = OpUndef %mat48x4
+%matrix3_8 = OpUndef %mat48x8
+%matrix4 = OpUndef %mat8x4
+%bias0 = OpUndef %vec48
+%bias1 = OpUndef %vec8
+%bias2 = OpUndef %vec48
+%bias3_4 = OpUndef %vec4
+%bias3_8 = OpUndef %vec8
+%bias4 = OpUndef %vec4
+%zero4 = OpConstantNull %vec4
+%zero8 = OpConstantNull %vec8
+%zero48 = OpConstantNull %vec48
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%raw0_var = OpVariable %ptr_fn_vec48 Function
+%act0_var = OpVariable %ptr_fn_vec48 Function
+%raw1_var = OpVariable %ptr_fn_vec8 Function
+%act1_var = OpVariable %ptr_fn_vec8 Function
+%raw2_var = OpVariable %ptr_fn_vec48 Function
+%act2_var = OpVariable %ptr_fn_vec48 Function
+%raw3_4_var = OpVariable %ptr_fn_vec4 Function
+%raw3_8_var = OpVariable %ptr_fn_vec8 Function
+%act3_var = OpVariable %ptr_fn_vec8 Function
+%raw4_var = OpVariable %ptr_fn_vec4 Function
+%layer0 = OpCooperativeVectorMatrixMulAddHW %vec48 %input %matrix0 %bias0
+OpStore %raw0_var %layer0
+%raw0 = OpLoad %vec48 %raw0_var
+%relu0 = OpExtInst %vec48 %glsl FMax %raw0 %zero48
+OpStore %act0_var %relu0
+%act0 = OpLoad %vec48 %act0_var
+%layer1 = OpCooperativeVectorMatrixMulAddHW %vec8 %act0 %matrix1 %bias1
+OpStore %raw1_var %layer1
+%raw1 = OpLoad %vec8 %raw1_var
+%relu1 = OpExtInst %vec8 %glsl FMax %raw1 %zero8
+OpStore %act1_var %relu1
+%act1 = OpLoad %vec8 %act1_var
+%layer2 = OpCooperativeVectorMatrixMulAddHW %vec48 %act1 %matrix2 %bias2
+OpStore %raw2_var %layer2
+%raw2 = OpLoad %vec48 %raw2_var
+%relu2 = OpExtInst %vec48 %glsl FMax %raw2 %zero48
+OpStore %act2_var %relu2
+%act2 = OpLoad %vec48 %act2_var
+)";
+
+  const std::string four_layer_tail = R"(
+%layer3 = OpCooperativeVectorMatrixMulAddHW %vec4 %act2 %matrix3_4 %bias3_4
+OpStore %raw3_4_var %layer3
+%raw3_4 = OpLoad %vec4 %raw3_4_var
+%relu3 = OpExtInst %vec4 %glsl FMax %raw3_4 %zero4
+OpReturn
+OpFunctionEnd
+)";
+
+  const std::string five_layer_tail = R"(
+%layer3 = OpCooperativeVectorMatrixMulAddHW %vec8 %act2 %matrix3_8 %bias3_8
+OpStore %raw3_8_var %layer3
+%raw3_8 = OpLoad %vec8 %raw3_8_var
+%relu3 = OpExtInst %vec8 %glsl FMax %raw3_8 %zero8
+OpStore %act3_var %relu3
+%act3 = OpLoad %vec8 %act3_var
+%layer4 = OpCooperativeVectorMatrixMulAddHW %vec4 %act3 %matrix4 %bias4
+OpStore %raw4_var %layer4
+%raw4 = OpLoad %vec4 %raw4_var
+%relu4 = OpExtInst %vec4 %glsl FMax %raw4 %zero4
+OpReturn
+OpFunctionEnd
+)";
+
+  return prefix + (include_odd_tail ? five_layer_tail : four_layer_tail);
+}
+
 TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesPureMulWithAllThreeTails) {
   const std::string text = R"(
 OpCapability Shader
@@ -773,6 +879,38 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
 }
 
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       FusesFourLayersAsTwoDisjointPairsWithIndependentBudgets) {
+  // Each pair is within the 768-MAC cap, while the full four-layer chain is
+  // not.  This also exercises the candidate snapshot after the first pair is
+  // rewritten and its two original matmuls are killed.
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      MakeMultiLayerMulAddChain(/*include_odd_tail=*/false), true, true,
+      768ull);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCompositeConstruct %vec8"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCompositeConstruct %vec4"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpExtInst %vec48"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesTwoPairsAndKeepsOddFifthLayer) {
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      MakeMultiLayerMulAddChain(/*include_odd_tail=*/true), true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpCompositeConstruct %vec8"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpExtInst %vec48"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+}
+
 TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNonZeroMaxOperand) {
   const std::string text = R"(
 OpCapability Shader
@@ -966,6 +1104,23 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest, FullScalarLoweringSkipsTwoLayerFusion) {
   // lowering handles the original two operations independently and therefore
   // must not introduce that vector type.
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpTypeVector"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       PreferPackedLoweringConsumesFusedPairsAndOddTail) {
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      MakeMultiLayerMulAddChain(/*include_odd_tail=*/true), true, true,
+      HwLowerToStandardPass::LoweringMode::kPreferPackedVec4);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeMatrixHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "SPV_HW_neural_shader"));
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 2"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 4"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v4half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesMulAddFirstPureMulSecond) {
