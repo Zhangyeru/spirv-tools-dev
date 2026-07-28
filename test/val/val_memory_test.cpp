@@ -8933,13 +8933,73 @@ OpCpAsyncTensorGlobalSharedHW 1 %dst %tm_value %int_0
 TEST_F(ValidateMemory, CpAsyncCommitWaitRequiresHWNeuralExtension) {
   const std::string spirv = GenCpAsyncBarrierShader(false, R"(
 OpCpAsyncCommitGroupHW
-OpCpAsyncWaitGroupHW 0
+OpCpAsyncWaitGroupHW %int_0
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("OpCpAsyncCommitGroupHW"));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_F(ValidateMemory, CpAsyncWaitRejectsNonConstantId) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%int_ptr = OpTypePointer Function %int
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+%var = OpVariable %int_ptr Function
+OpStore %var %int_0
+%n = OpLoad %int %var
+OpCpAsyncWaitGroupHW %n
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("CpAsyncWaitGroupHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
+}
+
+TEST_F(ValidateMemory, CpAsyncWaitRejectsSpecConstantId) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%spec = OpSpecConstant %int 0
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+OpCpAsyncWaitGroupHW %spec
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("CpAsyncWaitGroupHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
 }
 
 TEST_F(ValidateMemory, BarrierArriveWaitRequiresHWNeuralExtension) {
@@ -8952,6 +9012,97 @@ OpBarrierWaitHW %int_0 %int_1
   EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("OpBarrierArriveHW"));
   EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_F(ValidateMemory, BarrierArriveRejectsNonConstantCount) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%int_ptr = OpTypePointer Function %int
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+%var = OpVariable %int_ptr Function
+OpStore %var %int_0
+%n = OpLoad %int %var
+OpBarrierArriveHW %int_0 %n
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("BarrierArriveHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
+}
+
+TEST_F(ValidateMemory, BarrierWaitRejectsNonConstantCount) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%int_ptr = OpTypePointer Function %int
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+%var = OpVariable %int_ptr Function
+OpStore %var %int_0
+%n = OpLoad %int %var
+OpBarrierWaitHW %int_0 %n
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("BarrierWaitHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
+}
+
+TEST_F(ValidateMemory, BarrierWaitRejectsSpecConstantCount) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%spec = OpSpecConstant %int 1
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+OpBarrierWaitHW %int_0 %spec
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
 }
 }  // namespace
 }  // namespace val
