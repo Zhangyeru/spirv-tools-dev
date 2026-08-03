@@ -94,6 +94,19 @@ class HwLowerToStandardPass : public Pass {
     bool packed_vec4 = false;
   };
 
+  // Describes a cooperative load that can be folded into a generated direct
+  // matmul helper. Matrix-only fields remain zero for vector loads.
+  struct DirectLoadSource {
+    Instruction* source_load = nullptr;
+    std::vector<Instruction*> chain;
+    uint32_t pointer_id = 0;
+    uint32_t pointer_type_id = 0;
+    uint32_t shape_id = 0;
+    uint32_t offset_id = 0;
+    uint32_t layout = 0;
+    std::vector<Operand> memory_operands;
+  };
+
   enum class ElementwiseLoopKind {
     kConversion,
     kArithmetic,
@@ -298,16 +311,16 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
-      const MatrixTypeInfo& b, const MatrixTypeInfo& c,
-      uint32_t a_pointer_id, uint32_t a_pointer_type_id, uint32_t a_shape_id,
-      uint32_t a_offset_id, const std::vector<Operand>& a_memory_operands,
-      uint32_t a_constant_id, bool a_is_value,
-      uint32_t b_pointer_id, uint32_t b_pointer_type_id, uint32_t b_shape_id,
-      uint32_t b_offset_id, const std::vector<Operand>& b_memory_operands,
-      uint32_t b_constant_id, bool b_is_value,
-      uint32_t c_pointer_id, uint32_t c_pointer_type_id, uint32_t c_shape_id,
-      uint32_t c_offset_id, const std::vector<Operand>& c_memory_operands,
-      uint32_t c_constant_id, bool c_is_value,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
+      uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
+      const std::vector<Operand>& a_memory_operands, uint32_t a_constant_id,
+      bool a_is_value, uint32_t b_pointer_id, uint32_t b_pointer_type_id,
+      uint32_t b_shape_id, uint32_t b_offset_id,
+      const std::vector<Operand>& b_memory_operands, uint32_t b_constant_id,
+      bool b_is_value, uint32_t c_pointer_id, uint32_t c_pointer_type_id,
+      uint32_t c_shape_id, uint32_t c_offset_id,
+      const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
+      bool c_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
@@ -349,8 +362,7 @@ class HwLowerToStandardPass : public Pass {
   bool DescribeVectorValue(uint32_t value_id, uint32_t expected_length,
                            ValueLayout* layout) const;
   bool DescribeMatrixValue(uint32_t value_id, uint32_t expected_rows,
-                           uint32_t expected_cols,
-                           ValueLayout* layout) const;
+                           uint32_t expected_cols, ValueLayout* layout) const;
   uint32_t ExtractValuePiece(InstructionBuilder* builder,
                              const ValueLayout& layout, uint32_t value_id,
                              uint32_t piece_index);
@@ -365,6 +377,12 @@ class HwLowerToStandardPass : public Pass {
                                 const std::vector<uint32_t>& scalar_ids);
   bool RebuildMatrixFromScalars(Instruction* inst, const MatrixTypeInfo& info,
                                 const std::vector<uint32_t>& scalar_ids);
+  bool RebuildAggregateFromScalars(Instruction* inst, uint32_t lowered_type_id,
+                                   uint32_t packed_vec4_type_id,
+                                   uint32_t packed_piece_count,
+                                   uint32_t expected_scalar_count,
+                                   const std::vector<uint32_t>& scalar_ids,
+                                   const char* error_message);
   uint32_t BuildMatrixRowVector(InstructionBuilder* builder,
                                 const MatrixTypeInfo& info, uint32_t matrix_id,
                                 uint32_t row, uint32_t col_start,
@@ -374,9 +392,8 @@ class HwLowerToStandardPass : public Pass {
                                    uint32_t matrix_id, uint32_t row_start,
                                    uint32_t col, uint32_t vec4_type_id);
   uint32_t BuildVectorTimesScalar(InstructionBuilder* builder,
-                                  spv::Op scale_opcode,
-                                  uint32_t vec4_type_id, uint32_t vector_id,
-                                  uint32_t scalar_id);
+                                  spv::Op scale_opcode, uint32_t vec4_type_id,
+                                  uint32_t vector_id, uint32_t scalar_id);
   uint32_t BuildScalarSplat(InstructionBuilder* builder, uint32_t vec4_type_id,
                             uint32_t scalar_id);
   uint32_t BuildFma(InstructionBuilder* builder, uint32_t type_id,
@@ -437,6 +454,13 @@ class HwLowerToStandardPass : public Pass {
                                             uint32_t lowered_pointee_type_id,
                                             uint32_t* pointer_type_id) const;
   bool IsIgnorableDirectUser(const Instruction* user) const;
+  bool ResolveDirectVectorLoad(Instruction* value_inst, Instruction* use,
+                               DirectLoadSource* source) const;
+  bool ResolveDirectMatrixLoad(Instruction* value_inst, Instruction* use,
+                               DirectLoadSource* source) const;
+  bool DirectKillListUsersAreClosed(
+      Instruction* current_inst,
+      const std::vector<Instruction*>& kill_list) const;
   bool CanMoveLoadToUse(Instruction* load, Instruction* use,
                         bool function_memory,
                         uint32_t first_memory_operand) const;
@@ -538,8 +562,7 @@ class HwLowerToStandardPass : public Pass {
   void RemoveFPFastMathMode(uint32_t result_id);
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
-  const MatrixTypeInfo* GetMatrixTypeForValue(
-      const Instruction* value) const;
+  const MatrixTypeInfo* GetMatrixTypeForValue(const Instruction* value) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
   uint32_t GetLoweredType(uint32_t type_id) const;
   uint32_t GetPointerTypeId(uint32_t pointer_id) const;

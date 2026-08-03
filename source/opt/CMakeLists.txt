@@ -18,6 +18,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   analyze_live_input_pass.h
   hw_fuse_two_layer_vector_matmul_pass.h
   hw_lower_to_standard_pass.h
+  hw_lower_to_standard_pass_internal.h
   basic_block.h
   block_merge_pass.h
   block_merge_util.h
@@ -140,6 +141,15 @@ set(SPIRV_TOOLS_OPT_SOURCES
   analyze_live_input_pass.cpp
   hw_fuse_two_layer_vector_matmul_pass.cpp
   hw_lower_to_standard_pass.cpp
+  hw_lower_to_standard_aggregate.cpp
+  hw_lower_to_standard_direct.cpp
+  hw_lower_to_standard_direct_generated.cpp
+  hw_lower_to_standard_elementwise.cpp
+  hw_lower_to_standard_matmul.cpp
+  hw_lower_to_standard_matmul_helpers.cpp
+  hw_lower_to_standard_memory.cpp
+  hw_lower_to_standard_types.cpp
+  hw_lower_to_standard_validation.cpp
   basic_block.cpp
   block_merge_pass.cpp
   block_merge_util.cpp

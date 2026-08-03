@@ -21,7 +21,12 @@ add_spvtools_unittest(TARGET opt
        analyze_live_input_test.cpp
        assembly_builder_test.cpp
        hw_fuse_two_layer_vector_matmul_test.cpp
-       hw_lower_to_standard_test.cpp
+       hw_lower_to_standard_aggregate_test.cpp
+       hw_lower_to_standard_elementwise_test.cpp
+       hw_lower_to_standard_matmul_test.cpp
+       hw_lower_to_standard_memory_test.cpp
+       hw_lower_to_standard_test_utils.cpp
+       hw_lower_to_standard_validation_test.cpp
        block_merge_test.cpp
        c_interface_test.cpp
        ccp_test.cpp
