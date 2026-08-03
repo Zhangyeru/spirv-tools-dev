@@ -361,7 +361,6 @@ OpEntryPoint GLCompute %main "main"
 OpExecutionMode %main LocalSize 1 1 1
 OpDecorate %hidden FPFastMathMode NotNaN
 OpDecorate %out FPFastMathMode NotInf
-OpDecorate %out NoContraction
 OpName %vec7 "vec7"
 OpName %hidden "hidden"
 OpName %out "out"
@@ -399,7 +398,52 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
   EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotNaN"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotInf"), 0u);
-  EXPECT_EQ(0u, CountSubstring(disassembly, "NoContraction"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNoContractionOnFirstLayer) {
+  std::string text = MakePureMulChain(18, 7);
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %hidden NoContraction\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpCooperativeVectorMatrixMulHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "NoContraction"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNoContractionOnRelu) {
+  std::string text =
+      MakeMulAddChain(18, 7, /*first_has_bias=*/true, /*second_has_bias=*/true,
+                      /*insert_relu=*/true);
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %relu NoContraction\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, " FMax "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "NoContraction"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNoContractionOnSecondLayer) {
+  std::string text = MakePureMulChain(18, 7);
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %out NoContraction\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpCooperativeVectorMatrixMulHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "NoContraction"));
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesSingleHiddenLaneFinalSplit) {

@@ -3066,6 +3066,13 @@ spv_result_t ValidateCooperativeVectorMatrixMulHW(ValidationState_t& _,
   const auto opcode_name = spvOpcodeString(inst->opcode());
   const bool has_bias =
       inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW;
+
+  if (_.HasDecoration(inst->id(), spv::Decoration::NoContraction)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "NoContraction decoration must not be applied to the result of "
+           << opcode_name << ".";
+  }
+
   const auto result_type_id = inst->GetOperandAs<uint32_t>(0u);
   const auto input_id = inst->GetOperandAs<uint32_t>(2u);
   const auto matrix_id = inst->GetOperandAs<uint32_t>(3u);

@@ -404,6 +404,8 @@ Pass::Status HwLowerToStandardPass::Process() {
     return Status::Failure;
   }
 
+  if (!PreflightNoContractionVectorMatmul()) return Status::Failure;
+
   if (lowering_mode_ == LoweringMode::kPreferPackedVec4) {
     HwFuseTwoLayerVectorMatmulPass fusion(max_unrolled_matmul_macs_);
     fusion.SetMessageConsumer(consumer());
@@ -447,6 +449,25 @@ bool HwLowerToStandardPass::PreflightExtensionFreeMode() const {
       ReportError(inst,
                   "extension-free HW lowering has no equivalent lowering for "
                   "this HW operand");
+      ok = false;
+    }
+  });
+  return ok;
+}
+
+bool HwLowerToStandardPass::PreflightNoContractionVectorMatmul() const {
+  bool ok = true;
+  get_module()->ForEachInst([this, &ok](Instruction* inst) {
+    if (!ok || (inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW &&
+                inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulAddHW)) {
+      return;
+    }
+
+    if (context()->get_decoration_mgr()->HasDecoration(
+            inst->result_id(), spv::Decoration::NoContraction)) {
+      ReportError(inst,
+                  "NoContraction HW cooperative vector matrix multiply "
+                  "cannot be lowered");
       ok = false;
     }
   });
@@ -1753,14 +1774,6 @@ bool HwLowerToStandardPass::LegalizeModule() {
 
     if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulHW ||
         inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW) {
-      if (context()->get_decoration_mgr()->HasDecoration(
-              inst->result_id(), spv::Decoration::NoContraction)) {
-        ReportError(inst,
-                    "NoContraction HW cooperative vector matrix multiply "
-                    "cannot be lowered");
-        ok = false;
-        return;
-      }
       const VectorTypeInfo* result = GetVectorType(inst->type_id());
       Instruction* input_inst =
           inst->NumInOperands() > kHwVectorMatrixMulInputInIdx

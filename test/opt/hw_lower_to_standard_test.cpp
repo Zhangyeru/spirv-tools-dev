@@ -7968,6 +7968,108 @@ OpFunctionEnd
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
+TEST_F(HwLowerToStandardTest, RejectsGroupedNoContractionVectorMatmul) {
+  const std::string text = R"(
+; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%no_contraction = OpDecorationGroup
+OpDecorate %no_contraction NoContraction
+OpGroupDecorate %no_contraction %y
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%mat4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%x = OpUndef %vec4
+%w = OpUndef %mat4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpCooperativeVectorMatrixMulHW %vec4 %x %w
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest, RejectsNoContractionVectorMatmulAdd) {
+  const std::string text = R"(
+; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %y NoContraction
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%mat4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%x = OpUndef %vec4
+%w = OpUndef %mat4
+%bias = OpUndef %vec4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%y = OpCooperativeVectorMatrixMulAddHW %vec4 %x %w %bias
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
+TEST_F(HwLowerToStandardTest,
+       RejectsNoContractionBeforeTwoLayerVectorMatmulFusion) {
+  const std::string text = R"(
+; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %hidden NoContraction
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%uint_7 = OpConstant %uint 7
+%uint_18 = OpConstant %uint 18
+%half = OpTypeFloat 16
+%vec3 = OpTypeCooperativeVectorHW %half %uint_3
+%vec7 = OpTypeCooperativeVectorHW %half %uint_7
+%vec18 = OpTypeCooperativeVectorHW %half %uint_18
+%mat3x18 = OpTypeCooperativeMatrixHW %half %uint_3 %uint_18
+%mat18x7 = OpTypeCooperativeMatrixHW %half %uint_18 %uint_7
+%x = OpUndef %vec3
+%w0 = OpUndef %mat3x18
+%w1 = OpUndef %mat18x7
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%hidden = OpCooperativeVectorMatrixMulHW %vec18 %x %w0
+%out = OpCooperativeVectorMatrixMulHW %vec7 %hidden %w1
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+}
+
 TEST_F(HwLowerToStandardTest, RejectsSpecConstantCooperativeShape) {
   const std::string text = R"(
 ; CHECK: HW cooperative matrix specialization-constant shape is not supported

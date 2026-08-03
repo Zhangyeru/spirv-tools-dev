@@ -106,6 +106,7 @@ class HwLowerToStandardPass : public Pass {
   bool CollectHwTypes();
   bool MaterializeLoweredTypes();
   bool PreflightExtensionFreeMode() const;
+  bool PreflightNoContractionVectorMatmul() const;
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();

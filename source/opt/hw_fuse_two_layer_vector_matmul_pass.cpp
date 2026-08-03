@@ -91,6 +91,10 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
   if (!second || !match || !IsVectorMatrixMul(second)) return false;
   const uint32_t expected_operands = IsVectorMatrixMulAdd(second) ? 3u : 2u;
   if (second->NumInOperands() != expected_operands) return false;
+  if (context()->get_decoration_mgr()->HasDecoration(
+          second->result_id(), spv::Decoration::NoContraction)) {
+    return false;
+  }
 
   BasicBlock* block = context()->get_instr_block(second);
   if (!block) return false;
@@ -131,7 +135,9 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
   if (IsGlslFMax(producer)) {
     candidate.relu = producer;
     if (producer->type_id() != second_input->type_id() ||
-        context()->get_instr_block(producer) != block) {
+        context()->get_instr_block(producer) != block ||
+        context()->get_decoration_mgr()->HasDecoration(
+            producer->result_id(), spv::Decoration::NoContraction)) {
       return false;
     }
 
@@ -154,7 +160,9 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
 
   if (!IsVectorMatrixMul(producer) ||
       producer->NumInOperands() != (IsVectorMatrixMulAdd(producer) ? 3u : 2u) ||
-      context()->get_instr_block(producer) != block) {
+      context()->get_instr_block(producer) != block ||
+      context()->get_decoration_mgr()->HasDecoration(
+          producer->result_id(), spv::Decoration::NoContraction)) {
     return false;
   }
   candidate.first = producer;
@@ -528,11 +536,10 @@ bool HwFuseTwoLayerVectorMatmulPass::RewriteMatch(const Match& match) {
     output_ids.push_back(scalar);
   }
 
-  // FP arithmetic decorations are invalid on the replacement construct.  The
-  // corresponding mode has already been copied to every generated arithmetic
-  // instruction.  NoContraction is deliberately not carried across: this
-  // internal optimization follows the relaxed HW matmul lowering contract.
-  RemoveFloatingPointDecorations(match.second->result_id());
+  // FPFastMathMode is invalid on the replacement construct.  Its mode has
+  // already been copied to every generated arithmetic instruction.  The
+  // matcher rejects NoContraction, so no contraction guarantee is discarded.
+  RemoveFPFastMathMode(match.second->result_id());
   std::vector<Operand> operands;
   operands.reserve(output_ids.size());
   for (uint32_t id : output_ids) operands.push_back(IdOperand(id));
@@ -1301,15 +1308,13 @@ void HwFuseTwoLayerVectorMatmulPass::ApplyFPFastMathMode(Instruction* inst,
       inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode), mode);
 }
 
-void HwFuseTwoLayerVectorMatmulPass::RemoveFloatingPointDecorations(
-    uint32_t result_id) {
+void HwFuseTwoLayerVectorMatmulPass::RemoveFPFastMathMode(uint32_t result_id) {
   if (result_id == 0) return;
   context()->get_decoration_mgr()->RemoveDecorationsFrom(
       result_id, [](const Instruction& decoration) {
-        if (decoration.NumInOperands() < 2) return false;
-        const uint32_t kind = decoration.GetSingleWordInOperand(1);
-        return kind == uint32_t(spv::Decoration::FPFastMathMode) ||
-               kind == uint32_t(spv::Decoration::NoContraction);
+        return decoration.NumInOperands() >= 2 &&
+               decoration.GetSingleWordInOperand(1) ==
+                   uint32_t(spv::Decoration::FPFastMathMode);
       });
 }
 

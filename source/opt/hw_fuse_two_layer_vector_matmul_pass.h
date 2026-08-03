@@ -147,7 +147,7 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   uint32_t GetOrCreateZero(uint32_t type_id);
   uint32_t GetFPFastMathMode(uint32_t result_id) const;
   void ApplyFPFastMathMode(Instruction* inst, uint32_t mode);
-  void RemoveFloatingPointDecorations(uint32_t result_id);
+  void RemoveFPFastMathMode(uint32_t result_id);
 
   uint32_t BuildExtract(InstructionBuilder* builder, uint32_t type_id,
                         uint32_t composite_id,
