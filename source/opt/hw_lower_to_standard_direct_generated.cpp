@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -1192,6 +1191,975 @@ uint32_t HwLowerToStandardPass::BuildFusedMatrixMatmulStoreFunctionPackedVec4(
   return function_id;
 }
 
+uint32_t HwLowerToStandardPass::BuildDirectMixedVectorMatmulFunctionPackedVec4(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+    uint32_t input_pointer_id, uint32_t input_pointer_type_id,
+    const std::vector<Operand>& input_memory_operands,
+    uint32_t input_constant_id, bool input_is_value, uint32_t matrix_pointer_id,
+    uint32_t matrix_pointer_type_id, uint32_t matrix_shape_id,
+    uint32_t matrix_offset_id,
+    const std::vector<Operand>& matrix_memory_operands,
+    uint32_t matrix_constant_id, bool matrix_is_value, uint32_t bias_pointer_id,
+    uint32_t bias_pointer_type_id,
+    const std::vector<Operand>& bias_memory_operands, uint32_t bias_constant_id,
+    bool bias_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  if (!IsFloat32Type(result.component_type_id) ||
+      !IsFloat16Type(input.component_type_id) ||
+      !IsFloat16Type(matrix.component_type_id) || input.length != matrix.rows ||
+      result.length != matrix.cols ||
+      (has_bias && (!bias || !IsFloat32Type(bias->component_type_id) ||
+                    bias->length != result.length))) {
+    return 0;
+  }
+  if ((!input_is_value &&
+       (input_pointer_id == 0 || input_pointer_type_id == 0)) ||
+      (!matrix_is_value &&
+       (matrix_pointer_id == 0 || matrix_pointer_type_id == 0 ||
+        matrix_shape_id == 0 || matrix_offset_id == 0)) ||
+      (has_bias && !bias_is_value &&
+       (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
+    return 0;
+  }
+
+  const uint32_t full_output_packs = result.length / kPackedVec4Width;
+  const uint32_t output_tail_lanes = result.length % kPackedVec4Width;
+  const uint32_t full_input_packs = input.length / kPackedVec4Width;
+  const uint32_t input_tail_lanes = input.length % kPackedVec4Width;
+  const bool has_full_output = full_output_packs != 0;
+  const bool has_output_tail = output_tail_lanes != 0;
+  const bool has_full_input = full_input_packs != 0;
+  const bool has_input_tail = input_tail_lanes != 0;
+
+  Instruction* type_insertion_point =
+      get_def_use_mgr()->GetDef(result.lowered_type_id);
+  if (!type_insertion_point) return 0;
+  const uint32_t input_vec4_type_id = GetOrCreateVectorType(
+      input.component_type_id, kPackedVec4Width, &type_insertion_point);
+  const uint32_t result_vec4_type_id = GetOrCreateVectorType(
+      result.component_type_id, kPackedVec4Width, &type_insertion_point);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
+  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t full_output_packs_id =
+      has_full_output ? GetOrCreateUIntConstant(full_output_packs) : 0;
+  const uint32_t full_input_packs_id =
+      has_full_input ? GetOrCreateUIntConstant(full_input_packs) : 0;
+  const uint32_t output_tail_base_id =
+      has_output_tail
+          ? GetOrCreateUIntConstant(full_output_packs * kPackedVec4Width)
+          : 0;
+  const uint32_t input_tail_base_id =
+      has_input_tail
+          ? GetOrCreateUIntConstant(full_input_packs * kPackedVec4Width)
+          : 0;
+  const uint32_t matrix_cols_id = GetOrCreateUIntConstant(matrix.cols);
+  const uint32_t matrix_packed_cols_id =
+      IsPackedVec4(matrix) ? GetOrCreateUIntConstant(matrix.packed_cols) : 0;
+  const uint32_t input_zero_id = GetOrCreateZero(input.component_type_id);
+  const uint32_t result_zero4_id = GetOrCreateZero(result_vec4_type_id);
+  const uint32_t uint_function_ptr_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t result_vec4_function_ptr_type_id =
+      GetOrCreatePointerType(result_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t input_vec4_function_ptr_type_id =
+      GetOrCreatePointerType(input_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t input_scalar_function_ptr_type_id = GetOrCreatePointerType(
+      input.component_type_id, spv::StorageClass::Function);
+  const uint32_t result_scalar_function_ptr_type_id = GetOrCreatePointerType(
+      result.component_type_id, spv::StorageClass::Function);
+  const uint32_t lowered_result_function_ptr_type_id = GetOrCreatePointerType(
+      result.lowered_type_id, spv::StorageClass::Function);
+  if (input_vec4_type_id == 0 || result_vec4_type_id == 0 ||
+      uint_type_id == 0 || bool_type_id == 0 || zero_uint_id == 0 ||
+      one_uint_id == 0 || four_uint_id == 0 || matrix_cols_id == 0 ||
+      input_zero_id == 0 || result_zero4_id == 0 ||
+      uint_function_ptr_type_id == 0 || result_vec4_function_ptr_type_id == 0 ||
+      input_vec4_function_ptr_type_id == 0 ||
+      input_scalar_function_ptr_type_id == 0 ||
+      result_scalar_function_ptr_type_id == 0 ||
+      lowered_result_function_ptr_type_id == 0 ||
+      (has_full_output && full_output_packs_id == 0) ||
+      (has_full_input && full_input_packs_id == 0) ||
+      (has_output_tail && output_tail_base_id == 0) ||
+      (has_input_tail && input_tail_base_id == 0) ||
+      (IsPackedVec4(matrix) && matrix_packed_cols_id == 0)) {
+    return 0;
+  }
+
+  const uint32_t input_load_function_id =
+      !input_is_value && has_full_input
+          ? GetOrCreatePackedLoadChunkFunction(
+                input_pointer_id, input_pointer_type_id,
+                input.component_type_id, input_vec4_type_id,
+                input_memory_operands)
+          : 0;
+  const uint32_t matrix_load_function_id =
+      !matrix_is_value && has_full_output
+          ? GetOrCreatePackedLoadChunkFunction(
+                matrix_pointer_id, matrix_pointer_type_id,
+                matrix.component_type_id, input_vec4_type_id,
+                matrix_memory_operands)
+          : 0;
+  const uint32_t bias_load_function_id =
+      has_bias && !bias_is_value && has_full_output
+          ? GetOrCreatePackedLoadChunkFunction(
+                bias_pointer_id, bias_pointer_type_id, bias->component_type_id,
+                result_vec4_type_id, bias_memory_operands)
+          : 0;
+  if ((!input_is_value && has_full_input && input_load_function_id == 0) ||
+      (!matrix_is_value && has_full_output && matrix_load_function_id == 0) ||
+      (has_bias && !bias_is_value && has_full_output &&
+       bias_load_function_id == 0)) {
+    return 0;
+  }
+
+  std::vector<uint32_t> parameter_type_ids;
+  if (input_is_value && input_constant_id == 0) {
+    parameter_type_ids.push_back(input.lowered_type_id);
+  }
+  if (matrix_is_value && matrix_constant_id == 0) {
+    parameter_type_ids.push_back(matrix.lowered_type_id);
+  }
+  if (has_bias && bias_is_value && bias_constant_id == 0) {
+    parameter_type_ids.push_back(bias->lowered_type_id);
+  }
+  if (parameter_type_ids.size() != value_arguments.size()) return 0;
+  for (size_t i = 0; i < parameter_type_ids.size(); ++i) {
+    if (parameter_type_ids[i] != value_arguments[i].second) return 0;
+  }
+
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(result.lowered_type_id, parameter_type_ids);
+  const uint32_t function_id = TakeNextId();
+  if (function_type_id == 0 || function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  size_t parameter_index = 0;
+  auto add_parameter = [&](uint32_t type_id) -> uint32_t {
+    if (parameter_index >= parameter_type_ids.size() ||
+        parameter_type_ids[parameter_index] != type_id) {
+      return 0;
+    }
+    const uint32_t parameter_id = TakeNextId();
+    if (parameter_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, type_id, parameter_id,
+        std::initializer_list<Operand>{}));
+    ++parameter_index;
+    return parameter_id;
+  };
+  uint32_t input_value_id = input_constant_id;
+  if (input_is_value && input_value_id == 0) {
+    input_value_id = add_parameter(input.lowered_type_id);
+  }
+  uint32_t matrix_value_id = matrix_constant_id;
+  if (matrix_is_value && matrix_value_id == 0) {
+    matrix_value_id = add_parameter(matrix.lowered_type_id);
+  }
+  uint32_t bias_value_id = bias_constant_id;
+  if (has_bias && bias_is_value && bias_value_id == 0) {
+    bias_value_id = add_parameter(bias->lowered_type_id);
+  }
+  if ((input_is_value && input_value_id == 0) ||
+      (matrix_is_value && matrix_value_id == 0) ||
+      (has_bias && bias_is_value && bias_value_id == 0) ||
+      parameter_index != parameter_type_ids.size()) {
+    return 0;
+  }
+
+  const uint32_t entry_label_id = TakeNextId();
+  const uint32_t return_label_id = TakeNextId();
+  uint32_t out_header_label_id = 0;
+  uint32_t out_body_label_id = 0;
+  uint32_t out_finalize_label_id = 0;
+  uint32_t out_continue_label_id = 0;
+  uint32_t out_merge_label_id = 0;
+  uint32_t out_k_header_label_id = 0;
+  uint32_t out_k_body_label_id = 0;
+  uint32_t out_k_continue_label_id = 0;
+  uint32_t tail_entry_label_id = 0;
+  uint32_t tail_finalize_label_id = 0;
+  uint32_t tail_k_header_label_id = 0;
+  uint32_t tail_k_body_label_id = 0;
+  uint32_t tail_k_continue_label_id = 0;
+  if (has_full_output) {
+    out_header_label_id = TakeNextId();
+    out_body_label_id = TakeNextId();
+    out_finalize_label_id = TakeNextId();
+    out_continue_label_id = TakeNextId();
+    out_merge_label_id = TakeNextId();
+    if (has_full_input) {
+      out_k_header_label_id = TakeNextId();
+      out_k_body_label_id = TakeNextId();
+      out_k_continue_label_id = TakeNextId();
+    }
+  }
+  if (has_output_tail) {
+    tail_entry_label_id = TakeNextId();
+    tail_finalize_label_id = TakeNextId();
+    if (has_full_input) {
+      tail_k_header_label_id = TakeNextId();
+      tail_k_body_label_id = TakeNextId();
+      tail_k_continue_label_id = TakeNextId();
+    }
+  }
+  if (entry_label_id == 0 || return_label_id == 0 ||
+      (has_full_output &&
+       (out_header_label_id == 0 || out_body_label_id == 0 ||
+        out_finalize_label_id == 0 || out_continue_label_id == 0 ||
+        out_merge_label_id == 0)) ||
+      (has_full_output && has_full_input &&
+       (out_k_header_label_id == 0 || out_k_body_label_id == 0 ||
+        out_k_continue_label_id == 0)) ||
+      (has_output_tail &&
+       (tail_entry_label_id == 0 || tail_finalize_label_id == 0)) ||
+      (has_output_tail && has_full_input &&
+       (tail_k_header_label_id == 0 || tail_k_body_label_id == 0 ||
+        tail_k_continue_label_id == 0))) {
+    return 0;
+  }
+
+  auto make_block = [this](uint32_t label_id) {
+    return std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
+  };
+  std::unique_ptr<BasicBlock> entry_block = make_block(entry_label_id);
+  std::unique_ptr<BasicBlock> return_block = make_block(return_label_id);
+  std::unique_ptr<BasicBlock> out_header_block;
+  std::unique_ptr<BasicBlock> out_body_block;
+  std::unique_ptr<BasicBlock> out_finalize_block;
+  std::unique_ptr<BasicBlock> out_continue_block;
+  std::unique_ptr<BasicBlock> out_merge_block;
+  std::unique_ptr<BasicBlock> out_k_header_block;
+  std::unique_ptr<BasicBlock> out_k_body_block;
+  std::unique_ptr<BasicBlock> out_k_continue_block;
+  std::unique_ptr<BasicBlock> tail_entry_block;
+  std::unique_ptr<BasicBlock> tail_finalize_block;
+  std::unique_ptr<BasicBlock> tail_k_header_block;
+  std::unique_ptr<BasicBlock> tail_k_body_block;
+  std::unique_ptr<BasicBlock> tail_k_continue_block;
+  if (has_full_output) {
+    out_header_block = make_block(out_header_label_id);
+    out_body_block = make_block(out_body_label_id);
+    out_finalize_block = make_block(out_finalize_label_id);
+    out_continue_block = make_block(out_continue_label_id);
+    out_merge_block = make_block(out_merge_label_id);
+    if (has_full_input) {
+      out_k_header_block = make_block(out_k_header_label_id);
+      out_k_body_block = make_block(out_k_body_label_id);
+      out_k_continue_block = make_block(out_k_continue_label_id);
+    }
+  }
+  if (has_output_tail) {
+    tail_entry_block = make_block(tail_entry_label_id);
+    tail_finalize_block = make_block(tail_finalize_label_id);
+    if (has_full_input) {
+      tail_k_header_block = make_block(tail_k_header_label_id);
+      tail_k_body_block = make_block(tail_k_body_label_id);
+      tail_k_continue_block = make_block(tail_k_continue_label_id);
+    }
+  }
+  if (!entry_block || !return_block ||
+      (has_full_output &&
+       (!out_header_block || !out_body_block || !out_finalize_block ||
+        !out_continue_block || !out_merge_block)) ||
+      (has_full_output && has_full_input &&
+       (!out_k_header_block || !out_k_body_block || !out_k_continue_block)) ||
+      (has_output_tail && (!tail_entry_block || !tail_finalize_block)) ||
+      (has_output_tail && has_full_input &&
+       (!tail_k_header_block || !tail_k_body_block ||
+        !tail_k_continue_block))) {
+    return 0;
+  }
+
+  const uint32_t input_lowered_function_ptr_type_id =
+      input_is_value ? GetOrCreatePointerType(input.lowered_type_id,
+                                              spv::StorageClass::Function)
+                     : 0;
+  const uint32_t matrix_lowered_function_ptr_type_id =
+      matrix_is_value ? GetOrCreatePointerType(matrix.lowered_type_id,
+                                               spv::StorageClass::Function)
+                      : 0;
+  const uint32_t bias_lowered_function_ptr_type_id =
+      has_bias && bias_is_value
+          ? GetOrCreatePointerType(bias->lowered_type_id,
+                                   spv::StorageClass::Function)
+          : 0;
+  if ((input_is_value && input_lowered_function_ptr_type_id == 0) ||
+      (matrix_is_value && matrix_lowered_function_ptr_type_id == 0) ||
+      (has_bias && bias_is_value && bias_lowered_function_ptr_type_id == 0)) {
+    return 0;
+  }
+
+  InstructionBuilder entry_builder(context(), entry_block.get());
+  Instruction* result_var = entry_builder.AddVariable(
+      lowered_result_function_ptr_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* out_pack_var =
+      has_full_output ? entry_builder.AddVariable(
+                            uint_function_ptr_type_id,
+                            static_cast<uint32_t>(spv::StorageClass::Function))
+                      : nullptr;
+  Instruction* k_pack_var =
+      has_full_input ? entry_builder.AddVariable(
+                           uint_function_ptr_type_id,
+                           static_cast<uint32_t>(spv::StorageClass::Function))
+                     : nullptr;
+  std::array<Instruction*, kPackedVec4Width> accumulator_vars = {};
+  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+    accumulator_vars[lane] = entry_builder.AddVariable(
+        result_vec4_function_ptr_type_id,
+        static_cast<uint32_t>(spv::StorageClass::Function));
+  }
+  Instruction* input_var =
+      input_is_value ? entry_builder.AddVariable(
+                           input_lowered_function_ptr_type_id,
+                           static_cast<uint32_t>(spv::StorageClass::Function))
+                     : nullptr;
+  Instruction* matrix_var =
+      matrix_is_value ? entry_builder.AddVariable(
+                            matrix_lowered_function_ptr_type_id,
+                            static_cast<uint32_t>(spv::StorageClass::Function))
+                      : nullptr;
+  Instruction* bias_var =
+      has_bias && bias_is_value
+          ? entry_builder.AddVariable(
+                bias_lowered_function_ptr_type_id,
+                static_cast<uint32_t>(spv::StorageClass::Function))
+          : nullptr;
+  if (!result_var || (has_full_output && !out_pack_var) ||
+      (has_full_input && !k_pack_var) || (input_is_value && !input_var) ||
+      (matrix_is_value && !matrix_var) ||
+      (has_bias && bias_is_value && !bias_var)) {
+    return 0;
+  }
+  for (Instruction* accumulator_var : accumulator_vars) {
+    if (!accumulator_var) return 0;
+  }
+
+  const uint32_t captured_input_pointer_id =
+      input_is_value ? 0
+                     : BuildCapturedPointer(&entry_builder, input_pointer_id);
+  const uint32_t captured_matrix_pointer_id =
+      matrix_is_value ? 0
+                      : BuildCapturedPointer(&entry_builder, matrix_pointer_id);
+  const uint32_t captured_bias_pointer_id =
+      !has_bias || bias_is_value
+          ? 0
+          : BuildCapturedPointer(&entry_builder, bias_pointer_id);
+  if ((!input_is_value && captured_input_pointer_id == 0) ||
+      (!matrix_is_value && captured_matrix_pointer_id == 0) ||
+      (has_bias && !bias_is_value && captured_bias_pointer_id == 0)) {
+    return 0;
+  }
+  if ((input_is_value &&
+       !entry_builder.AddStore(input_var->result_id(), input_value_id)) ||
+      (matrix_is_value &&
+       !entry_builder.AddStore(matrix_var->result_id(), matrix_value_id)) ||
+      (has_bias && bias_is_value &&
+       !entry_builder.AddStore(bias_var->result_id(), bias_value_id)) ||
+      (has_full_output &&
+       !entry_builder.AddStore(out_pack_var->result_id(), zero_uint_id))) {
+    return 0;
+  }
+  const uint32_t first_label_id = has_full_output   ? out_header_label_id
+                                  : has_output_tail ? tail_entry_label_id
+                                                    : return_label_id;
+  if (!entry_builder.AddBranch(first_label_id)) return 0;
+
+  auto add_offset = [this, uint_type_id](InstructionBuilder* builder,
+                                         uint32_t base_id,
+                                         uint32_t offset) -> uint32_t {
+    if (!builder || base_id == 0) return 0;
+    if (offset == 0) return base_id;
+    const uint32_t offset_id = GetOrCreateUIntConstant(offset);
+    Instruction* sum = offset_id
+                           ? builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                  base_id, offset_id)
+                           : nullptr;
+    return sum ? sum->result_id() : 0;
+  };
+  auto load_buffer_scalar =
+      [this](InstructionBuilder* builder, uint32_t pointer_type_id,
+             uint32_t pointer_id, uint32_t component_type_id,
+             uint32_t element_index_id,
+             const std::vector<Operand>& memory_operands) -> uint32_t {
+    if (!builder || pointer_type_id == 0 || pointer_id == 0 ||
+        component_type_id == 0 || element_index_id == 0) {
+      return 0;
+    }
+    const uint32_t element_pointer_id =
+        BuildElementAccessFromPointerType(builder, pointer_type_id, pointer_id,
+                                          component_type_id, element_index_id);
+    return element_pointer_id ? AddLoad(builder, component_type_id,
+                                        element_pointer_id, memory_operands)
+                              : 0;
+  };
+  auto load_input_scalar = [&](InstructionBuilder* builder,
+                               uint32_t index_id) -> uint32_t {
+    if (input_is_value) {
+      Instruction* pointer =
+          builder->AddAccessChain(input_scalar_function_ptr_type_id,
+                                  input_var->result_id(), {index_id});
+      Instruction* value = pointer ? builder->AddLoad(input.component_type_id,
+                                                      pointer->result_id())
+                                   : nullptr;
+      return value ? value->result_id() : 0;
+    }
+    return load_buffer_scalar(
+        builder, input_pointer_type_id, captured_input_pointer_id,
+        input.component_type_id, index_id, input_memory_operands);
+  };
+  auto load_matrix_scalar = [&](InstructionBuilder* builder, uint32_t row_id,
+                                uint32_t col_id) -> uint32_t {
+    Instruction* row_offset = builder->AddBinaryOp(
+        uint_type_id, spv::Op::OpIMul, row_id, matrix_cols_id);
+    Instruction* flat_index =
+        row_offset ? builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                          row_offset->result_id(), col_id)
+                   : nullptr;
+    if (!flat_index) return 0;
+    if (matrix_is_value) {
+      Instruction* pointer = builder->AddAccessChain(
+          input_scalar_function_ptr_type_id, matrix_var->result_id(),
+          {flat_index->result_id()});
+      Instruction* value = pointer ? builder->AddLoad(matrix.component_type_id,
+                                                      pointer->result_id())
+                                   : nullptr;
+      return value ? value->result_id() : 0;
+    }
+    const uint32_t memory_index_id = BuildRowMajorMatrixMemoryIndex(
+        builder, nullptr, matrix_shape_id, matrix_offset_id, matrix.cols,
+        flat_index->result_id());
+    return memory_index_id
+               ? load_buffer_scalar(builder, matrix_pointer_type_id,
+                                    captured_matrix_pointer_id,
+                                    matrix.component_type_id, memory_index_id,
+                                    matrix_memory_operands)
+               : 0;
+  };
+  auto load_bias_scalar = [&](InstructionBuilder* builder,
+                              uint32_t index_id) -> uint32_t {
+    if (!has_bias || !bias) return 0;
+    if (bias_is_value) {
+      Instruction* pointer =
+          builder->AddAccessChain(result_scalar_function_ptr_type_id,
+                                  bias_var->result_id(), {index_id});
+      Instruction* value = pointer ? builder->AddLoad(bias->component_type_id,
+                                                      pointer->result_id())
+                                   : nullptr;
+      return value ? value->result_id() : 0;
+    }
+    return load_buffer_scalar(builder, bias_pointer_type_id,
+                              captured_bias_pointer_id, bias->component_type_id,
+                              index_id, bias_memory_operands);
+  };
+
+  auto emit_accumulate =
+      [&](InstructionBuilder* builder, uint32_t input_base_id,
+          uint32_t input_pack_index_id, uint32_t output_base_id,
+          uint32_t output_pack_index_id, uint32_t valid_input_lanes,
+          uint32_t valid_output_lanes) -> bool {
+    if (!builder || input_base_id == 0 || output_base_id == 0 ||
+        valid_input_lanes == 0 || valid_input_lanes > kPackedVec4Width ||
+        valid_output_lanes == 0 || valid_output_lanes > kPackedVec4Width) {
+      return false;
+    }
+
+    uint32_t input_vec_id = 0;
+    if (valid_input_lanes == kPackedVec4Width) {
+      if (input_is_value && IsPackedVec4(input)) {
+        Instruction* pointer = builder->AddAccessChain(
+            input_vec4_function_ptr_type_id, input_var->result_id(),
+            {input_pack_index_id});
+        Instruction* value =
+            pointer ? builder->AddLoad(input_vec4_type_id, pointer->result_id())
+                    : nullptr;
+        input_vec_id = value ? value->result_id() : 0;
+      } else if (!input_is_value) {
+        Instruction* value = builder->AddFunctionCall(
+            input_vec4_type_id, input_load_function_id, {input_base_id});
+        input_vec_id = value ? value->result_id() : 0;
+      }
+    }
+    if (input_vec_id == 0) {
+      std::vector<uint32_t> input_lane_ids;
+      input_lane_ids.reserve(kPackedVec4Width);
+      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+        uint32_t value_id = input_zero_id;
+        if (lane < valid_input_lanes) {
+          const uint32_t index_id = add_offset(builder, input_base_id, lane);
+          value_id = index_id ? load_input_scalar(builder, index_id) : 0;
+          if (value_id == 0) return false;
+        }
+        input_lane_ids.push_back(value_id);
+      }
+      Instruction* input_vec =
+          builder->AddCompositeConstruct(input_vec4_type_id, input_lane_ids);
+      input_vec_id = input_vec ? input_vec->result_id() : 0;
+    }
+    Instruction* widened_input =
+        input_vec_id ? builder->AddUnaryOp(result_vec4_type_id,
+                                           spv::Op::OpFConvert, input_vec_id)
+                     : nullptr;
+    if (!widened_input) return false;
+    ApplyActiveFPFastMathMode(widened_input);
+
+    std::array<uint32_t, kPackedVec4Width> matrix_row_vec_ids = {};
+    if (valid_output_lanes == kPackedVec4Width) {
+      for (uint32_t input_lane = 0; input_lane < valid_input_lanes;
+           ++input_lane) {
+        const uint32_t row_id = add_offset(builder, input_base_id, input_lane);
+        if (row_id == 0) return false;
+        if (matrix_is_value && IsPackedVec4(matrix)) {
+          Instruction* row_offset = builder->AddBinaryOp(
+              uint_type_id, spv::Op::OpIMul, row_id, matrix_packed_cols_id);
+          Instruction* packed_index =
+              row_offset ? builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                row_offset->result_id(),
+                                                output_pack_index_id)
+                         : nullptr;
+          Instruction* pointer =
+              packed_index
+                  ? builder->AddAccessChain(input_vec4_function_ptr_type_id,
+                                            matrix_var->result_id(),
+                                            {packed_index->result_id()})
+                  : nullptr;
+          Instruction* value = pointer ? builder->AddLoad(input_vec4_type_id,
+                                                          pointer->result_id())
+                                       : nullptr;
+          matrix_row_vec_ids[input_lane] = value ? value->result_id() : 0;
+        } else if (!matrix_is_value) {
+          Instruction* row_offset = builder->AddBinaryOp(
+              uint_type_id, spv::Op::OpIMul, row_id, matrix_cols_id);
+          Instruction* local_index =
+              row_offset ? builder->AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                                row_offset->result_id(),
+                                                output_base_id)
+                         : nullptr;
+          const uint32_t memory_index_id =
+              local_index
+                  ? BuildRowMajorMatrixMemoryIndex(
+                        builder, nullptr, matrix_shape_id, matrix_offset_id,
+                        matrix.cols, local_index->result_id())
+                  : 0;
+          Instruction* value =
+              memory_index_id ? builder->AddFunctionCall(
+                                    input_vec4_type_id, matrix_load_function_id,
+                                    {memory_index_id})
+                              : nullptr;
+          matrix_row_vec_ids[input_lane] = value ? value->result_id() : 0;
+        }
+        if (matrix_row_vec_ids[input_lane] == 0 &&
+            (IsPackedVec4(matrix) || !matrix_is_value)) {
+          return false;
+        }
+      }
+    }
+
+    for (uint32_t output_lane = 0; output_lane < valid_output_lanes;
+         ++output_lane) {
+      std::vector<uint32_t> weight_lane_ids;
+      weight_lane_ids.reserve(kPackedVec4Width);
+      for (uint32_t input_lane = 0; input_lane < kPackedVec4Width;
+           ++input_lane) {
+        uint32_t weight_id = input_zero_id;
+        if (input_lane < valid_input_lanes) {
+          if (matrix_row_vec_ids[input_lane] != 0) {
+            weight_id = ExtractCompositeElement(
+                builder, matrix.component_type_id,
+                matrix_row_vec_ids[input_lane], output_lane);
+          } else {
+            const uint32_t row_id =
+                add_offset(builder, input_base_id, input_lane);
+            const uint32_t col_id =
+                add_offset(builder, output_base_id, output_lane);
+            weight_id = row_id && col_id
+                            ? load_matrix_scalar(builder, row_id, col_id)
+                            : 0;
+          }
+          if (weight_id == 0) return false;
+        }
+        weight_lane_ids.push_back(weight_id);
+      }
+      Instruction* weight =
+          builder->AddCompositeConstruct(input_vec4_type_id, weight_lane_ids);
+      Instruction* widened_weight =
+          weight ? builder->AddUnaryOp(result_vec4_type_id, spv::Op::OpFConvert,
+                                       weight->result_id())
+                 : nullptr;
+      Instruction* accumulator = builder->AddLoad(
+          result_vec4_type_id, accumulator_vars[output_lane]->result_id());
+      if (!widened_weight || !accumulator) return false;
+      ApplyActiveFPFastMathMode(widened_weight);
+      const uint32_t accumulated =
+          BuildFma(builder, result_vec4_type_id, widened_input->result_id(),
+                   widened_weight->result_id(), accumulator->result_id());
+      if (accumulated == 0 ||
+          !builder->AddStore(accumulator_vars[output_lane]->result_id(),
+                             accumulated)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto emit_full_output = [&](InstructionBuilder* builder,
+                              uint32_t output_pack_id,
+                              uint32_t output_base_id) -> bool {
+    std::vector<uint32_t> lane_ids;
+    lane_ids.reserve(kPackedVec4Width);
+    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      Instruction* accumulator = builder->AddLoad(
+          result_vec4_type_id, accumulator_vars[lane]->result_id());
+      const uint32_t reduced =
+          accumulator ? BuildHorizontalReduce(builder, result.component_type_id,
+                                              accumulator->result_id())
+                      : 0;
+      if (reduced == 0) return false;
+      lane_ids.push_back(reduced);
+    }
+    Instruction* result_vec =
+        builder->AddCompositeConstruct(result_vec4_type_id, lane_ids);
+    if (!result_vec) return false;
+
+    if (has_bias) {
+      uint32_t bias_vec_id = 0;
+      if (bias_is_value && IsPackedVec4(*bias)) {
+        Instruction* pointer =
+            builder->AddAccessChain(result_vec4_function_ptr_type_id,
+                                    bias_var->result_id(), {output_pack_id});
+        Instruction* value = pointer ? builder->AddLoad(result_vec4_type_id,
+                                                        pointer->result_id())
+                                     : nullptr;
+        bias_vec_id = value ? value->result_id() : 0;
+      } else if (!bias_is_value) {
+        Instruction* value = builder->AddFunctionCall(
+            result_vec4_type_id, bias_load_function_id, {output_base_id});
+        bias_vec_id = value ? value->result_id() : 0;
+      } else {
+        std::vector<uint32_t> bias_lane_ids;
+        bias_lane_ids.reserve(kPackedVec4Width);
+        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+          const uint32_t index_id = add_offset(builder, output_base_id, lane);
+          const uint32_t value_id =
+              index_id ? load_bias_scalar(builder, index_id) : 0;
+          if (value_id == 0) return false;
+          bias_lane_ids.push_back(value_id);
+        }
+        Instruction* value =
+            builder->AddCompositeConstruct(result_vec4_type_id, bias_lane_ids);
+        bias_vec_id = value ? value->result_id() : 0;
+      }
+      Instruction* sum = bias_vec_id ? builder->AddBinaryOp(
+                                           result_vec4_type_id, spv::Op::OpFAdd,
+                                           result_vec->result_id(), bias_vec_id)
+                                     : nullptr;
+      if (!sum) return false;
+      ApplyActiveFPFastMathMode(sum);
+      result_vec = sum;
+    }
+
+    if (IsPackedVec4(result)) {
+      Instruction* pointer =
+          builder->AddAccessChain(result_vec4_function_ptr_type_id,
+                                  result_var->result_id(), {output_pack_id});
+      return pointer &&
+             builder->AddStore(pointer->result_id(), result_vec->result_id());
+    }
+    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      const uint32_t index_id = add_offset(builder, output_base_id, lane);
+      const uint32_t value_id = ExtractCompositeElement(
+          builder, result.component_type_id, result_vec->result_id(), lane);
+      Instruction* pointer = index_id ? builder->AddAccessChain(
+                                            result_scalar_function_ptr_type_id,
+                                            result_var->result_id(), {index_id})
+                                      : nullptr;
+      if (value_id == 0 || !pointer ||
+          !builder->AddStore(pointer->result_id(), value_id)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto emit_output_tail = [&](InstructionBuilder* builder) -> bool {
+    for (uint32_t lane = 0; lane < output_tail_lanes; ++lane) {
+      Instruction* accumulator = builder->AddLoad(
+          result_vec4_type_id, accumulator_vars[lane]->result_id());
+      uint32_t scalar_id =
+          accumulator ? BuildHorizontalReduce(builder, result.component_type_id,
+                                              accumulator->result_id())
+                      : 0;
+      const uint32_t index_id = add_offset(builder, output_tail_base_id, lane);
+      if (scalar_id == 0 || index_id == 0) return false;
+      if (has_bias) {
+        const uint32_t bias_id = load_bias_scalar(builder, index_id);
+        Instruction* sum =
+            bias_id ? builder->AddBinaryOp(result.component_type_id,
+                                           spv::Op::OpFAdd, scalar_id, bias_id)
+                    : nullptr;
+        if (!sum) return false;
+        ApplyActiveFPFastMathMode(sum);
+        scalar_id = sum->result_id();
+      }
+      Instruction* pointer =
+          builder->AddAccessChain(result_scalar_function_ptr_type_id,
+                                  result_var->result_id(), {index_id});
+      if (!pointer || !builder->AddStore(pointer->result_id(), scalar_id)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  auto reset_accumulators = [&](InstructionBuilder* builder,
+                                uint32_t lane_count) -> bool {
+    for (uint32_t lane = 0; lane < lane_count; ++lane) {
+      if (!builder->AddStore(accumulator_vars[lane]->result_id(),
+                             result_zero4_id)) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (has_full_output) {
+    InstructionBuilder out_header_builder(context(), out_header_block.get());
+    Instruction* out_pack =
+        out_header_builder.AddLoad(uint_type_id, out_pack_var->result_id());
+    Instruction* out_condition =
+        out_pack ? out_header_builder.AddBinaryOp(
+                       bool_type_id, spv::Op::OpULessThan,
+                       out_pack->result_id(), full_output_packs_id)
+                 : nullptr;
+    if (!out_condition ||
+        !out_header_builder.AddLoopMerge(out_merge_label_id,
+                                         out_continue_label_id) ||
+        !out_header_builder.AddConditionalBranch(out_condition->result_id(),
+                                                 out_body_label_id,
+                                                 out_merge_label_id)) {
+      return 0;
+    }
+
+    InstructionBuilder out_body_builder(context(), out_body_block.get());
+    if (!reset_accumulators(&out_body_builder, kPackedVec4Width)) return 0;
+    if (has_full_input) {
+      if (!out_body_builder.AddStore(k_pack_var->result_id(), zero_uint_id) ||
+          !out_body_builder.AddBranch(out_k_header_label_id)) {
+        return 0;
+      }
+    } else if (!out_body_builder.AddBranch(out_finalize_label_id)) {
+      return 0;
+    }
+
+    if (has_full_input) {
+      InstructionBuilder k_header_builder(context(), out_k_header_block.get());
+      Instruction* k_pack =
+          k_header_builder.AddLoad(uint_type_id, k_pack_var->result_id());
+      Instruction* k_condition =
+          k_pack ? k_header_builder.AddBinaryOp(
+                       bool_type_id, spv::Op::OpULessThan, k_pack->result_id(),
+                       full_input_packs_id)
+                 : nullptr;
+      if (!k_condition ||
+          !k_header_builder.AddLoopMerge(out_finalize_label_id,
+                                         out_k_continue_label_id) ||
+          !k_header_builder.AddConditionalBranch(k_condition->result_id(),
+                                                 out_k_body_label_id,
+                                                 out_finalize_label_id)) {
+        return 0;
+      }
+
+      InstructionBuilder k_body_builder(context(), out_k_body_block.get());
+      Instruction* input_base = k_body_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIMul, k_pack->result_id(), four_uint_id);
+      Instruction* output_base = k_body_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIMul, out_pack->result_id(), four_uint_id);
+      if (!input_base || !output_base ||
+          !emit_accumulate(&k_body_builder, input_base->result_id(),
+                           k_pack->result_id(), output_base->result_id(),
+                           out_pack->result_id(), kPackedVec4Width,
+                           kPackedVec4Width) ||
+          !k_body_builder.AddBranch(out_k_continue_label_id)) {
+        return 0;
+      }
+
+      InstructionBuilder k_continue_builder(context(),
+                                            out_k_continue_block.get());
+      Instruction* next_k = k_continue_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIAdd, k_pack->result_id(), one_uint_id);
+      if (!next_k ||
+          !k_continue_builder.AddStore(k_pack_var->result_id(),
+                                       next_k->result_id()) ||
+          !k_continue_builder.AddBranch(out_k_header_label_id)) {
+        return 0;
+      }
+    }
+
+    InstructionBuilder out_finalize_builder(context(),
+                                            out_finalize_block.get());
+    Instruction* output_base = out_finalize_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpIMul, out_pack->result_id(), four_uint_id);
+    if (!output_base) return 0;
+    if (has_input_tail) {
+      const uint32_t tail_pack_index_id =
+          has_full_input ? full_input_packs_id : zero_uint_id;
+      if (!emit_accumulate(&out_finalize_builder, input_tail_base_id,
+                           tail_pack_index_id, output_base->result_id(),
+                           out_pack->result_id(), input_tail_lanes,
+                           kPackedVec4Width)) {
+        return 0;
+      }
+    }
+    if (!emit_full_output(&out_finalize_builder, out_pack->result_id(),
+                          output_base->result_id()) ||
+        !out_finalize_builder.AddBranch(out_continue_label_id)) {
+      return 0;
+    }
+
+    InstructionBuilder out_continue_builder(context(),
+                                            out_continue_block.get());
+    Instruction* next_out = out_continue_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpIAdd, out_pack->result_id(), one_uint_id);
+    if (!next_out ||
+        !out_continue_builder.AddStore(out_pack_var->result_id(),
+                                       next_out->result_id()) ||
+        !out_continue_builder.AddBranch(out_header_label_id)) {
+      return 0;
+    }
+
+    InstructionBuilder out_merge_builder(context(), out_merge_block.get());
+    if (!out_merge_builder.AddBranch(has_output_tail ? tail_entry_label_id
+                                                     : return_label_id)) {
+      return 0;
+    }
+  }
+
+  if (has_output_tail) {
+    InstructionBuilder tail_entry_builder(context(), tail_entry_block.get());
+    if (!reset_accumulators(&tail_entry_builder, output_tail_lanes)) return 0;
+    if (has_full_input) {
+      if (!tail_entry_builder.AddStore(k_pack_var->result_id(), zero_uint_id) ||
+          !tail_entry_builder.AddBranch(tail_k_header_label_id)) {
+        return 0;
+      }
+    } else if (!tail_entry_builder.AddBranch(tail_finalize_label_id)) {
+      return 0;
+    }
+
+    if (has_full_input) {
+      InstructionBuilder k_header_builder(context(), tail_k_header_block.get());
+      Instruction* k_pack =
+          k_header_builder.AddLoad(uint_type_id, k_pack_var->result_id());
+      Instruction* k_condition =
+          k_pack ? k_header_builder.AddBinaryOp(
+                       bool_type_id, spv::Op::OpULessThan, k_pack->result_id(),
+                       full_input_packs_id)
+                 : nullptr;
+      if (!k_condition ||
+          !k_header_builder.AddLoopMerge(tail_finalize_label_id,
+                                         tail_k_continue_label_id) ||
+          !k_header_builder.AddConditionalBranch(k_condition->result_id(),
+                                                 tail_k_body_label_id,
+                                                 tail_finalize_label_id)) {
+        return 0;
+      }
+
+      InstructionBuilder k_body_builder(context(), tail_k_body_block.get());
+      Instruction* input_base = k_body_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIMul, k_pack->result_id(), four_uint_id);
+      const uint32_t output_pack_index_id =
+          has_full_output ? full_output_packs_id : zero_uint_id;
+      if (!input_base ||
+          !emit_accumulate(&k_body_builder, input_base->result_id(),
+                           k_pack->result_id(), output_tail_base_id,
+                           output_pack_index_id, kPackedVec4Width,
+                           output_tail_lanes) ||
+          !k_body_builder.AddBranch(tail_k_continue_label_id)) {
+        return 0;
+      }
+
+      InstructionBuilder k_continue_builder(context(),
+                                            tail_k_continue_block.get());
+      Instruction* next_k = k_continue_builder.AddBinaryOp(
+          uint_type_id, spv::Op::OpIAdd, k_pack->result_id(), one_uint_id);
+      if (!next_k ||
+          !k_continue_builder.AddStore(k_pack_var->result_id(),
+                                       next_k->result_id()) ||
+          !k_continue_builder.AddBranch(tail_k_header_label_id)) {
+        return 0;
+      }
+    }
+
+    InstructionBuilder tail_finalize_builder(context(),
+                                             tail_finalize_block.get());
+    if (has_input_tail) {
+      const uint32_t input_pack_index_id =
+          has_full_input ? full_input_packs_id : zero_uint_id;
+      const uint32_t output_pack_index_id =
+          has_full_output ? full_output_packs_id : zero_uint_id;
+      if (!emit_accumulate(&tail_finalize_builder, input_tail_base_id,
+                           input_pack_index_id, output_tail_base_id,
+                           output_pack_index_id, input_tail_lanes,
+                           output_tail_lanes)) {
+        return 0;
+      }
+    }
+    if (!emit_output_tail(&tail_finalize_builder) ||
+        !tail_finalize_builder.AddBranch(return_label_id)) {
+      return 0;
+    }
+  }
+
+  InstructionBuilder return_builder(context(), return_block.get());
+  Instruction* result_value =
+      return_builder.AddLoad(result.lowered_type_id, result_var->result_id());
+  if (!result_value || !return_builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                                                  result_value->result_id())) {
+    return 0;
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(entry_block));
+  if (has_full_output) {
+    function->AddBasicBlock(std::move(out_header_block));
+    function->AddBasicBlock(std::move(out_body_block));
+    if (has_full_input) {
+      function->AddBasicBlock(std::move(out_k_header_block));
+      function->AddBasicBlock(std::move(out_k_body_block));
+      function->AddBasicBlock(std::move(out_k_continue_block));
+    }
+    function->AddBasicBlock(std::move(out_finalize_block));
+    function->AddBasicBlock(std::move(out_continue_block));
+    function->AddBasicBlock(std::move(out_merge_block));
+  }
+  if (has_output_tail) {
+    function->AddBasicBlock(std::move(tail_entry_block));
+    if (has_full_input) {
+      function->AddBasicBlock(std::move(tail_k_header_block));
+      function->AddBasicBlock(std::move(tail_k_body_block));
+      function->AddBasicBlock(std::move(tail_k_continue_block));
+    }
+    function->AddBasicBlock(std::move(tail_finalize_block));
+  }
+  function->AddBasicBlock(std::move(return_block));
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
+  return function_id;
+}
+
 uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
@@ -1206,6 +2174,21 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     const std::vector<Operand>& bias_memory_operands, uint32_t bias_constant_id,
     bool bias_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  const bool mixed_f16_f32 =
+      IsFloat32Type(result.component_type_id) &&
+      IsFloat16Type(input.component_type_id) &&
+      IsFloat16Type(matrix.component_type_id) &&
+      (!has_bias || (bias && IsFloat32Type(bias->component_type_id)));
+  if (mixed_f16_f32) {
+    return BuildDirectMixedVectorMatmulFunctionPackedVec4(
+        result, input, matrix, bias, has_bias, input_pointer_id,
+        input_pointer_type_id, input_memory_operands, input_constant_id,
+        input_is_value, matrix_pointer_id, matrix_pointer_type_id,
+        matrix_shape_id, matrix_offset_id, matrix_memory_operands,
+        matrix_constant_id, matrix_is_value, bias_pointer_id,
+        bias_pointer_type_id, bias_memory_operands, bias_constant_id,
+        bias_is_value, value_arguments);
+  }
   if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
       input.length != matrix.rows || result.length != matrix.cols ||
       (has_bias && (!bias || !IsPackedVec4(*bias)))) {

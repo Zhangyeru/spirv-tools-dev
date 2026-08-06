@@ -45,6 +45,17 @@ namespace opt {
 
 using namespace hw_lower_internal;
 
+namespace {
+
+Instruction* MoveTypeAfter(Instruction* type, Instruction* insert_after) {
+  if (!type || !insert_after || type == insert_after) return nullptr;
+  type->RemoveFromList();
+  std::unique_ptr<Instruction> owned_type(type);
+  return insert_after->NextNode()->InsertBefore(std::move(owned_type));
+}
+
+}  // namespace
+
 bool HwLowerToStandardPass::CollectHwTypes() {
   std::vector<Instruction*> hw_types;
   get_module()->ForEachInst([this, &hw_types](Instruction* inst) {
@@ -64,6 +75,11 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       MatrixTypeInfo info;
       info.type_id = inst->result_id();
       info.component_type_id = inst->GetSingleWordInOperand(0);
+      if (inst->NumInOperands() >= 4) {
+        info.has_matrix_use = true;
+        info.matrix_use = static_cast<spv::CooperativeMatrixUseHW>(
+            inst->GetSingleWordInOperand(3));
+      }
       Instruction* rows_def =
           get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(1));
       Instruction* cols_def =
@@ -230,16 +246,33 @@ uint32_t HwLowerToStandardPass::GetOrCreateArrayType(
   uint32_t length_id = GetOrCreateUIntConstantAfter(length, &insertion_point);
   if (length_id == 0) return 0;
 
+  bool passed_insertion_point = false;
+  Instruction* later_array_type = nullptr;
   for (Instruction& inst : get_module()->types_values()) {
-    if (inst.opcode() != spv::Op::OpTypeArray ||
-        inst.GetSingleWordInOperand(0) != component_type_id) {
-      continue;
+    if (inst.opcode() == spv::Op::OpTypeArray &&
+        inst.GetSingleWordInOperand(0) == component_type_id) {
+      uint32_t existing_length = 0;
+      if (GetConstantU32(inst.GetSingleWordInOperand(1), &existing_length) &&
+          existing_length == length) {
+        if (!passed_insertion_point) return inst.result_id();
+        later_array_type = &inst;
+        break;
+      }
     }
-    uint32_t existing_length = 0;
-    if (GetConstantU32(inst.GetSingleWordInOperand(1), &existing_length) &&
-        existing_length == length) {
-      return inst.result_id();
+    if (&inst == insertion_point) passed_insertion_point = true;
+  }
+
+  if (later_array_type) {
+    // Preserve the identity of an existing aggregate type so function types
+    // that become equivalent after lowering can still be canonicalized. The
+    // replacement length constant is guaranteed to precede the insertion
+    // point, unlike the existing array's length declaration in general.
+    if (later_array_type->GetSingleWordInOperand(1) != length_id) {
+      later_array_type->SetInOperand(1, {length_id});
+      context()->UpdateDefUse(later_array_type);
     }
+    Instruction* moved = MoveTypeAfter(later_array_type, insertion_point);
+    return moved ? moved->result_id() : 0;
   }
 
   const uint32_t result_id = TakeNextId();
@@ -255,12 +288,24 @@ uint32_t HwLowerToStandardPass::GetOrCreateArrayType(
 uint32_t HwLowerToStandardPass::GetOrCreateVectorType(
     uint32_t component_type_id, uint32_t component_count,
     Instruction** insert_after) {
+  bool passed_insertion_point = false;
+  Instruction* later_vector_type = nullptr;
   for (Instruction& inst : get_module()->types_values()) {
     if (inst.opcode() == spv::Op::OpTypeVector &&
         inst.GetSingleWordInOperand(0) == component_type_id &&
         inst.GetSingleWordInOperand(1) == component_count) {
-      return inst.result_id();
+      if (!passed_insertion_point) return inst.result_id();
+      later_vector_type = &inst;
+      break;
     }
+    if (&inst == *insert_after) passed_insertion_point = true;
+  }
+
+  if (later_vector_type) {
+    Instruction* moved = MoveTypeAfter(later_vector_type, *insert_after);
+    if (!moved) return 0;
+    *insert_after = moved;
+    return moved->result_id();
   }
 
   const uint32_t result_id = TakeNextId();

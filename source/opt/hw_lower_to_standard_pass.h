@@ -69,6 +69,9 @@ class HwLowerToStandardPass : public Pass {
     uint32_t component_type_id = 0;
     uint32_t rows = 0;
     uint32_t cols = 0;
+    bool has_matrix_use = false;
+    spv::CooperativeMatrixUseHW matrix_use =
+        spv::CooperativeMatrixUseHW::MatrixUseAHW;
     uint32_t lowered_type_id = 0;
     bool packed_f16vec4 = false;
     bool packed_f32vec4 = false;
@@ -296,6 +299,20 @@ class HwLowerToStandardPass : public Pass {
       uint32_t output_offset_id,
       const std::vector<Operand>& output_memory_operands);
   uint32_t BuildDirectVectorMatmulFunctionPackedVec4(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+      uint32_t input_pointer_id, uint32_t input_pointer_type_id,
+      const std::vector<Operand>& input_memory_operands,
+      uint32_t input_constant_id, bool input_is_value,
+      uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
+      uint32_t matrix_shape_id, uint32_t matrix_offset_id,
+      const std::vector<Operand>& matrix_memory_operands,
+      uint32_t matrix_constant_id, bool matrix_is_value,
+      uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
+      const std::vector<Operand>& bias_memory_operands,
+      uint32_t bias_constant_id, bool bias_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
+  uint32_t BuildDirectMixedVectorMatmulFunctionPackedVec4(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
       uint32_t input_pointer_id, uint32_t input_pointer_type_id,
@@ -548,6 +565,10 @@ class HwLowerToStandardPass : public Pass {
                                        const VectorTypeInfo& input,
                                        const MatrixTypeInfo& matrix,
                                        const VectorTypeInfo* bias) const;
+  bool CanUseDirectVectorMatrixMul(const VectorTypeInfo& result,
+                                   const VectorTypeInfo& input,
+                                   const MatrixTypeInfo& matrix,
+                                   const VectorTypeInfo* bias) const;
   bool ShouldUsePackedVec4(uint32_t extent) const;
   uint32_t MatrixFlatIndex(const MatrixTypeInfo& info, uint32_t row,
                            uint32_t col) const;

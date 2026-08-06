@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -1722,6 +1721,23 @@ bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
     return false;
   }
   return !bias || IsSamePackedVec4Kind(result, *bias);
+}
+
+bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
+  if (CanUsePackedVec4VectorMatrixMul(result, input, matrix, bias)) return true;
+
+  if (lowering_mode_ != LoweringMode::kPreferPackedVec4 ||
+      !IsFloat32Type(result.component_type_id) ||
+      !IsFloat16Type(input.component_type_id) ||
+      !IsFloat16Type(matrix.component_type_id) ||
+      result.length != matrix.cols || input.length != matrix.rows) {
+    return false;
+  }
+
+  return !bias || (IsFloat32Type(bias->component_type_id) &&
+                   bias->length == result.length);
 }
 
 bool HwLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {

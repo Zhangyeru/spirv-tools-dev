@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -31,6 +30,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -949,18 +949,80 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
     bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
   }
   if (!result || !input || !matrix || (has_bias && !bias) ||
-      !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)) {
+      !CanUseDirectVectorMatrixMul(*result, *input, *matrix, bias)) {
     return true;
   }
 
-  auto trace_changes_type = [this, inst](Instruction* value_inst) {
-    if (!value_inst) return true;
+  auto is_compatible_matrix_use_bitcast = [this](Instruction* bitcast) {
+    if (!bitcast || bitcast->opcode() != spv::Op::OpBitcast ||
+        bitcast->NumInOperands() < 1) {
+      return false;
+    }
+    Instruction* source =
+        get_def_use_mgr()->GetDef(bitcast->GetSingleWordInOperand(0));
+    const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
+    const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(bitcast);
+    return source_matrix && result_matrix && source_matrix->has_matrix_use &&
+           result_matrix->has_matrix_use &&
+           source_matrix->component_type_id ==
+               result_matrix->component_type_id &&
+           source_matrix->rows == result_matrix->rows &&
+           source_matrix->cols == result_matrix->cols &&
+           source_matrix->matrix_use ==
+               spv::CooperativeMatrixUseHW::MatrixUseAHW &&
+           result_matrix->matrix_use ==
+               spv::CooperativeMatrixUseHW::MatrixUseBHW;
+  };
+  auto trace_types_are_compatible = [this, inst,
+                                     &is_compatible_matrix_use_bitcast](
+                                        Instruction* value_inst) {
+    if (!value_inst) return false;
     std::vector<Instruction*> chain;
     Instruction* source = TraceFunctionValueSource(value_inst, inst, &chain);
-    return source && source->type_id() != value_inst->type_id();
+    bool saw_compatible_type_change = false;
+    for (Instruction* chain_inst : chain) {
+      if (!chain_inst || chain_inst->opcode() != spv::Op::OpBitcast ||
+          chain_inst->NumInOperands() < 1) {
+        continue;
+      }
+
+      Instruction* bitcast_source =
+          get_def_use_mgr()->GetDef(chain_inst->GetSingleWordInOperand(0));
+      if (!bitcast_source) return false;
+      const MatrixTypeInfo* source_matrix =
+          GetMatrixTypeForValue(bitcast_source);
+      const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(chain_inst);
+      if (source_matrix && result_matrix &&
+          source_matrix->type_id == result_matrix->type_id) {
+        continue;
+      }
+      if (!is_compatible_matrix_use_bitcast(chain_inst)) {
+        return false;
+      }
+      saw_compatible_type_change = true;
+    }
+
+    if (!source) return true;
+    const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
+    const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(value_inst);
+    if (source_matrix && result_matrix &&
+        source_matrix->type_id != result_matrix->type_id) {
+      return saw_compatible_type_change && source_matrix->has_matrix_use &&
+             result_matrix->has_matrix_use &&
+             source_matrix->component_type_id ==
+                 result_matrix->component_type_id &&
+             source_matrix->rows == result_matrix->rows &&
+             source_matrix->cols == result_matrix->cols &&
+             source_matrix->matrix_use ==
+                 spv::CooperativeMatrixUseHW::MatrixUseAHW &&
+             result_matrix->matrix_use ==
+                 spv::CooperativeMatrixUseHW::MatrixUseBHW;
+    }
+    return source->type_id() == value_inst->type_id();
   };
-  if (trace_changes_type(input_inst) || trace_changes_type(matrix_inst) ||
-      (has_bias && trace_changes_type(bias_inst))) {
+  if (!trace_types_are_compatible(input_inst) ||
+      !trace_types_are_compatible(matrix_inst) ||
+      (has_bias && !trace_types_are_compatible(bias_inst))) {
     return true;
   }
 
@@ -1185,6 +1247,118 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   if (has_bias && !bias_is_value &&
       has_live_users_outside_kill(direct_bias.source_load)) {
     remove_kill(direct_bias.source_load);
+  }
+
+  // EliminateHwFunctionVariables rewrites the matmul operand to its original
+  // value, but deliberately leaves dead forward copies in place.  Frontends
+  // commonly emit those copies after a MatrixUseA-to-MatrixUseB bitcast.  Add
+  // an entire copy chain to the kill list only when every pointer is a
+  // function-local variable with a single store and every loaded value is
+  // consumed solely by another such copy or by the current matmul.
+  auto add_dead_forward_copy_chain = [this, inst, &add_kill,
+                                      &kill_set](Instruction* seed) {
+    if (!seed || seed->result_id() == 0 ||
+        IsFunctionPointer(seed->result_id())) {
+      return;
+    }
+
+    std::unordered_set<Instruction*> candidates;
+    std::unordered_set<const Instruction*> active_values;
+    std::unordered_set<const Instruction*> proven_values;
+    std::unordered_set<const Instruction*> active_pointers;
+    std::unordered_set<const Instruction*> proven_pointers;
+    std::unordered_map<const Instruction*, const Instruction*> pointer_stores;
+    std::function<bool(Instruction*)> prove_value;
+    std::function<bool(Instruction*, Instruction*)> prove_pointer;
+
+    prove_pointer = [&](Instruction* pointer, Instruction* originating_store) {
+      if (!pointer || pointer->opcode() != spv::Op::OpVariable ||
+          !IsFunctionPointer(pointer->result_id())) {
+        return false;
+      }
+      const auto* decoration_mgr = context()->get_decoration_mgr();
+      if (decoration_mgr &&
+          decoration_mgr->HasDecoration(pointer->result_id(),
+                                        uint32_t(spv::Decoration::Volatile))) {
+        return false;
+      }
+      auto store_it = pointer_stores.find(pointer);
+      if (store_it != pointer_stores.end() &&
+          store_it->second != originating_store) {
+        return false;
+      }
+      pointer_stores[pointer] = originating_store;
+      if (proven_pointers.find(pointer) != proven_pointers.end()) {
+        return true;
+      }
+      if (!active_pointers.insert(pointer).second) return false;
+
+      bool safe = true;
+      get_def_use_mgr()->ForEachUser(pointer, [&](Instruction* pointer_user) {
+        if (!safe || !pointer_user || IsIgnorableDirectUser(pointer_user) ||
+            kill_set.find(pointer_user) != kill_set.end() ||
+            candidates.find(pointer_user) != candidates.end()) {
+          return;
+        }
+        if (pointer_user == originating_store) {
+          candidates.insert(pointer_user);
+          return;
+        }
+        if (pointer_user->opcode() != spv::Op::OpLoad ||
+            pointer_user->NumInOperands() != 1 ||
+            pointer_user->GetSingleWordInOperand(0) != pointer->result_id() ||
+            !prove_value(pointer_user)) {
+          safe = false;
+          return;
+        }
+        candidates.insert(pointer_user);
+      });
+
+      active_pointers.erase(pointer);
+      if (!safe) return false;
+      candidates.insert(originating_store);
+      candidates.insert(pointer);
+      proven_pointers.insert(pointer);
+      return true;
+    };
+
+    prove_value = [&](Instruction* value) {
+      if (!value || value->result_id() == 0) return false;
+      if (proven_values.find(value) != proven_values.end()) return true;
+      if (!active_values.insert(value).second) return false;
+
+      bool safe = true;
+      get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+        if (!safe || !user || user == inst || IsIgnorableDirectUser(user) ||
+            kill_set.find(user) != kill_set.end() ||
+            candidates.find(user) != candidates.end()) {
+          return;
+        }
+        if (user->opcode() != spv::Op::OpStore || user->NumInOperands() != 2 ||
+            user->GetSingleWordInOperand(1) != value->result_id()) {
+          safe = false;
+          return;
+        }
+        Instruction* pointer =
+            get_def_use_mgr()->GetDef(user->GetSingleWordInOperand(0));
+        if (!prove_pointer(pointer, user)) safe = false;
+      });
+
+      active_values.erase(value);
+      if (!safe) return false;
+      proven_values.insert(value);
+      return true;
+    };
+
+    if (!prove_value(seed)) return;
+    for (Instruction* candidate : candidates) add_kill(candidate);
+  };
+
+  for (Instruction* seed : direct_matrix.chain) {
+    if (kill_set.find(seed) != kill_set.end() &&
+        is_compatible_matrix_use_bitcast(seed)) {
+      add_dead_forward_copy_chain(seed);
+    }
   }
   if (!DirectKillListUsersAreClosed(inst, kill_list)) return true;
 
