@@ -1726,18 +1726,23 @@ bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
 bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
-  if (CanUsePackedVec4VectorMatrixMul(result, input, matrix, bias)) return true;
-
   if (lowering_mode_ != LoweringMode::kPreferPackedVec4 ||
-      !IsFloat32Type(result.component_type_id) ||
-      !IsFloat16Type(input.component_type_id) ||
-      !IsFloat16Type(matrix.component_type_id) ||
-      result.length != matrix.cols || input.length != matrix.rows) {
+      result.length != matrix.cols || input.length != matrix.rows ||
+      (bias && bias->length != result.length)) {
     return false;
   }
 
-  return !bias || (IsFloat32Type(bias->component_type_id) &&
-                   bias->length == result.length);
+  const bool same_component =
+      result.component_type_id == input.component_type_id &&
+      result.component_type_id == matrix.component_type_id &&
+      (!bias || result.component_type_id == bias->component_type_id) &&
+      (IsFloat16Type(result.component_type_id) ||
+       IsFloat32Type(result.component_type_id));
+  const bool mixed_f16_f32 = IsFloat32Type(result.component_type_id) &&
+                             IsFloat16Type(input.component_type_id) &&
+                             IsFloat16Type(matrix.component_type_id) &&
+                             (!bias || IsFloat32Type(bias->component_type_id));
+  return same_component || mixed_f16_f32;
 }
 
 bool HwLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {
@@ -1791,19 +1796,20 @@ uint32_t HwLowerToStandardPass::GetFPFastMathMode(uint32_t result_id) const {
   return 0;
 }
 
-void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
-  if (!inst || inst->result_id() == 0 || active_fp_fast_math_mode_ == 0) {
-    return;
-  }
+void HwLowerToStandardPass::ApplyFPFastMathMode(Instruction* inst,
+                                                uint32_t mode) {
+  if (!inst || inst->result_id() == 0 || mode == 0) return;
   if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse) &&
       !context()->get_def_use_mgr()->GetDef(inst->result_id())) {
-    pending_fp_fast_math_modes_.emplace_back(inst->result_id(),
-                                             active_fp_fast_math_mode_);
+    pending_fp_fast_math_modes_.emplace_back(inst->result_id(), mode);
     return;
   }
   context()->get_decoration_mgr()->AddDecorationVal(
-      inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode),
-      active_fp_fast_math_mode_);
+      inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode), mode);
+}
+
+void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
+  ApplyFPFastMathMode(inst, active_fp_fast_math_mode_);
 }
 
 bool HwLowerToStandardPass::MatmulAllowsReassociation(

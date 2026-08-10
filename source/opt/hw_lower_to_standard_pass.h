@@ -101,11 +101,15 @@ class HwLowerToStandardPass : public Pass {
   // matmul helper. Matrix-only fields remain zero for vector loads.
   struct DirectLoadSource {
     Instruction* source_load = nullptr;
+    Instruction* conversion = nullptr;
     std::vector<Instruction*> chain;
     uint32_t pointer_id = 0;
     uint32_t pointer_type_id = 0;
+    uint32_t component_type_id = 0;
+    uint32_t conversion_fp_fast_math_mode = 0;
     uint32_t shape_id = 0;
     uint32_t offset_id = 0;
+    uint32_t constant_offset = 0;
     uint32_t layout = 0;
     std::vector<Operand> memory_operands;
   };
@@ -310,21 +314,9 @@ class HwLowerToStandardPass : public Pass {
       uint32_t matrix_constant_id, bool matrix_is_value,
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
       const std::vector<Operand>& bias_memory_operands,
-      uint32_t bias_constant_id, bool bias_is_value,
-      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
-  uint32_t BuildDirectMixedVectorMatmulFunctionPackedVec4(
-      const VectorTypeInfo& result, const VectorTypeInfo& input,
-      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
-      uint32_t input_pointer_id, uint32_t input_pointer_type_id,
-      const std::vector<Operand>& input_memory_operands,
-      uint32_t input_constant_id, bool input_is_value,
-      uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
-      uint32_t matrix_shape_id, uint32_t matrix_offset_id,
-      const std::vector<Operand>& matrix_memory_operands,
-      uint32_t matrix_constant_id, bool matrix_is_value,
-      uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
-      const std::vector<Operand>& bias_memory_operands,
-      uint32_t bias_constant_id, bool bias_is_value,
+      uint32_t bias_source_component_type_id, uint32_t bias_offset,
+      uint32_t bias_conversion_fp_fast_math_mode, uint32_t bias_constant_id,
+      bool bias_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
@@ -473,6 +465,9 @@ class HwLowerToStandardPass : public Pass {
   bool IsIgnorableDirectUser(const Instruction* user) const;
   bool ResolveDirectVectorLoad(Instruction* value_inst, Instruction* use,
                                DirectLoadSource* source) const;
+  bool ResolveDirectF16ToF32VectorLoad(Instruction* value_inst,
+                                       Instruction* use,
+                                       DirectLoadSource* source) const;
   bool ResolveDirectMatrixLoad(Instruction* value_inst, Instruction* use,
                                DirectLoadSource* source) const;
   bool DirectKillListUsersAreClosed(
@@ -578,6 +573,7 @@ class HwLowerToStandardPass : public Pass {
   uint32_t PackedLane(uint32_t scalar_index) const;
   uint32_t GetOrCreateGLSLStd450Import();
   uint32_t GetFPFastMathMode(uint32_t result_id) const;
+  void ApplyFPFastMathMode(Instruction* inst, uint32_t mode);
   void ApplyActiveFPFastMathMode(Instruction* inst);
   bool MatmulAllowsReassociation(const Instruction* inst) const;
   void RemoveFPFastMathMode(uint32_t result_id);

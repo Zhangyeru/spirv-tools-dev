@@ -569,10 +569,74 @@ bool HwLowerToStandardPass::ResolveDirectVectorLoad(
   if (!GetConstantU32(source->offset_id, &offset) || offset != 0) {
     return false;
   }
+  source->constant_offset = offset;
 
   source->source_load = load;
+  const VectorTypeInfo* load_type = GetVectorType(load->type_id());
+  if (!load_type) return false;
   source->pointer_id = load->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   source->pointer_type_id = GetPointerTypeId(source->pointer_id);
+  source->component_type_id = load_type->component_type_id;
+  source->memory_operands =
+      CopyMemoryOperands(load, kHwVectorLoadMemoryOperandsInIdx);
+  return source->pointer_type_id != 0 &&
+         CanCapturePointer(source->pointer_id) &&
+         CanMoveLoadToUse(load, use, /*function_memory=*/false,
+                          kHwVectorLoadMemoryOperandsInIdx);
+}
+
+bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
+    Instruction* value_inst, Instruction* use, DirectLoadSource* source) const {
+  if (!source) return false;
+  *source = {};
+
+  std::vector<Instruction*> result_chain;
+  Instruction* conversion =
+      TraceFunctionValueSource(value_inst, use, &result_chain);
+  if (!conversion || conversion->opcode() != spv::Op::OpFConvert ||
+      conversion->NumInOperands() != 1) {
+    return false;
+  }
+
+  Instruction* converted_value =
+      get_def_use_mgr()->GetDef(conversion->GetSingleWordInOperand(0));
+  const VectorTypeInfo* result_type = GetVectorType(conversion->type_id());
+  const VectorTypeInfo* source_type =
+      converted_value ? GetVectorType(converted_value->type_id()) : nullptr;
+  if (!result_type || !source_type ||
+      !IsFloat32Type(result_type->component_type_id) ||
+      !IsFloat16Type(source_type->component_type_id) ||
+      result_type->length != source_type->length) {
+    return false;
+  }
+
+  std::vector<Instruction*> source_chain;
+  Instruction* load =
+      TraceFunctionValueSource(converted_value, conversion, &source_chain);
+  if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
+    return false;
+  }
+  const VectorTypeInfo* load_type = GetVectorType(load->type_id());
+  if (!load_type || load_type->type_id != source_type->type_id) return false;
+
+  const uint32_t offset_id =
+      load->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx);
+  uint32_t offset = 0;
+  if (!GetConstantU32(offset_id, &offset)) return false;
+
+  source->source_load = load;
+  source->conversion = conversion;
+  source->chain = std::move(result_chain);
+  source->chain.push_back(conversion);
+  source->chain.insert(source->chain.end(), source_chain.begin(),
+                       source_chain.end());
+  source->pointer_id = load->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
+  source->pointer_type_id = GetPointerTypeId(source->pointer_id);
+  source->component_type_id = source_type->component_type_id;
+  source->conversion_fp_fast_math_mode =
+      GetFPFastMathMode(conversion->result_id());
+  source->offset_id = offset_id;
+  source->constant_offset = offset;
   source->memory_operands =
       CopyMemoryOperands(load, kHwVectorLoadMemoryOperandsInIdx);
   return source->pointer_type_id != 0 &&
@@ -1114,8 +1178,9 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   uint32_t bias_constant_id = 0;
   uint32_t bias_value_id = bias_inst ? bias_inst->result_id() : 0;
   if (has_bias) {
-    if (ResolveDirectVectorLoad(bias_inst, inst, &direct_bias)) {
-      // Bias comes from a buffer load (existing path)
+    if (ResolveDirectVectorLoad(bias_inst, inst, &direct_bias) ||
+        ResolveDirectF16ToF32VectorLoad(bias_inst, inst, &direct_bias)) {
+      // Bias comes directly from a buffer load, optionally widened from f16.
       bias_is_value = false;
     } else {
       // Try to trace back to find the actual source
@@ -1360,6 +1425,9 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       add_dead_forward_copy_chain(seed);
     }
   }
+  if (has_bias && !bias_is_value && direct_bias.conversion) {
+    add_dead_forward_copy_chain(direct_bias.conversion);
+  }
   if (!DirectKillListUsersAreClosed(inst, kill_list)) return true;
 
   const uint32_t function_id = BuildDirectVectorMatmulFunctionPackedVec4(
@@ -1378,6 +1446,11 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       (has_bias && !bias_is_value) ? direct_bias.pointer_type_id : 0,
       (has_bias && !bias_is_value) ? direct_bias.memory_operands
                                    : std::vector<Operand>{},
+      (has_bias && !bias_is_value) ? direct_bias.component_type_id
+                                   : (bias ? bias->component_type_id : 0),
+      (has_bias && !bias_is_value) ? direct_bias.constant_offset : 0,
+      (has_bias && !bias_is_value) ? direct_bias.conversion_fp_fast_math_mode
+                                   : 0,
       bias_constant_id, bias_is_value, value_arguments);
   if (function_id == 0) return false;
 
@@ -1490,7 +1563,8 @@ HwLowerToStandardPass::AnalyzeSharedDirectValueUses(
   SharedDirectUserState state = SharedDirectUserState::kNone;
   get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
     if (state == SharedDirectUserState::kUnsafe || !user ||
-        user == current_inst || IsIgnorableDirectUser(user)) {
+        user == current_inst || IsIgnorableDirectUser(user) ||
+        kill_set.find(user) != kill_set.end()) {
       return;
     }
 
