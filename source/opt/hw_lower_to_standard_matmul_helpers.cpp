@@ -1709,6 +1709,27 @@ bool HwLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
          IsSamePackedVec4Kind(result, b) && IsSamePackedVec4Kind(result, c);
 }
 
+bool HwLowerToStandardPass::CanUseDirectMatrixMulAdd(
+    const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+    const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
+  if (lowering_mode_ != LoweringMode::kPreferPackedVec4 ||
+      result.rows != a.rows || result.cols != b.cols || a.cols != b.rows ||
+      c.rows != result.rows || c.cols != result.cols) {
+    return false;
+  }
+
+  const bool same_component = result.component_type_id == a.component_type_id &&
+                              result.component_type_id == b.component_type_id &&
+                              result.component_type_id == c.component_type_id &&
+                              (IsFloat16Type(result.component_type_id) ||
+                               IsFloat32Type(result.component_type_id));
+  const bool mixed_f16_f32 = IsFloat32Type(result.component_type_id) &&
+                             IsFloat16Type(a.component_type_id) &&
+                             IsFloat16Type(b.component_type_id) &&
+                             IsFloat32Type(c.component_type_id);
+  return same_component || mixed_f16_f32;
+}
+
 bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {

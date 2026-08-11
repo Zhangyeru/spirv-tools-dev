@@ -180,7 +180,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
     bool ok = true;
     switch (inst->opcode()) {
       case spv::Op::OpCooperativeMatrixMulAddHW:
-        ok = TryLowerDirectMatrixMulAddPackedVec4(inst, &handled);
+        ok = TryLowerDirectMatrixMulAdd(inst, &handled);
         break;
       case spv::Op::OpCooperativeVectorMatrixMulHW:
         ok = TryLowerDirectVectorMatrixMulPackedVec4(inst, false, &handled);

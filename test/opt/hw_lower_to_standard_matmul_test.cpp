@@ -63,6 +63,18 @@ void ExpectPackedVec4VectorMatmulWithTails(const std::string& disassembly) {
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
 }
 
+void ExpectDirectMatrixMatmulWithRuntimeLoops(
+    const std::string& disassembly, const std::string& component_name) {
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst " + component_name), 0u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFAdd " + component_name), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpReturnValue"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
+}
+
 TEST_F(HwLowerToStandardTest, LowersMatmulWithCollidingLoweredMatrixTypes) {
   const std::string text = R"(
 OpCapability Shader
@@ -94,8 +106,7 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(12u, CountSubstring(disassembly, " Fma ")) << disassembly;
+  ExpectDirectMatrixMatmulWithRuntimeLoops(disassembly, "%float");
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatmul4x4x4F32Tiled) {
@@ -219,7 +230,7 @@ OpFunctionEnd
 )";
 
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
-  ExpectScalarFallbackMath(std::get<0>(result));
+  ExpectDirectMatrixMatmulWithRuntimeLoops(std::get<0>(result), "%float");
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatmul2x4x4F32ExactTile) {
@@ -273,10 +284,10 @@ TEST_F(HwLowerToStandardTest, LowersMatmul3x5x8F32PackedKTail) {
 ; CHECK: OpTypeVector %float 4
 ; CHECK: OpTypeArray %v4float %uint_10
 ; CHECK: OpTypeArray %v4float %uint_6
+; CHECK: OpFunctionCall
 ; CHECK: OpExtInst %float
 ; CHECK-SAME: Fma
-; CHECK: OpCompositeConstruct %v4float
-; CHECK-NOT: OpFunctionCall
+; CHECK: OpReturnValue
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -315,9 +326,9 @@ OpFunctionEnd
   EXPECT_NE(std::string::npos, output.find("OpTypeArray %v4float %uint_6"));
   EXPECT_GT(CountSubstring(output, "OpExtInst %float"), 0u);
   EXPECT_GT(CountSubstring(output, " Fma "), 0u);
-  EXPECT_GT(CountSubstring(output, "OpCompositeConstruct %v4float"), 0u);
-  EXPECT_EQ(0u, CountSubstring(output, "OpFunctionCall"));
-  EXPECT_EQ(0u, CountSubstring(output, "OpReturnValue"));
+  EXPECT_EQ(2u, CountSubstring(output, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(output, "OpFunctionCall"), 0u);
+  EXPECT_GT(CountSubstring(output, "OpReturnValue"), 0u);
   EXPECT_EQ(0u, CountSubstring(output, "OpVectorTimesScalar"));
 }
 
@@ -2150,6 +2161,413 @@ OpFunctionEnd
             1u);
 }
 
+TEST_F(HwLowerToStandardTest,
+       DirectMixedPrecisionMatrixMulAdd2x5x3HandlesTails) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %HalfBuf 0 Offset 0
+OpMemberDecorate %FloatBuf 0 Offset 0
+OpDecorate %HalfBuf Block
+OpDecorate %FloatBuf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape_a = OpConstantComposite %v2uint %uint_2 %uint_5
+%shape_b = OpConstantComposite %v2uint %uint_5 %uint_3
+%shape_c = OpConstantComposite %v2uint %uint_2 %uint_3
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_a = OpTypeCooperativeMatrixHW %half %uint_2 %uint_5
+%mat_b = OpTypeCooperativeMatrixHW %half %uint_5 %uint_3
+%mat_c = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%_runtimearr_half = OpTypeRuntimeArray %half
+%_runtimearr_float = OpTypeRuntimeArray %float
+%HalfBuf = OpTypeStruct %_runtimearr_half
+%FloatBuf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_HalfBuf = OpTypePointer StorageBuffer %HalfBuf
+%_ptr_StorageBuffer_FloatBuf = OpTypePointer StorageBuffer %FloatBuf
+%abuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat_a %abase %shape_a %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat_b %bbase %shape_b %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat_c %cbase %shape_c %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat_c %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionParameter"));
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %float"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest,
+       DirectSamePrecisionMatrixMulAdd2x5x3HandlesTails) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape_a = OpConstantComposite %v2uint %uint_2 %uint_5
+%shape_b = OpConstantComposite %v2uint %uint_5 %uint_3
+%shape_c = OpConstantComposite %v2uint %uint_2 %uint_3
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_a = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%mat_b = OpTypeCooperativeMatrixHW %float %uint_5 %uint_3
+%mat_c = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%abuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat_a %abase %shape_a %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat_b %bbase %shape_b %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat_c %cbase %shape_c %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat_c %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionParameter"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %float"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest,
+       DirectMixedPrecisionMatrixMulAddDoesNotAbsorbConvertedC) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+; CHECK: [[CONVERTED_C_ELEMENT:%\w+]] = OpFConvert %float
+; CHECK-NEXT: [[CONVERTED_C_ELEMENT_PTR:%\w+]] = OpAccessChain %_ptr_Function_float [[CONVERTED_C_ARRAY:%\w+]] {{%\w+}}
+; CHECK-NEXT: OpStore [[CONVERTED_C_ELEMENT_PTR]] [[CONVERTED_C_ELEMENT]]
+; CHECK: [[CONVERTED_C_ARG:%\w+]] = OpLoad %_arr_float_uint_6 [[CONVERTED_C_ARRAY]]
+; CHECK: {{%\w+}} = OpFunctionCall %_arr_float_uint_6 [[DIRECT_HELPER:%\w+]] [[CONVERTED_C_ARG]]
+; CHECK: [[DIRECT_HELPER]] = OpFunction %_arr_float_uint_6
+; CHECK-NEXT: [[CONVERTED_C_PARAM:%\w+]] = OpFunctionParameter %_arr_float_uint_6
+; CHECK: OpStore [[CONVERTED_C_LOCAL:%\w+]] [[CONVERTED_C_PARAM]]
+; CHECK: [[CONVERTED_C_PTR:%\w+]] = OpAccessChain %_ptr_Function_float [[CONVERTED_C_LOCAL]] [[OUTPUT_INDEX:%\w+]]
+; CHECK-NEXT: [[CONVERTED_C_VALUE:%\w+]] = OpLoad %float [[CONVERTED_C_PTR]]
+; CHECK-NEXT: [[SUM:%\w+]] = OpFAdd %float {{%\w+}} [[CONVERTED_C_VALUE]]
+; CHECK-NEXT: [[OUTPUT_PTR:%\w+]] = OpAccessChain %_ptr_Function_float [[OUTPUT_ARRAY:%\w+]] [[OUTPUT_INDEX]]
+; CHECK-NEXT: OpStore [[OUTPUT_PTR]] [[SUM]]
+; CHECK: [[RESULT:%\w+]] = OpLoad %_arr_float_uint_6 [[OUTPUT_ARRAY]]
+; CHECK-NEXT: OpReturnValue [[RESULT]]
+OpCapability Shader
+OpCapability Float16
+OpCapability FloatControls2
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_float_controls2"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %cf_source FPFastMathMode NotNaN
+OpDecorate %d FPFastMathMode Fast
+OpDecorate %_runtimearr_half ArrayStride 2
+OpMemberDecorate %HalfBuf 0 Offset 0
+OpDecorate %HalfBuf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape_a = OpConstantComposite %v2uint %uint_2 %uint_5
+%shape_b = OpConstantComposite %v2uint %uint_5 %uint_3
+%shape_c = OpConstantComposite %v2uint %uint_2 %uint_3
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_a = OpTypeCooperativeMatrixHW %half %uint_2 %uint_5
+%mat_b = OpTypeCooperativeMatrixHW %half %uint_5 %uint_3
+%mat_ch = OpTypeCooperativeMatrixHW %half %uint_2 %uint_3 MatrixUseAHW
+%mat_cf_source = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3 MatrixUseAHW
+%mat_cf = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3 MatrixAccumulatorHW
+%_runtimearr_half = OpTypeRuntimeArray %half
+%HalfBuf = OpTypeStruct %_runtimearr_half
+%_ptr_StorageBuffer_HalfBuf = OpTypePointer StorageBuffer %HalfBuf
+%abuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat_a %abase %shape_a %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat_b %bbase %shape_b %offset %int_0
+%ch = OpCooperativeMatrixLoadHW %mat_ch %cbase %shape_c %offset %int_0
+%cf_source = OpFConvert %mat_cf_source %ch
+%cf = OpBitcast %mat_cf %cf_source
+%d = OpCooperativeMatrixMulAddHW %mat_cf %a %b %cf
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFunctionParameter"));
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %float"), 0u);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
+
+  const auto expect_result_decoration = [&disassembly](
+                                            const std::string& opcode_and_type,
+                                            const std::string& decoration) {
+    const std::string opcode_marker = " = " + opcode_and_type;
+    size_t opcode_pos = 0;
+    bool found = false;
+    while ((opcode_pos = disassembly.find(opcode_marker, opcode_pos)) !=
+           std::string::npos) {
+      size_t line_begin = disassembly.rfind('\n', opcode_pos);
+      line_begin = line_begin == std::string::npos ? 0 : line_begin + 1;
+      const size_t id_begin = disassembly.find_first_not_of(" \t", line_begin);
+      if (id_begin != std::string::npos && id_begin < opcode_pos) {
+        const std::string result_id =
+            disassembly.substr(id_begin, opcode_pos - id_begin);
+        if (disassembly.find("OpDecorate " + result_id + " " + decoration) !=
+            std::string::npos) {
+          found = true;
+          break;
+        }
+      }
+      opcode_pos += opcode_marker.size();
+    }
+    EXPECT_TRUE(found) << opcode_and_type << " result lacks " << decoration;
+  };
+  expect_result_decoration("OpFConvert %float", "FPFastMathMode NotNaN");
+  expect_result_decoration("OpFAdd %float", "FPFastMathMode Fast");
+}
+
+TEST_F(HwLowerToStandardTest,
+       DirectMatrixMulAddComponentBitcastValueFallsBackSafely) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%float = OpTypeFloat 32
+%mat_bits = OpTypeCooperativeMatrixHW %uint %uint_2 %uint_3
+%mat_a = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%mat_b = OpTypeCooperativeMatrixHW %float %uint_3 %uint_2
+%mat_c = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%bits = OpUndef %mat_bits
+%b = OpUndef %mat_b
+%c = OpUndef %mat_c
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%a = OpBitcast %mat_a %bits
+%d = OpCooperativeMatrixMulAddHW %mat_c %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectScalarFallbackMath(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpBitcast %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       DirectMatrixMulAddComponentBitcastLoadFallsBackSafely) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_uint ArrayStride 4
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %UintBuf 0 Offset 0
+OpMemberDecorate %FloatBuf 0 Offset 0
+OpDecorate %UintBuf Block
+OpDecorate %FloatBuf Block
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape_a = OpConstantComposite %v2uint %uint_2 %uint_3
+%shape_b = OpConstantComposite %v2uint %uint_3 %uint_2
+%shape_c = OpConstantComposite %v2uint %uint_2 %uint_2
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_bits = OpTypeCooperativeMatrixHW %uint %uint_2 %uint_3
+%mat_a = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%mat_b = OpTypeCooperativeMatrixHW %float %uint_3 %uint_2
+%mat_c = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%_runtimearr_uint = OpTypeRuntimeArray %uint
+%_runtimearr_float = OpTypeRuntimeArray %float
+%UintBuf = OpTypeStruct %_runtimearr_uint
+%FloatBuf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_UintBuf = OpTypePointer StorageBuffer %UintBuf
+%_ptr_StorageBuffer_FloatBuf = OpTypePointer StorageBuffer %FloatBuf
+%_ptr_StorageBuffer__runtimearr_uint = OpTypePointer StorageBuffer %_runtimearr_uint
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%abuf = OpVariable %_ptr_StorageBuffer_UintBuf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_uint %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%bits = OpCooperativeMatrixLoadHW %mat_bits %abase %shape_a %offset %int_0
+%a = OpBitcast %mat_a %bits
+%b = OpCooperativeMatrixLoadHW %mat_b %bbase %shape_b %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat_c %cbase %shape_c %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat_c %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectScalarFallbackMath(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpBitcast %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       DirectMatrixMulAddFallsBackWhenLoadHasUnsafeSharedUser) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape_a = OpConstantComposite %v2uint %uint_2 %uint_5
+%shape_b = OpConstantComposite %v2uint %uint_5 %uint_3
+%shape_c = OpConstantComposite %v2uint %uint_2 %uint_3
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_a = OpTypeCooperativeMatrixHW %float %uint_2 %uint_5
+%mat_b = OpTypeCooperativeMatrixHW %float %uint_5 %uint_3
+%mat_c = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%abuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat_a %abase %shape_a %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat_b %bbase %shape_b %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat_c %cbase %shape_c %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat_c %a %b %c
+%a0 = OpCompositeExtract %float %a 0 0
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectScalarFallbackMath(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpCompositeExtract %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+}
+
 TEST_F(HwLowerToStandardTest, DirectMatmulAddElidesFunctionValueStaging) {
   const std::string text = R"(
 ; CHECK-NOT: HW
@@ -3325,7 +3743,7 @@ OpFunctionEnd
   ExpectPackedVec4MatmulPattern(std::get<0>(result), "%float");
 }
 
-TEST_F(HwLowerToStandardTest, F32MatrixMulAddUsesScalarFallbackWhenUnaligned) {
+TEST_F(HwLowerToStandardTest, F32MatrixMulAddUsesDirectPathWhenUnaligned) {
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK: OpTypeArray %float %uint_15
@@ -3360,7 +3778,7 @@ OpFunctionEnd
 )";
 
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
-  ExpectScalarFallbackMath(std::get<0>(result));
+  ExpectDirectMatrixMatmulWithRuntimeLoops(std::get<0>(result), "%float");
 }
 
 TEST_F(HwLowerToStandardTest, F32VectorMatrixMulUsesPackedTailsWhenUnaligned) {

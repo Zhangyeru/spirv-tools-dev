@@ -676,6 +676,80 @@ bool HwLowerToStandardPass::ResolveDirectMatrixLoad(
                           kHwMatrixLoadMemoryOperandsInIdx);
 }
 
+bool HwLowerToStandardPass::IsCompatibleDirectMatrixUseBitcast(
+    Instruction* bitcast, DirectMatrixUseBitcastPolicy policy) const {
+  if (!bitcast || bitcast->opcode() != spv::Op::OpBitcast ||
+      bitcast->NumInOperands() < 1) {
+    return false;
+  }
+  Instruction* source =
+      get_def_use_mgr()->GetDef(bitcast->GetSingleWordInOperand(0));
+  const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
+  const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(bitcast);
+  if (!source_matrix || !result_matrix || !source_matrix->has_matrix_use ||
+      !result_matrix->has_matrix_use ||
+      source_matrix->component_type_id != result_matrix->component_type_id ||
+      source_matrix->rows != result_matrix->rows ||
+      source_matrix->cols != result_matrix->cols) {
+    return false;
+  }
+  return policy == DirectMatrixUseBitcastPolicy::kAnySameShapeComponent ||
+         (source_matrix->matrix_use ==
+              spv::CooperativeMatrixUseHW::MatrixUseAHW &&
+          result_matrix->matrix_use ==
+              spv::CooperativeMatrixUseHW::MatrixUseBHW);
+}
+
+bool HwLowerToStandardPass::DirectTraceTypesAreCompatible(
+    Instruction* value_inst, Instruction* use,
+    DirectMatrixUseBitcastPolicy policy) const {
+  if (!value_inst || !use) return false;
+
+  std::vector<Instruction*> chain;
+  Instruction* source = TraceFunctionValueSource(value_inst, use, &chain);
+  bool saw_compatible_type_change = false;
+  for (Instruction* chain_inst : chain) {
+    if (!chain_inst || chain_inst->opcode() != spv::Op::OpBitcast ||
+        chain_inst->NumInOperands() < 1) {
+      continue;
+    }
+
+    Instruction* bitcast_source =
+        get_def_use_mgr()->GetDef(chain_inst->GetSingleWordInOperand(0));
+    if (!bitcast_source) return false;
+    const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(bitcast_source);
+    const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(chain_inst);
+    if (source_matrix && result_matrix &&
+        source_matrix->type_id == result_matrix->type_id) {
+      continue;
+    }
+    if (!IsCompatibleDirectMatrixUseBitcast(chain_inst, policy)) {
+      return false;
+    }
+    saw_compatible_type_change = true;
+  }
+
+  if (!source) return true;
+  const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
+  const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(value_inst);
+  if (source_matrix && result_matrix &&
+      source_matrix->type_id != result_matrix->type_id) {
+    if (!saw_compatible_type_change || !source_matrix->has_matrix_use ||
+        !result_matrix->has_matrix_use ||
+        source_matrix->component_type_id != result_matrix->component_type_id ||
+        source_matrix->rows != result_matrix->rows ||
+        source_matrix->cols != result_matrix->cols) {
+      return false;
+    }
+    return policy == DirectMatrixUseBitcastPolicy::kAnySameShapeComponent ||
+           (source_matrix->matrix_use ==
+                spv::CooperativeMatrixUseHW::MatrixUseAHW &&
+            result_matrix->matrix_use ==
+                spv::CooperativeMatrixUseHW::MatrixUseBHW);
+  }
+  return source->type_id() == value_inst->type_id();
+}
+
 bool HwLowerToStandardPass::DirectKillListUsersAreClosed(
     Instruction* current_inst,
     const std::vector<Instruction*>& kill_list) const {
@@ -725,8 +799,8 @@ bool HwLowerToStandardPass::DirectKillListUsersAreClosed(
   return true;
 }
 
-bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
-    Instruction* inst, bool* handled) {
+bool HwLowerToStandardPass::TryLowerDirectMatrixMulAdd(Instruction* inst,
+                                                       bool* handled) {
   if (handled) *handled = false;
   if (!handled || !inst ||
       inst->opcode() != spv::Op::OpCooperativeMatrixMulAddHW) {
@@ -745,7 +819,15 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
   const MatrixTypeInfo* b = GetMatrixTypeForValue(b_inst);
   const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c ||
-      !CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)) {
+      !CanUseDirectMatrixMulAdd(*result, *a, *b, *c)) {
+    return true;
+  }
+  if (!DirectTraceTypesAreCompatible(
+          a_inst, inst, DirectMatrixUseBitcastPolicy::kAnySameShapeComponent) ||
+      !DirectTraceTypesAreCompatible(
+          b_inst, inst, DirectMatrixUseBitcastPolicy::kAnySameShapeComponent) ||
+      !DirectTraceTypesAreCompatible(
+          c_inst, inst, DirectMatrixUseBitcastPolicy::kAnySameShapeComponent)) {
     return true;
   }
 
@@ -960,7 +1042,7 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAddPackedVec4(
   }
   if (!DirectKillListUsersAreClosed(inst, kill_list)) return true;
 
-  const uint32_t function_id = BuildDirectMatmulFunctionPackedVec4(
+  const uint32_t function_id = BuildDirectMatrixMatmulFunction(
       *result, *a, *b, *c, a_is_value ? 0 : direct_a.pointer_id,
       a_is_value ? 0 : direct_a.pointer_type_id,
       a_is_value ? 0 : direct_a.shape_id, a_is_value ? 0 : direct_a.offset_id,
@@ -1017,76 +1099,13 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
     return true;
   }
 
-  auto is_compatible_matrix_use_bitcast = [this](Instruction* bitcast) {
-    if (!bitcast || bitcast->opcode() != spv::Op::OpBitcast ||
-        bitcast->NumInOperands() < 1) {
-      return false;
-    }
-    Instruction* source =
-        get_def_use_mgr()->GetDef(bitcast->GetSingleWordInOperand(0));
-    const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
-    const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(bitcast);
-    return source_matrix && result_matrix && source_matrix->has_matrix_use &&
-           result_matrix->has_matrix_use &&
-           source_matrix->component_type_id ==
-               result_matrix->component_type_id &&
-           source_matrix->rows == result_matrix->rows &&
-           source_matrix->cols == result_matrix->cols &&
-           source_matrix->matrix_use ==
-               spv::CooperativeMatrixUseHW::MatrixUseAHW &&
-           result_matrix->matrix_use ==
-               spv::CooperativeMatrixUseHW::MatrixUseBHW;
-  };
-  auto trace_types_are_compatible = [this, inst,
-                                     &is_compatible_matrix_use_bitcast](
-                                        Instruction* value_inst) {
-    if (!value_inst) return false;
-    std::vector<Instruction*> chain;
-    Instruction* source = TraceFunctionValueSource(value_inst, inst, &chain);
-    bool saw_compatible_type_change = false;
-    for (Instruction* chain_inst : chain) {
-      if (!chain_inst || chain_inst->opcode() != spv::Op::OpBitcast ||
-          chain_inst->NumInOperands() < 1) {
-        continue;
-      }
-
-      Instruction* bitcast_source =
-          get_def_use_mgr()->GetDef(chain_inst->GetSingleWordInOperand(0));
-      if (!bitcast_source) return false;
-      const MatrixTypeInfo* source_matrix =
-          GetMatrixTypeForValue(bitcast_source);
-      const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(chain_inst);
-      if (source_matrix && result_matrix &&
-          source_matrix->type_id == result_matrix->type_id) {
-        continue;
-      }
-      if (!is_compatible_matrix_use_bitcast(chain_inst)) {
-        return false;
-      }
-      saw_compatible_type_change = true;
-    }
-
-    if (!source) return true;
-    const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
-    const MatrixTypeInfo* result_matrix = GetMatrixTypeForValue(value_inst);
-    if (source_matrix && result_matrix &&
-        source_matrix->type_id != result_matrix->type_id) {
-      return saw_compatible_type_change && source_matrix->has_matrix_use &&
-             result_matrix->has_matrix_use &&
-             source_matrix->component_type_id ==
-                 result_matrix->component_type_id &&
-             source_matrix->rows == result_matrix->rows &&
-             source_matrix->cols == result_matrix->cols &&
-             source_matrix->matrix_use ==
-                 spv::CooperativeMatrixUseHW::MatrixUseAHW &&
-             result_matrix->matrix_use ==
-                 spv::CooperativeMatrixUseHW::MatrixUseBHW;
-    }
-    return source->type_id() == value_inst->type_id();
-  };
-  if (!trace_types_are_compatible(input_inst) ||
-      !trace_types_are_compatible(matrix_inst) ||
-      (has_bias && !trace_types_are_compatible(bias_inst))) {
+  if (!DirectTraceTypesAreCompatible(input_inst, inst,
+                                     DirectMatrixUseBitcastPolicy::kAtoBOnly) ||
+      !DirectTraceTypesAreCompatible(matrix_inst, inst,
+                                     DirectMatrixUseBitcastPolicy::kAtoBOnly) ||
+      (has_bias &&
+       !DirectTraceTypesAreCompatible(
+           bias_inst, inst, DirectMatrixUseBitcastPolicy::kAtoBOnly))) {
     return true;
   }
 
@@ -1421,7 +1440,8 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
 
   for (Instruction* seed : direct_matrix.chain) {
     if (kill_set.find(seed) != kill_set.end() &&
-        is_compatible_matrix_use_bitcast(seed)) {
+        IsCompatibleDirectMatrixUseBitcast(
+            seed, DirectMatrixUseBitcastPolicy::kAtoBOnly)) {
       add_dead_forward_copy_chain(seed);
     }
   }

@@ -156,7 +156,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerVectorStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
   bool TryLowerFusedMatrixMatmulStore(Instruction* inst, bool* handled);
-  bool TryLowerDirectMatrixMulAddPackedVec4(Instruction* inst, bool* handled);
+  bool TryLowerDirectMatrixMulAdd(Instruction* inst, bool* handled);
   bool TryLowerDirectVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias,
                                                bool* handled);
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
@@ -331,6 +331,19 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
       bool c_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
+  uint32_t BuildDirectMatrixMatmulFunction(
+      const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
+      uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
+      const std::vector<Operand>& a_memory_operands, uint32_t a_constant_id,
+      bool a_is_value, uint32_t b_pointer_id, uint32_t b_pointer_type_id,
+      uint32_t b_shape_id, uint32_t b_offset_id,
+      const std::vector<Operand>& b_memory_operands, uint32_t b_constant_id,
+      bool b_is_value, uint32_t c_pointer_id, uint32_t c_pointer_type_id,
+      uint32_t c_shape_id, uint32_t c_offset_id,
+      const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
+      bool c_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildRowMajorMatrixMemoryIndex(InstructionBuilder* builder,
                                           Instruction* user, uint32_t shape_id,
                                           uint32_t offset_id, uint32_t cols,
@@ -470,6 +483,14 @@ class HwLowerToStandardPass : public Pass {
                                        DirectLoadSource* source) const;
   bool ResolveDirectMatrixLoad(Instruction* value_inst, Instruction* use,
                                DirectLoadSource* source) const;
+  enum class DirectMatrixUseBitcastPolicy {
+    kAtoBOnly,
+    kAnySameShapeComponent,
+  };
+  bool IsCompatibleDirectMatrixUseBitcast(
+      Instruction* bitcast, DirectMatrixUseBitcastPolicy policy) const;
+  bool DirectTraceTypesAreCompatible(Instruction* value_inst, Instruction* use,
+                                     DirectMatrixUseBitcastPolicy policy) const;
   bool DirectKillListUsersAreClosed(
       Instruction* current_inst,
       const std::vector<Instruction*>& kill_list) const;
@@ -556,6 +577,10 @@ class HwLowerToStandardPass : public Pass {
                                     const MatrixTypeInfo& a,
                                     const MatrixTypeInfo& b,
                                     const MatrixTypeInfo& c) const;
+  bool CanUseDirectMatrixMulAdd(const MatrixTypeInfo& result,
+                                const MatrixTypeInfo& a,
+                                const MatrixTypeInfo& b,
+                                const MatrixTypeInfo& c) const;
   bool CanUsePackedVec4VectorMatrixMul(const VectorTypeInfo& result,
                                        const VectorTypeInfo& input,
                                        const MatrixTypeInfo& matrix,

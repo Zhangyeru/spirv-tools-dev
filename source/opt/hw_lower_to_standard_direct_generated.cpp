@@ -2213,6 +2213,411 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
   return function_id;
 }
 
+uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunction(
+    const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+    const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
+    uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
+    const std::vector<Operand>& a_memory_operands, uint32_t a_constant_id,
+    bool a_is_value, uint32_t b_pointer_id, uint32_t b_pointer_type_id,
+    uint32_t b_shape_id, uint32_t b_offset_id,
+    const std::vector<Operand>& b_memory_operands, uint32_t b_constant_id,
+    bool b_is_value, uint32_t c_pointer_id, uint32_t c_pointer_type_id,
+    uint32_t c_shape_id, uint32_t c_offset_id,
+    const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
+    bool c_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  if (!CanUseDirectMatrixMulAdd(result, a, b, c)) return 0;
+  if (CanUsePackedVec4MatrixMulAdd(result, a, b, c)) {
+    return BuildDirectMatmulFunctionPackedVec4(
+        result, a, b, c, a_pointer_id, a_pointer_type_id, a_shape_id,
+        a_offset_id, a_memory_operands, a_constant_id, a_is_value, b_pointer_id,
+        b_pointer_type_id, b_shape_id, b_offset_id, b_memory_operands,
+        b_constant_id, b_is_value, c_pointer_id, c_pointer_type_id, c_shape_id,
+        c_offset_id, c_memory_operands, c_constant_id, c_is_value,
+        value_arguments);
+  }
+  if ((!a_is_value && (a_pointer_id == 0 || a_pointer_type_id == 0 ||
+                       a_shape_id == 0 || a_offset_id == 0)) ||
+      (!b_is_value && (b_pointer_id == 0 || b_pointer_type_id == 0 ||
+                       b_shape_id == 0 || b_offset_id == 0)) ||
+      (!c_is_value && (c_pointer_id == 0 || c_pointer_type_id == 0 ||
+                       c_shape_id == 0 || c_offset_id == 0))) {
+    return 0;
+  }
+
+  std::vector<uint32_t> parameter_type_ids;
+  if (a_is_value && a_constant_id == 0) {
+    parameter_type_ids.push_back(a.lowered_type_id);
+  }
+  if (b_is_value && b_constant_id == 0) {
+    parameter_type_ids.push_back(b.lowered_type_id);
+  }
+  if (c_is_value && c_constant_id == 0) {
+    parameter_type_ids.push_back(c.lowered_type_id);
+  }
+  if (parameter_type_ids.size() != value_arguments.size()) return 0;
+  for (size_t i = 0; i < parameter_type_ids.size(); ++i) {
+    if (parameter_type_ids[i] != value_arguments[i].second) return 0;
+  }
+
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(result.lowered_type_id, parameter_type_ids);
+  const uint32_t function_id = TakeNextId();
+  if (function_type_id == 0 || function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  size_t parameter_index = 0;
+  auto add_parameter = [&](uint32_t type_id) -> uint32_t {
+    if (parameter_index >= parameter_type_ids.size() ||
+        parameter_type_ids[parameter_index] != type_id) {
+      return 0;
+    }
+    const uint32_t parameter_id = TakeNextId();
+    if (parameter_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, type_id, parameter_id,
+        std::initializer_list<Operand>{}));
+    ++parameter_index;
+    return parameter_id;
+  };
+  uint32_t a_value_id = a_constant_id;
+  if (a_is_value && a_value_id == 0) {
+    a_value_id = add_parameter(a.lowered_type_id);
+  }
+  uint32_t b_value_id = b_constant_id;
+  if (b_is_value && b_value_id == 0) {
+    b_value_id = add_parameter(b.lowered_type_id);
+  }
+  uint32_t c_value_id = c_constant_id;
+  if (c_is_value && c_value_id == 0) {
+    c_value_id = add_parameter(c.lowered_type_id);
+  }
+  if ((a_is_value && a_value_id == 0) || (b_is_value && b_value_id == 0) ||
+      (c_is_value && c_value_id == 0) ||
+      parameter_index != parameter_type_ids.size()) {
+    return 0;
+  }
+
+  const uint32_t result_pointer_type_id = GetOrCreatePointerType(
+      result.lowered_type_id, spv::StorageClass::Function);
+  const uint32_t a_value_pointer_type_id =
+      a_is_value ? GetOrCreatePointerType(a.lowered_type_id,
+                                          spv::StorageClass::Function)
+                 : 0;
+  const uint32_t b_value_pointer_type_id =
+      b_is_value ? GetOrCreatePointerType(b.lowered_type_id,
+                                          spv::StorageClass::Function)
+                 : 0;
+  const uint32_t c_value_pointer_type_id =
+      c_is_value ? GetOrCreatePointerType(c.lowered_type_id,
+                                          spv::StorageClass::Function)
+                 : 0;
+  const uint32_t accumulator_pointer_type_id = GetOrCreatePointerType(
+      result.component_type_id, spv::StorageClass::Function);
+  const uint32_t uint_type_id = GetOrCreateUIntType();
+  const uint32_t uint_pointer_type_id =
+      GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
+  const uint32_t bool_type_id = GetOrCreateBoolType();
+  const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
+  const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
+  const uint32_t output_count_id =
+      GetOrCreateUIntConstant(result.rows * result.cols);
+  const uint32_t result_cols_id = GetOrCreateUIntConstant(result.cols);
+  const uint32_t inner_count_id = GetOrCreateUIntConstant(a.cols);
+  const uint32_t result_zero_id = GetOrCreateZero(result.lowered_type_id);
+  const uint32_t accumulator_zero_id =
+      GetOrCreateZero(result.component_type_id);
+  if (result_pointer_type_id == 0 || accumulator_pointer_type_id == 0 ||
+      uint_type_id == 0 || uint_pointer_type_id == 0 || bool_type_id == 0 ||
+      zero_uint_id == 0 || one_uint_id == 0 || output_count_id == 0 ||
+      result_cols_id == 0 || inner_count_id == 0 || result_zero_id == 0 ||
+      accumulator_zero_id == 0 ||
+      (a_is_value && a_value_pointer_type_id == 0) ||
+      (b_is_value && b_value_pointer_type_id == 0) ||
+      (c_is_value && c_value_pointer_type_id == 0)) {
+    return 0;
+  }
+
+  std::array<uint32_t, 8> labels = {};
+  for (uint32_t& label : labels) {
+    label = TakeNextId();
+    if (label == 0) return 0;
+  }
+  const uint32_t entry_label_id = labels[0];
+  const uint32_t output_header_label_id = labels[1];
+  const uint32_t output_body_label_id = labels[2];
+  const uint32_t k_header_label_id = labels[3];
+  const uint32_t k_body_label_id = labels[4];
+  const uint32_t k_continue_label_id = labels[5];
+  const uint32_t k_merge_label_id = labels[6];
+  const uint32_t output_continue_label_id = labels[7];
+  const uint32_t return_label_id = TakeNextId();
+  if (return_label_id == 0) return 0;
+
+  auto make_block = [this](uint32_t label_id) {
+    return std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
+  };
+  std::unique_ptr<BasicBlock> entry_block = make_block(entry_label_id);
+  std::unique_ptr<BasicBlock> output_header_block =
+      make_block(output_header_label_id);
+  std::unique_ptr<BasicBlock> output_body_block =
+      make_block(output_body_label_id);
+  std::unique_ptr<BasicBlock> k_header_block = make_block(k_header_label_id);
+  std::unique_ptr<BasicBlock> k_body_block = make_block(k_body_label_id);
+  std::unique_ptr<BasicBlock> k_continue_block =
+      make_block(k_continue_label_id);
+  std::unique_ptr<BasicBlock> k_merge_block = make_block(k_merge_label_id);
+  std::unique_ptr<BasicBlock> output_continue_block =
+      make_block(output_continue_label_id);
+  std::unique_ptr<BasicBlock> return_block = make_block(return_label_id);
+  if (!entry_block || !output_header_block || !output_body_block ||
+      !k_header_block || !k_body_block || !k_continue_block || !k_merge_block ||
+      !output_continue_block || !return_block) {
+    return 0;
+  }
+
+  InstructionBuilder entry_builder(context(), entry_block.get());
+  Instruction* result_var = entry_builder.AddVariable(
+      result_pointer_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* output_index_var = entry_builder.AddVariable(
+      uint_pointer_type_id, static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* k_var = entry_builder.AddVariable(
+      uint_pointer_type_id, static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* accumulator_var = entry_builder.AddVariable(
+      accumulator_pointer_type_id,
+      static_cast<uint32_t>(spv::StorageClass::Function));
+  Instruction* a_value_var =
+      a_is_value ? entry_builder.AddVariable(
+                       a_value_pointer_type_id,
+                       static_cast<uint32_t>(spv::StorageClass::Function))
+                 : nullptr;
+  Instruction* b_value_var =
+      b_is_value ? entry_builder.AddVariable(
+                       b_value_pointer_type_id,
+                       static_cast<uint32_t>(spv::StorageClass::Function))
+                 : nullptr;
+  Instruction* c_value_var =
+      c_is_value ? entry_builder.AddVariable(
+                       c_value_pointer_type_id,
+                       static_cast<uint32_t>(spv::StorageClass::Function))
+                 : nullptr;
+  if (!result_var || !output_index_var || !k_var || !accumulator_var ||
+      (a_is_value && !a_value_var) || (b_is_value && !b_value_var) ||
+      (c_is_value && !c_value_var)) {
+    return 0;
+  }
+
+  const uint32_t captured_a_pointer_id =
+      a_is_value ? 0 : BuildCapturedPointer(&entry_builder, a_pointer_id);
+  const uint32_t captured_b_pointer_id =
+      b_is_value ? 0 : BuildCapturedPointer(&entry_builder, b_pointer_id);
+  const uint32_t captured_c_pointer_id =
+      c_is_value ? 0 : BuildCapturedPointer(&entry_builder, c_pointer_id);
+  if ((!a_is_value && captured_a_pointer_id == 0) ||
+      (!b_is_value && captured_b_pointer_id == 0) ||
+      (!c_is_value && captured_c_pointer_id == 0)) {
+    return 0;
+  }
+
+  if ((a_is_value &&
+       !entry_builder.AddStore(a_value_var->result_id(), a_value_id)) ||
+      (b_is_value &&
+       !entry_builder.AddStore(b_value_var->result_id(), b_value_id)) ||
+      (c_is_value &&
+       !entry_builder.AddStore(c_value_var->result_id(), c_value_id)) ||
+      !entry_builder.AddStore(result_var->result_id(), result_zero_id) ||
+      !entry_builder.AddStore(output_index_var->result_id(), zero_uint_id) ||
+      !entry_builder.AddBranch(output_header_label_id)) {
+    return 0;
+  }
+
+  auto load_matrix_scalar =
+      [&](InstructionBuilder* builder, const MatrixTypeInfo& info,
+          bool is_value, Instruction* value_var, uint32_t pointer_type_id,
+          uint32_t captured_pointer_id, uint32_t shape_id, uint32_t offset_id,
+          const std::vector<Operand>& memory_operands,
+          uint32_t logical_index_id) -> uint32_t {
+    if (!builder || logical_index_id == 0) return 0;
+    if (is_value) {
+      return value_var
+                 ? BuildLogicalAggregateLoad(
+                       builder, value_var->result_id(), info.component_type_id,
+                       info.packed_vec4_type_id, logical_index_id)
+                 : 0;
+    }
+    const uint32_t memory_index_id = BuildRowMajorMatrixMemoryIndex(
+        builder, nullptr, shape_id, offset_id, info.cols, logical_index_id);
+    const uint32_t element_pointer_id =
+        memory_index_id ? BuildElementAccessFromPointerType(
+                              builder, pointer_type_id, captured_pointer_id,
+                              info.component_type_id, memory_index_id)
+                        : 0;
+    return element_pointer_id ? AddLoad(builder, info.component_type_id,
+                                        element_pointer_id, memory_operands)
+                              : 0;
+  };
+
+  InstructionBuilder output_header_builder(context(),
+                                           output_header_block.get());
+  Instruction* output_index = output_header_builder.AddLoad(
+      uint_type_id, output_index_var->result_id());
+  Instruction* output_condition =
+      output_index ? output_header_builder.AddBinaryOp(
+                         bool_type_id, spv::Op::OpULessThan,
+                         output_index->result_id(), output_count_id)
+                   : nullptr;
+  if (!output_condition ||
+      !output_header_builder.AddLoopMerge(return_label_id,
+                                          output_continue_label_id) ||
+      !output_header_builder.AddConditionalBranch(output_condition->result_id(),
+                                                  output_body_label_id,
+                                                  return_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder output_body_builder(context(), output_body_block.get());
+  if (!output_body_builder.AddStore(accumulator_var->result_id(),
+                                    accumulator_zero_id) ||
+      !output_body_builder.AddStore(k_var->result_id(), zero_uint_id) ||
+      !output_body_builder.AddBranch(k_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_header_builder(context(), k_header_block.get());
+  Instruction* k = k_header_builder.AddLoad(uint_type_id, k_var->result_id());
+  Instruction* k_condition =
+      k ? k_header_builder.AddBinaryOp(bool_type_id, spv::Op::OpULessThan,
+                                       k->result_id(), inner_count_id)
+        : nullptr;
+  if (!k_condition ||
+      !k_header_builder.AddLoopMerge(k_merge_label_id, k_continue_label_id) ||
+      !k_header_builder.AddConditionalBranch(
+          k_condition->result_id(), k_body_label_id, k_merge_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_body_builder(context(), k_body_block.get());
+  Instruction* row = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpUDiv, output_index->result_id(), result_cols_id);
+  Instruction* col = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpUMod, output_index->result_id(), result_cols_id);
+  Instruction* a_row_base =
+      row ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIMul,
+                                       row->result_id(), inner_count_id)
+          : nullptr;
+  Instruction* a_index =
+      a_row_base
+          ? k_body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
+                                       a_row_base->result_id(), k->result_id())
+          : nullptr;
+  Instruction* b_row_base = k_body_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIMul, k->result_id(), result_cols_id);
+  Instruction* b_index = b_row_base && col
+                             ? k_body_builder.AddBinaryOp(
+                                   uint_type_id, spv::Op::OpIAdd,
+                                   b_row_base->result_id(), col->result_id())
+                             : nullptr;
+  const uint32_t a_scalar =
+      a_index ? load_matrix_scalar(&k_body_builder, a, a_is_value, a_value_var,
+                                   a_pointer_type_id, captured_a_pointer_id,
+                                   a_shape_id, a_offset_id, a_memory_operands,
+                                   a_index->result_id())
+              : 0;
+  const uint32_t b_scalar =
+      b_index ? load_matrix_scalar(&k_body_builder, b, b_is_value, b_value_var,
+                                   b_pointer_type_id, captured_b_pointer_id,
+                                   b_shape_id, b_offset_id, b_memory_operands,
+                                   b_index->result_id())
+              : 0;
+  Instruction* accumulator = k_body_builder.AddLoad(
+      result.component_type_id, accumulator_var->result_id());
+  const uint32_t accumulated =
+      accumulator && a_scalar != 0 && b_scalar != 0
+          ? BuildMatmulAccumulate(&k_body_builder, result.component_type_id,
+                                  a.component_type_id, a_scalar,
+                                  b.component_type_id, b_scalar,
+                                  accumulator->result_id())
+          : 0;
+  if (!row || !col || !a_index || !b_index || accumulated == 0 ||
+      !k_body_builder.AddStore(accumulator_var->result_id(), accumulated) ||
+      !k_body_builder.AddBranch(k_continue_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_continue_builder(context(), k_continue_block.get());
+  Instruction* next_k = k_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, k->result_id(), one_uint_id);
+  if (!next_k ||
+      !k_continue_builder.AddStore(k_var->result_id(), next_k->result_id()) ||
+      !k_continue_builder.AddBranch(k_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder k_merge_builder(context(), k_merge_block.get());
+  Instruction* product = k_merge_builder.AddLoad(result.component_type_id,
+                                                 accumulator_var->result_id());
+  const uint32_t c_scalar = load_matrix_scalar(
+      &k_merge_builder, c, c_is_value, c_value_var, c_pointer_type_id,
+      captured_c_pointer_id, c_shape_id, c_offset_id, c_memory_operands,
+      output_index->result_id());
+  Instruction* sum = product && c_scalar != 0
+                         ? k_merge_builder.AddBinaryOp(
+                               result.component_type_id, spv::Op::OpFAdd,
+                               product->result_id(), c_scalar)
+                         : nullptr;
+  ApplyActiveFPFastMathMode(sum);
+  if (!sum ||
+      !BuildLogicalAggregateStore(
+          &k_merge_builder, result_var->result_id(), result.component_type_id,
+          result.packed_vec4_type_id, output_index->result_id(),
+          sum->result_id()) ||
+      !k_merge_builder.AddBranch(output_continue_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder output_continue_builder(context(),
+                                             output_continue_block.get());
+  Instruction* next_output = output_continue_builder.AddBinaryOp(
+      uint_type_id, spv::Op::OpIAdd, output_index->result_id(), one_uint_id);
+  if (!next_output ||
+      !output_continue_builder.AddStore(output_index_var->result_id(),
+                                        next_output->result_id()) ||
+      !output_continue_builder.AddBranch(output_header_label_id)) {
+    return 0;
+  }
+
+  InstructionBuilder return_builder(context(), return_block.get());
+  Instruction* result_value =
+      return_builder.AddLoad(result.lowered_type_id, result_var->result_id());
+  if (!result_value || !return_builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                                                  result_value->result_id())) {
+    return 0;
+  }
+
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  function->AddBasicBlock(std::move(entry_block));
+  function->AddBasicBlock(std::move(output_header_block));
+  function->AddBasicBlock(std::move(output_body_block));
+  function->AddBasicBlock(std::move(k_header_block));
+  function->AddBasicBlock(std::move(k_body_block));
+  function->AddBasicBlock(std::move(k_continue_block));
+  function->AddBasicBlock(std::move(k_merge_block));
+  function->AddBasicBlock(std::move(output_continue_block));
+  function->AddBasicBlock(std::move(return_block));
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
+  return function_id;
+}
+
 uint32_t HwLowerToStandardPass::BuildDirectMatmulFunctionPackedVec4(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,

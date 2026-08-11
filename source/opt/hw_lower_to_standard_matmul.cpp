@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -94,7 +93,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
   }
 
   bool handled = false;
-  if (!TryLowerDirectMatrixMulAddPackedVec4(inst, &handled)) return false;
+  if (!TryLowerDirectMatrixMulAdd(inst, &handled)) return false;
   if (handled) return true;
 
   const uint32_t function_id =
