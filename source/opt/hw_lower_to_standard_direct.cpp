@@ -563,6 +563,7 @@ bool HwLowerToStandardPass::ResolveDirectVectorLoad(
   if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
     return false;
   }
+  if (!DirectTransportChainIsMovable(source->chain)) return false;
 
   source->offset_id = load->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx);
   uint32_t offset = 0;
@@ -594,7 +595,8 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
   Instruction* conversion =
       TraceFunctionValueSource(value_inst, use, &result_chain);
   if (!conversion || conversion->opcode() != spv::Op::OpFConvert ||
-      conversion->NumInOperands() != 1) {
+      conversion->NumInOperands() != 1 ||
+      !DirectTransportChainIsMovable(result_chain)) {
     return false;
   }
 
@@ -613,7 +615,8 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
   std::vector<Instruction*> source_chain;
   Instruction* load =
       TraceFunctionValueSource(converted_value, conversion, &source_chain);
-  if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
+  if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW ||
+      !DirectTransportChainIsMovable(source_chain)) {
     return false;
   }
   const VectorTypeInfo* load_type = GetVectorType(load->type_id());
@@ -633,8 +636,8 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
   source->pointer_id = load->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   source->pointer_type_id = GetPointerTypeId(source->pointer_id);
   source->component_type_id = source_type->component_type_id;
-  source->conversion_fp_fast_math_mode =
-      GetFPFastMathMode(conversion->result_id());
+  source->conversion_has_explicit_fp_fast_math_mode = GetExplicitFPFastMathMode(
+      conversion->result_id(), &source->conversion_fp_fast_math_mode);
   source->offset_id = offset_id;
   source->constant_offset = offset;
   source->memory_operands =
@@ -654,6 +657,7 @@ bool HwLowerToStandardPass::ResolveDirectMatrixLoad(
   if (!load || load->opcode() != spv::Op::OpCooperativeMatrixLoadHW) {
     return false;
   }
+  if (!DirectTransportChainIsMovable(source->chain)) return false;
   if (!GetConstantU32(load->GetSingleWordInOperand(kHwMatrixLoadLayoutInIdx),
                       &source->layout) ||
       source->layout !=
@@ -1471,6 +1475,9 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
       (has_bias && !bias_is_value) ? direct_bias.constant_offset : 0,
       (has_bias && !bias_is_value) ? direct_bias.conversion_fp_fast_math_mode
                                    : 0,
+      (has_bias && !bias_is_value)
+          ? direct_bias.conversion_has_explicit_fp_fast_math_mode
+          : false,
       bias_constant_id, bias_is_value, value_arguments);
   if (function_id == 0) return false;
 
@@ -1931,10 +1938,121 @@ bool HwLowerToStandardPass::IsDisjointModuleMemoryWrite(
     return false;
   }
 
+  auto pointer_path_may_alias = [this](uint32_t pointer_id) {
+    auto* decoration_mgr = context()->get_decoration_mgr();
+    if (!decoration_mgr) return true;
+
+    std::unordered_set<uint32_t> visited;
+    while (pointer_id != 0 && visited.insert(pointer_id).second) {
+      if (decoration_mgr->HasDecoration(pointer_id,
+                                        uint32_t(spv::Decoration::Aliased)) ||
+          decoration_mgr->HasDecoration(
+              pointer_id, uint32_t(spv::Decoration::AliasedPointer))) {
+        return true;
+      }
+
+      Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+      if (!pointer) return true;
+      if (pointer->opcode() == spv::Op::OpVariable) return false;
+      if (pointer->opcode() == spv::Op::OpLoad &&
+          pointer->NumInOperands() >= 1) {
+        const uint32_t function_pointer_id = pointer->GetSingleWordInOperand(0);
+        if (decoration_mgr->HasDecoration(function_pointer_id,
+                                          uint32_t(spv::Decoration::Aliased)) ||
+            decoration_mgr->HasDecoration(
+                function_pointer_id,
+                uint32_t(spv::Decoration::AliasedPointer))) {
+          return true;
+        }
+        if (!IsFunctionPointer(function_pointer_id)) return true;
+        Instruction* store =
+            FindLastStoreToFunctionPointer(function_pointer_id, pointer);
+        if (!store || store->NumInOperands() < 2) return true;
+        pointer_id = store->GetSingleWordInOperand(1);
+        continue;
+      }
+
+      switch (pointer->opcode()) {
+        case spv::Op::OpAccessChain:
+        case spv::Op::OpInBoundsAccessChain:
+        case spv::Op::OpPtrAccessChain:
+        case spv::Op::OpInBoundsPtrAccessChain:
+        case spv::Op::OpCopyObject:
+        case spv::Op::OpBitcast:
+          if (pointer->NumInOperands() < 1) return true;
+          pointer_id = pointer->GetSingleWordInOperand(0);
+          break;
+        default:
+          return true;
+      }
+    }
+    return pointer_id != 0;
+  };
+
+  if (pointer_path_may_alias(load_pointer_id) ||
+      pointer_path_may_alias(write_pointer_id)) {
+    return false;
+  }
+
   const uint32_t load_root_id = GetRootModulePointerId(load_pointer_id);
   const uint32_t write_root_id = GetRootModulePointerId(write_pointer_id);
   return load_root_id != 0 && write_root_id != 0 &&
          load_root_id != write_root_id;
+}
+
+bool HwLowerToStandardPass::DirectTransportChainIsMovable(
+    const std::vector<Instruction*>& chain) const {
+  auto pointer_path_is_volatile = [this](uint32_t pointer_id) {
+    auto* decoration_mgr = context()->get_decoration_mgr();
+    if (!decoration_mgr) return true;
+
+    std::unordered_set<uint32_t> visited;
+    while (pointer_id != 0 && visited.insert(pointer_id).second) {
+      if (decoration_mgr->HasDecoration(pointer_id,
+                                        uint32_t(spv::Decoration::Volatile))) {
+        return true;
+      }
+      Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+      if (!pointer) return true;
+      if (pointer->opcode() == spv::Op::OpVariable) return false;
+      switch (pointer->opcode()) {
+        case spv::Op::OpAccessChain:
+        case spv::Op::OpInBoundsAccessChain:
+        case spv::Op::OpPtrAccessChain:
+        case spv::Op::OpInBoundsPtrAccessChain:
+        case spv::Op::OpCopyObject:
+        case spv::Op::OpBitcast:
+          if (pointer->NumInOperands() < 1) return true;
+          pointer_id = pointer->GetSingleWordInOperand(0);
+          break;
+        default:
+          return true;
+      }
+    }
+    return pointer_id != 0;
+  };
+
+  for (Instruction* inst : chain) {
+    if (!inst) return false;
+    uint32_t pointer_id = 0;
+    switch (inst->opcode()) {
+      case spv::Op::OpLoad:
+        if (inst->NumInOperands() != 1) return false;
+        pointer_id = inst->GetSingleWordInOperand(0);
+        break;
+      case spv::Op::OpStore:
+        if (inst->NumInOperands() != 2) return false;
+        pointer_id = inst->GetSingleWordInOperand(0);
+        break;
+      default:
+        continue;
+    }
+    if (!IsFunctionPointer(pointer_id) ||
+        pointer_path_is_volatile(pointer_id)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool HwLowerToStandardPass::MemoryAccessOperandsAreMovable(

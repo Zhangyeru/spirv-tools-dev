@@ -1204,8 +1204,9 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     uint32_t bias_pointer_type_id,
     const std::vector<Operand>& bias_memory_operands,
     uint32_t bias_source_component_type_id, uint32_t bias_offset,
-    uint32_t bias_conversion_fp_fast_math_mode, uint32_t bias_constant_id,
-    bool bias_is_value,
+    uint32_t bias_conversion_fp_fast_math_mode,
+    bool bias_conversion_has_explicit_fp_fast_math_mode,
+    uint32_t bias_constant_id, bool bias_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
   const bool same_component =
       result.component_type_id == input.component_type_id &&
@@ -1693,7 +1694,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
     }
     Instruction* converted = builder->AddUnaryOp(
         bias->component_type_id, spv::Op::OpFConvert, source_id);
-    ApplyFPFastMathMode(converted, bias_conversion_fp_fast_math_mode);
+    ApplyFPFastMathMode(converted, bias_conversion_fp_fast_math_mode,
+                        bias_conversion_has_explicit_fp_fast_math_mode);
     return converted ? converted->result_id() : 0;
   };
 
@@ -1894,7 +1896,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec4(
         if (value && bias_source_component_type_id != bias->component_type_id) {
           Instruction* converted = builder->AddUnaryOp(
               result_vec4_type_id, spv::Op::OpFConvert, value->result_id());
-          ApplyFPFastMathMode(converted, bias_conversion_fp_fast_math_mode);
+          ApplyFPFastMathMode(converted, bias_conversion_fp_fast_math_mode,
+                              bias_conversion_has_explicit_fp_fast_math_mode);
           bias_vec_id = converted ? converted->result_id() : 0;
         } else {
           bias_vec_id = value ? value->result_id() : 0;

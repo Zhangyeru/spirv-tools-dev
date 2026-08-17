@@ -107,6 +107,7 @@ class HwLowerToStandardPass : public Pass {
     uint32_t pointer_type_id = 0;
     uint32_t component_type_id = 0;
     uint32_t conversion_fp_fast_math_mode = 0;
+    bool conversion_has_explicit_fp_fast_math_mode = false;
     uint32_t shape_id = 0;
     uint32_t offset_id = 0;
     uint32_t constant_offset = 0;
@@ -315,8 +316,9 @@ class HwLowerToStandardPass : public Pass {
       uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
       const std::vector<Operand>& bias_memory_operands,
       uint32_t bias_source_component_type_id, uint32_t bias_offset,
-      uint32_t bias_conversion_fp_fast_math_mode, uint32_t bias_constant_id,
-      bool bias_is_value,
+      uint32_t bias_conversion_fp_fast_math_mode,
+      bool bias_conversion_has_explicit_fp_fast_math_mode,
+      uint32_t bias_constant_id, bool bias_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatmulFunctionPackedVec4(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
@@ -547,6 +549,8 @@ class HwLowerToStandardPass : public Pass {
                                    const Instruction* inst) const;
   bool MemoryAccessOperandsAreMovable(const Instruction* inst,
                                       uint32_t first_in_operand) const;
+  bool DirectTransportChainIsMovable(
+      const std::vector<Instruction*>& chain) const;
   bool GetPointerStorageClass(uint32_t pointer_id,
                               uint32_t* storage_class) const;
   Instruction* TraceFunctionValueSource(Instruction* value_inst,
@@ -597,8 +601,10 @@ class HwLowerToStandardPass : public Pass {
   uint32_t VectorPackedIndex(uint32_t scalar_index) const;
   uint32_t PackedLane(uint32_t scalar_index) const;
   uint32_t GetOrCreateGLSLStd450Import();
+  bool GetExplicitFPFastMathMode(uint32_t result_id, uint32_t* mode) const;
   uint32_t GetFPFastMathMode(uint32_t result_id) const;
-  void ApplyFPFastMathMode(Instruction* inst, uint32_t mode);
+  void ApplyFPFastMathMode(Instruction* inst, uint32_t mode,
+                           bool preserve_none = false);
   void ApplyActiveFPFastMathMode(Instruction* inst);
   bool MatmulAllowsReassociation(const Instruction* inst) const;
   void RemoveFPFastMathMode(uint32_t result_id);

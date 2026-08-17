@@ -1803,23 +1803,33 @@ uint32_t HwLowerToStandardPass::GetOrCreateGLSLStd450Import() {
   return context()->get_feature_mgr()->GetExtInstImportId_GLSLstd450();
 }
 
-uint32_t HwLowerToStandardPass::GetFPFastMathMode(uint32_t result_id) const {
-  if (result_id == 0) return 0;
+bool HwLowerToStandardPass::GetExplicitFPFastMathMode(uint32_t result_id,
+                                                      uint32_t* mode) const {
+  if (mode) *mode = 0;
+  if (result_id == 0 || !mode) return false;
   for (const Instruction* decoration :
        context()->get_decoration_mgr()->GetDecorationsFor(
            result_id, /*include_linkage=*/false)) {
     if (decoration && decoration->NumInOperands() >= 3 &&
         decoration->GetSingleWordInOperand(1) ==
             uint32_t(spv::Decoration::FPFastMathMode)) {
-      return decoration->GetSingleWordInOperand(2);
+      *mode = decoration->GetSingleWordInOperand(2);
+      return true;
     }
   }
-  return 0;
+  return false;
+}
+
+uint32_t HwLowerToStandardPass::GetFPFastMathMode(uint32_t result_id) const {
+  uint32_t mode = 0;
+  GetExplicitFPFastMathMode(result_id, &mode);
+  return mode;
 }
 
 void HwLowerToStandardPass::ApplyFPFastMathMode(Instruction* inst,
-                                                uint32_t mode) {
-  if (!inst || inst->result_id() == 0 || mode == 0) return;
+                                                uint32_t mode,
+                                                bool preserve_none) {
+  if (!inst || inst->result_id() == 0 || (mode == 0 && !preserve_none)) return;
   if (context()->AreAnalysesValid(IRContext::kAnalysisDefUse) &&
       !context()->get_def_use_mgr()->GetDef(inst->result_id())) {
     pending_fp_fast_math_modes_.emplace_back(inst->result_id(), mode);
