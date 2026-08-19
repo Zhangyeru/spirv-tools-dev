@@ -28,10 +28,12 @@ class BasicBlock;
 class Instruction;
 class InstructionBuilder;
 
-// Fuses a narrow two-layer f16 cooperative vector-matrix chain before the HW
-// cooperative types are lowered.  The middle dimension is processed in
-// 16-element splits and both dot products are expanded as ordinary f16vec2
-// Fma operations.  This pass is intentionally internal to
+// Fuses a narrow two-layer cooperative vector-matrix chain before the HW
+// cooperative types are lowered.  Both all-f16 chains and f16 input/weight
+// chains with f32 accumulation plus an explicit f32-to-f16 activation bridge
+// are supported.  The middle dimension is processed in 16-element splits and
+// both dot products are expanded as ordinary vec2 Fma operations.  This pass
+// is intentionally internal to
 // HwLowerToStandardPass; it has no public optimizer flag or factory.
 class HwFuseTwoLayerVectorMatmulPass : public Pass {
  public:
@@ -72,16 +74,21 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
 
   struct DirectVectorLoadInfo {
     Instruction* source_load = nullptr;
+    Instruction* conversion = nullptr;
     uint32_t pointer_id = 0;
     uint32_t storage_class = 0;
+    uint32_t source_component_type_id = 0;
     uint32_t offset = 0;
     uint32_t element_stride_bytes = 0;
+    uint32_t conversion_fp_fast_math_mode = 0;
+    bool conversion_has_explicit_fp_fast_math_mode = false;
     std::vector<Operand> memory_operands;
   };
 
   struct Match {
     Instruction* first = nullptr;
     Instruction* relu = nullptr;
+    Instruction* bridge_conversion = nullptr;
     Instruction* second = nullptr;
     BasicBlock* block = nullptr;
     VectorTypeInfo input;
@@ -93,9 +100,16 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
     DirectMatrixLoadInfo second_direct_matrix;
     DirectVectorLoadInfo first_direct_bias;
     DirectVectorLoadInfo second_direct_bias;
+    bool mixed_precision = false;
+    bool has_fp_fast_math_default = false;
     uint32_t first_fp_fast_math_mode = 0;
+    bool first_has_explicit_fp_fast_math_mode = false;
     uint32_t relu_fp_fast_math_mode = 0;
+    bool relu_has_explicit_fp_fast_math_mode = false;
+    uint32_t bridge_fp_fast_math_mode = 0;
+    bool bridge_has_explicit_fp_fast_math_mode = false;
     uint32_t second_fp_fast_math_mode = 0;
+    bool second_has_explicit_fp_fast_math_mode = false;
     std::vector<Instruction*> kill_list;
   };
 
@@ -129,6 +143,7 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   bool GetConstantU32(uint32_t id, uint32_t* value) const;
   bool GetConstantPairU32(uint32_t id, uint32_t* first, uint32_t* second) const;
   bool IsFloat16Type(uint32_t type_id) const;
+  bool IsFloat32Type(uint32_t type_id) const;
   bool IsZeroConstant(uint32_t id) const;
   bool IsZeroConstantImpl(uint32_t id,
                           std::unordered_set<uint32_t>* visited) const;
@@ -136,6 +151,8 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   bool IsVectorMatrixMulAdd(const Instruction* inst) const;
   bool IsGlslFMax(const Instruction* inst) const;
   bool IsIgnorableUser(const Instruction* inst) const;
+  bool HasFPFastMathDefault() const;
+  bool Has16BitRoundingMode() const;
 
   uint32_t GetOrCreateGLSLStd450Import();
   uint32_t GetOrCreateVectorType(uint32_t component_type_id,
@@ -145,8 +162,9 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   uint32_t GetOrCreatePointerType(uint32_t pointee_type_id,
                                   uint32_t storage_class);
   uint32_t GetOrCreateZero(uint32_t type_id);
-  uint32_t GetFPFastMathMode(uint32_t result_id) const;
-  void ApplyFPFastMathMode(Instruction* inst, uint32_t mode);
+  bool GetExplicitFPFastMathMode(uint32_t result_id, uint32_t* mode) const;
+  void ApplyFPFastMathMode(Instruction* inst, uint32_t mode,
+                           bool preserve_none = false);
   void RemoveFPFastMathMode(uint32_t result_id);
 
   uint32_t BuildExtract(InstructionBuilder* builder, uint32_t type_id,
@@ -162,13 +180,22 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
                                   uint32_t index);
   uint32_t BuildVec2(InstructionBuilder* builder, uint32_t vec2_type_id,
                      uint32_t lane0, uint32_t lane1);
+  uint32_t BuildFConvert(InstructionBuilder* builder, uint32_t result_type_id,
+                         uint32_t value_id, uint32_t fp_fast_math_mode,
+                         bool preserve_fp_fast_math_none);
+  uint32_t BuildQuantizeToF16(InstructionBuilder* builder,
+                              uint32_t result_type_id, uint32_t value_id,
+                              uint32_t fp_fast_math_mode,
+                              bool preserve_fp_fast_math_none);
   uint32_t BuildFma(InstructionBuilder* builder, uint32_t vec2_type_id,
                     uint32_t glsl_import_id, uint32_t lhs, uint32_t rhs,
-                    uint32_t accumulator, uint32_t fp_fast_math_mode);
+                    uint32_t accumulator, uint32_t fp_fast_math_mode,
+                    bool preserve_fp_fast_math_none);
   uint32_t BuildFMaxZero(InstructionBuilder* builder,
                          uint32_t component_type_id, uint32_t glsl_import_id,
                          uint32_t value_id, uint32_t zero_id,
-                         uint32_t fp_fast_math_mode);
+                         uint32_t fp_fast_math_mode,
+                         bool preserve_fp_fast_math_none);
 
   void ReportError(const Instruction* inst, const char* message) const;
 

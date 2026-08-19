@@ -240,6 +240,71 @@ std::string MakeMulAddChain(uint32_t middle_length, uint32_t output_length,
          "OpFunctionEnd\n";
 }
 
+std::string MakeMixedPrecisionChain(bool first_has_bias = true,
+                                    bool second_has_bias = true,
+                                    bool insert_relu = true) {
+  const std::string first_opcode = first_has_bias
+                                       ? "OpCooperativeVectorMatrixMulAddHW"
+                                       : "OpCooperativeVectorMatrixMulHW";
+  const std::string first_bias_suffix = first_has_bias ? " %bias0" : "";
+  const std::string second_opcode = second_has_bias
+                                        ? "OpCooperativeVectorMatrixMulAddHW"
+                                        : "OpCooperativeVectorMatrixMulHW";
+  const std::string second_bias_suffix = second_has_bias ? " %bias1" : "";
+  std::string bias_decls;
+  if (first_has_bias) bias_decls += "%bias0 = OpUndef %vec18f32\n";
+  if (second_has_bias) bias_decls += "%bias1 = OpUndef %vec7f32\n";
+  std::string relu;
+  std::string bridge_input = "%hidden";
+  if (insert_relu) {
+    relu = "%relu = OpExtInst %vec18f32 %glsl FMax %hidden %zero18f32\n";
+    bridge_input = "%relu";
+  }
+
+  return "OpCapability Shader\n"
+         "OpCapability Float16\n"
+         "OpCapability ReplicatedCompositesEXT\n"
+         "OpCapability CooperativeVectorHW\n"
+         "OpCapability CooperativeMatrixHW\n"
+         "OpExtension \"SPV_EXT_replicated_composites\"\n"
+         "OpExtension \"SPV_HW_neural_shader\"\n"
+         "%glsl = OpExtInstImport \"GLSL.std.450\"\n"
+         "OpMemoryModel Logical GLSL450\n"
+         "OpEntryPoint GLCompute %main \"main\"\n"
+         "OpExecutionMode %main LocalSize 1 1 1\n"
+         "OpName %vec7f32 \"vec7f32\"\n"
+         "%uint = OpTypeInt 32 0\n"
+         "%uint_3 = OpConstant %uint 3\n"
+         "%uint_7 = OpConstant %uint 7\n"
+         "%uint_18 = OpConstant %uint 18\n"
+         "%half = OpTypeFloat 16\n"
+         "%float = OpTypeFloat 32\n"
+         "%float_0 = OpConstant %float 0\n"
+         "%vec3f16 = OpTypeCooperativeVectorHW %half %uint_3\n"
+         "%vec18f16 = OpTypeCooperativeVectorHW %half %uint_18\n"
+         "%vec18f32 = OpTypeCooperativeVectorHW %float %uint_18\n"
+         "%vec7f32 = OpTypeCooperativeVectorHW %float %uint_7\n"
+         "%mat3x18f16 = OpTypeCooperativeMatrixHW %half %uint_3 %uint_18\n"
+         "%mat18x7f16 = OpTypeCooperativeMatrixHW %half %uint_18 %uint_7\n"
+         "%zero18f32 = OpConstantCompositeReplicateEXT %vec18f32 %float_0\n"
+         "%input = OpUndef %vec3f16\n"
+         "%matrix0 = OpUndef %mat3x18f16\n"
+         "%matrix1 = OpUndef %mat18x7f16\n" +
+         bias_decls +
+         "%void = OpTypeVoid\n"
+         "%fn = OpTypeFunction %void\n"
+         "%main = OpFunction %void None %fn\n"
+         "%entry = OpLabel\n"
+         "%hidden = " +
+         first_opcode + " %vec18f32 %input %matrix0" + first_bias_suffix +
+         "\n" + relu + "%bridge = OpFConvert %vec18f16 " + bridge_input +
+         "\n%out = " + second_opcode + " %vec7f32 %bridge %matrix1" +
+         second_bias_suffix +
+         "\n"
+         "OpReturn\n"
+         "OpFunctionEnd\n";
+}
+
 std::string MakeMultiLayerMulAddChain(bool include_odd_tail) {
   const std::string prefix = R"(
 OpCapability Shader
@@ -398,6 +463,189 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
   EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotNaN"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotInf"), 0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       FusesMixedF16OperandsWithF32AccumulationAndActivationBridge) {
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      MakeMixedPrecisionChain(), true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCompositeConstruct %vec7f32"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpQuantizeToF16 %v2float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %v2half"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %vec18f16"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       FusesMixedPrecisionMulAndMulAddVariants) {
+  for (const bool first_has_bias : {false, true}) {
+    for (const bool second_has_bias : {false, true}) {
+      for (const bool insert_relu : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << "first_bias=" << first_has_bias
+                                          << " second_bias=" << second_has_bias
+                                          << " relu=" << insert_relu);
+        auto result =
+            SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+                MakeMixedPrecisionChain(first_has_bias, second_has_bias,
+                                        insert_relu),
+                true, true);
+        const std::string& disassembly = std::get<0>(result);
+        EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+        EXPECT_EQ(
+            0u, CountSubstring(disassembly, "OpCooperativeVectorMatrixMulHW"));
+        EXPECT_EQ(0u, CountSubstring(disassembly,
+                                     "OpCooperativeVectorMatrixMulAddHW"));
+      }
+    }
+  }
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       RejectsMixedPrecisionChainWithoutF16ActivationBridge) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "%bridge = OpFConvert %vec18f16 %relu\n", ""));
+  ASSERT_TRUE(ReplaceOnce(&text, "%vec7f32 %bridge %matrix1",
+                          "%vec7f32 %relu %matrix1"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       RejectsMixedPrecisionActivationWithExtraUser) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "%bridge = OpFConvert %vec18f16 %relu\n",
+                          "%extra = OpCopyObject %vec18f32 %relu\n"
+                          "%bridge = OpFConvert %vec18f16 %relu\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, PropagatesMixedPrecisionFastMathModes) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Float16\n",
+                          "OpCapability Float16\n"
+                          "OpCapability FloatControls2\n"
+                          "OpExtension \"SPV_KHR_float_controls2\"\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %hidden FPFastMathMode NotNaN\n"
+                          "OpDecorate %relu FPFastMathMode NotInf\n"
+                          "OpDecorate %bridge FPFastMathMode NSZ\n"
+                          "OpDecorate %out FPFastMathMode AllowRecip\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotNaN"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NotInf"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode NSZ"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "FPFastMathMode AllowRecip"), 0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       PreservesExplicitNoneOnMixedPrecisionBridge) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Float16\n",
+                          "OpCapability Float16\n"
+                          "OpCapability FloatControls2\n"
+                          "OpExtension \"SPV_KHR_float_controls2\"\n"));
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "OpExecutionMode %main LocalSize 1 1 1\n",
+      "OpExecutionMode %main LocalSize 1 1 1\n"
+      "OpExecutionModeId %main FPFastMathDefault %half %uint_default\n"
+      "OpDecorate %bridge FPFastMathMode None\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "%uint_18 = OpConstant %uint 18\n",
+                          "%uint_18 = OpConstant %uint 18\n"
+                          "%uint_default = OpConstant %uint 131073\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(9u, CountSubstring(disassembly, "FPFastMathMode None"))
+      << disassembly;
+  EXPECT_EQ(9u, CountSubstring(disassembly, "OpQuantizeToF16 %v2float"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       RejectsImplicitBridgeModeWithFPFastMathDefault) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Float16\n",
+                          "OpCapability Float16\n"
+                          "OpCapability FloatControls2\n"
+                          "OpExtension \"SPV_KHR_float_controls2\"\n"));
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "OpExecutionMode %main LocalSize 1 1 1\n",
+      "OpExecutionMode %main LocalSize 1 1 1\n"
+      "OpExecutionModeId %main FPFastMathDefault %half %uint_default\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "%uint_18 = OpConstant %uint 18\n",
+                          "%uint_18 = OpConstant %uint 18\n"
+                          "%uint_default = OpConstant %uint 131073\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpQuantizeToF16"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsRoundedMixedPrecisionBridge) {
+  std::string text = MakeMixedPrecisionChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %bridge FPRoundingMode RTE\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "FPRoundingMode RTE"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       RejectsModuleRoundingModeOnMixedPrecisionBridge) {
+  for (const char* mode : {"RoundingModeRTE", "RoundingModeRTZ"}) {
+    SCOPED_TRACE(mode);
+    std::string text = MakeMixedPrecisionChain();
+    ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Float16\n",
+                            std::string("OpCapability Float16\nOpCapability ") +
+                                mode +
+                                "\nOpExtension \"SPV_KHR_float_controls\"\n"));
+    ASSERT_TRUE(
+        ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                    std::string("OpExecutionMode %main LocalSize 1 1 1\n") +
+                        "OpExecutionMode %main " + mode + " 16\n"));
+
+    auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+        text, true, true);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+    EXPECT_EQ(2u,
+              CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+    EXPECT_EQ(0u, CountSubstring(disassembly, "OpQuantizeToF16"));
+  }
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNoContractionOnFirstLayer) {
@@ -603,6 +851,36 @@ OpFunctionEnd
 )";
 }
 
+bool ConvertStreamingBiasChainToMixedPrecision(std::string* text) {
+  return ReplaceOnce(text, "%half = OpTypeFloat 16\n",
+                     "%half = OpTypeFloat 16\n"
+                     "%float = OpTypeFloat 32\n") &&
+         ReplaceOnce(text,
+                     "%vec17 = OpTypeCooperativeVectorHW %half %uint_17\n",
+                     "%vec17 = OpTypeCooperativeVectorHW %half %uint_17\n"
+                     "%vec17f32 = OpTypeCooperativeVectorHW %float %uint_17\n"
+                     "%vec7f32 = OpTypeCooperativeVectorHW %float %uint_7\n") &&
+         ReplaceOnce(
+             text,
+             "%bias0 = OpLoad %vec17 %bias0_value\n"
+             "%hidden = OpCooperativeVectorMatrixMulAddHW %vec17 %input "
+             "%matrix0 %bias0\n",
+             "%bias0 = OpLoad %vec17 %bias0_value\n"
+             "%bias0f32 = OpFConvert %vec17f32 %bias0\n"
+             "%hidden = OpCooperativeVectorMatrixMulAddHW %vec17f32 %input "
+             "%matrix0 %bias0f32\n"
+             "%bridge = OpFConvert %vec17 %hidden\n") &&
+         ReplaceOnce(
+             text,
+             "%bias1 = OpLoad %vec7 %bias1_value\n"
+             "%out = OpCooperativeVectorMatrixMulAddHW %vec7 %hidden "
+             "%matrix1 %bias1\n",
+             "%bias1 = OpLoad %vec7 %bias1_value\n"
+             "%bias1f32 = OpFConvert %vec7f32 %bias1\n"
+             "%out = OpCooperativeVectorMatrixMulAddHW %vec7f32 %bridge "
+             "%matrix1 %bias1f32\n");
+}
+
 TEST_F(HwFuseTwoLayerVectorMatmulTest, StreamsPrivateRowMajorMatrixLoads) {
   const std::string text = MakeStreamingMatrixChain();
 
@@ -621,6 +899,77 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest, StreamsPrivateRowMajorMatrixLoads) {
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       StreamsCompatibleMatrixLoadThroughUseBitcast) {
+  std::string text = MakeStreamingMatrixChain();
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "%mat3x18 = OpTypeCooperativeMatrixHW %half %uint_3 %uint_18\n",
+      "%mat3x18 = OpTypeCooperativeMatrixHW %half %uint_3 %uint_18 "
+      "MatrixUseBHW\n"
+      "%mat3x18_load = OpTypeCooperativeMatrixHW %half %uint_3 %uint_18 "
+      "MatrixUseAHW\n"));
+  ASSERT_TRUE(ReplaceOnce(
+      &text,
+      "%matrix0 = OpCooperativeMatrixLoadHW %mat3x18 %matrix0_ptr %shape0 "
+      "%offset %int_0 Aligned 16\n",
+      "%matrix0_loaded = OpCooperativeMatrixLoadHW %mat3x18_load "
+      "%matrix0_ptr %shape0 %offset %int_0 Aligned 16\n"
+      "%matrix0 = OpBitcast %mat3x18 %matrix0_loaded\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpCooperativeMatrixLoadHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpBitcast %mat3x18"));
+  EXPECT_EQ(180u, CountSubstring(disassembly, "OpLoad %half"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       StreamsLinearizedMatrixWindowPastLogicalShape) {
+  std::string text = MakeStreamingMatrixChain();
+  ASSERT_TRUE(ReplaceOnce(&text, "%uint_54 = OpConstant %uint 54\n",
+                          "%uint_54 = OpConstant %uint 54\n"
+                          "%uint_55 = OpConstant %uint 55\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "%arr54 = OpTypeArray %half %uint_54\n",
+                          "%arr54 = OpTypeArray %half %uint_55\n"));
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "%offset = OpConstantComposite %v2int %int_0 %int_0\n",
+      "%offset = OpConstantComposite %v2int %int_0 %int_0\n"
+      "%offset_linear = OpConstantComposite %v2int %int_0 %int_1\n"));
+  ASSERT_TRUE(
+      ReplaceOnce(&text, "%matrix0_ptr %shape0 %offset %int_0 Aligned 16",
+                  "%matrix0_ptr %shape0 %offset_linear %int_0 Aligned 16"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpCooperativeMatrixLoadHW"));
+  EXPECT_EQ(180u, CountSubstring(disassembly, "OpLoad %half"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       KeepsOutOfBoundsFixedArrayMatrixAggregate) {
+  std::string text = MakeStreamingMatrixChain();
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "%offset = OpConstantComposite %v2int %int_0 %int_0\n",
+      "%offset = OpConstantComposite %v2int %int_0 %int_0\n"
+      "%offset_linear = OpConstantComposite %v2int %int_0 %int_1\n"));
+  ASSERT_TRUE(
+      ReplaceOnce(&text, "%matrix0_ptr %shape0 %offset %int_0 Aligned 16",
+                  "%matrix0_ptr %shape0 %offset_linear %int_0 Aligned 16"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCooperativeMatrixLoadHW"));
+  EXPECT_EQ(126u, CountSubstring(disassembly, "OpLoad %half"));
+  EXPECT_GT(CountSubstring(disassembly, "OpCompositeExtract %half %matrix0"),
+            0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
        StreamsPrivateBiasLoadsThroughFunctionTransport) {
   auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
       MakeStreamingBiasChain(), true, true);
@@ -636,6 +985,68 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest,
   EXPECT_GT(CountSubstring(disassembly, "Aligned 8"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "Aligned 4"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "Aligned 2"), 0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       StreamsConvertedF16BiasLoadsForMixedPrecisionFusion) {
+  std::string text = MakeStreamingBiasChain();
+  ASSERT_TRUE(ConvertStreamingBiasChainToMixedPrecision(&text));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpCooperativeVectorLoadHW"));
+  EXPECT_EQ(0u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(24u, CountSubstring(disassembly, "OpLoad %half"));
+  EXPECT_GE(CountSubstring(disassembly, "OpFConvert %float"), 24u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %vec17f32"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpStore"));
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       PreservesExplicitNoneOnStreamedConvertedBias) {
+  std::string text = MakeStreamingBiasChain();
+  ASSERT_TRUE(ConvertStreamingBiasChainToMixedPrecision(&text));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Float16\n",
+                          "OpCapability Float16\n"
+                          "OpCapability FloatControls2\n"
+                          "OpExtension \"SPV_KHR_float_controls2\"\n"));
+  ASSERT_TRUE(ReplaceOnce(
+      &text, "OpExecutionMode %main LocalSize 1 1 1\n",
+      "OpExecutionMode %main LocalSize 1 1 1\n"
+      "OpExecutionModeId %main FPFastMathDefault %float %uint_default\n"
+      "OpDecorate %bridge FPFastMathMode NSZ\n"
+      "OpDecorate %bias0f32 FPFastMathMode None\n"
+      "OpDecorate %bias1f32 FPFastMathMode None\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "%uint_32 = OpConstant %uint 32\n",
+                          "%uint_32 = OpConstant %uint 32\n"
+                          "%uint_default = OpConstant %uint 131073\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(24u, CountSubstring(disassembly, "FPFastMathMode None"))
+      << disassembly;
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest, KeepsRoundedConvertedBiasAggregate) {
+  std::string text = MakeStreamingBiasChain();
+  ASSERT_TRUE(ConvertStreamingBiasChainToMixedPrecision(&text));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpDecorate %bias0f32 FPRoundingMode RTE\n"));
+
+  auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
+      text, true, false);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u,
+            CountSubstring(disassembly, "OpCooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCooperativeVectorLoadHW"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "FPRoundingMode RTE"));
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest,
@@ -1165,6 +1576,23 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest,
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v4half"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+}
+
+TEST_F(HwFuseTwoLayerVectorMatmulTest,
+       PreferPackedLoweringConsumesMixedPrecisionPair) {
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      MakeMixedPrecisionChain(), true, true,
+      HwLowerToStandardPass::LoweringMode::kPreferPackedVec4);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeMatrixHW"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "SPV_HW_neural_shader"));
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 2"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %float 2"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpQuantizeToF16 %v2float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %v2half"));
 }
 
 TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesMulAddFirstPureMulSecond) {

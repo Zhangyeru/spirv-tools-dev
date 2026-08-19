@@ -131,10 +131,36 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
       TraceFunctionValueSource(second_input, second, &second_transport);
   if (!producer) return false;
 
+  std::vector<Instruction*> bridge_transport;
+  VectorTypeInfo bridge_input_type;
+  if (producer->opcode() == spv::Op::OpFConvert) {
+    if (producer->NumInOperands() != 1 ||
+        producer->type_id() != second_input->type_id() ||
+        context()->get_instr_block(producer) != block) {
+      return false;
+    }
+    Instruction* bridge_input =
+        get_def_use_mgr()->GetDef(producer->GetSingleWordInOperand(0));
+    if (!bridge_input ||
+        !GetVectorType(bridge_input->type_id(), &bridge_input_type) ||
+        bridge_input_type.length != second_input_type.length ||
+        context()->get_decoration_mgr()->HasDecoration(
+            producer->result_id(), spv::Decoration::FPRoundingMode)) {
+      return false;
+    }
+    candidate.bridge_conversion = producer;
+    producer = TraceFunctionValueSource(
+        bridge_input, candidate.bridge_conversion, &bridge_transport);
+    if (!producer) return false;
+  }
+
   std::vector<Instruction*> first_transport;
   if (IsGlslFMax(producer)) {
     candidate.relu = producer;
-    if (producer->type_id() != second_input->type_id() ||
+    const uint32_t expected_relu_type_id = candidate.bridge_conversion
+                                               ? bridge_input_type.type_id
+                                               : second_input_type.type_id;
+    if (producer->type_id() != expected_relu_type_id ||
         context()->get_instr_block(producer) != block ||
         context()->get_decoration_mgr()->HasDecoration(
             producer->result_id(), spv::Decoration::NoContraction)) {
@@ -189,15 +215,29 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
     }
   }
 
-  const uint32_t component_type_id = candidate.input.component_type_id;
-  if (!IsFloat16Type(component_type_id) ||
-      candidate.middle.component_type_id != component_type_id ||
-      candidate.output.component_type_id != component_type_id ||
-      candidate.first_matrix.component_type_id != component_type_id ||
-      candidate.second_matrix.component_type_id != component_type_id ||
-      second_input_type.component_type_id != component_type_id) {
+  const uint32_t input_component_type_id = candidate.input.component_type_id;
+  const bool all_f16 =
+      !candidate.bridge_conversion && IsFloat16Type(input_component_type_id) &&
+      candidate.middle.component_type_id == input_component_type_id &&
+      candidate.output.component_type_id == input_component_type_id &&
+      candidate.first_matrix.component_type_id == input_component_type_id &&
+      candidate.second_matrix.component_type_id == input_component_type_id &&
+      second_input_type.component_type_id == input_component_type_id;
+  const bool mixed_f16_f32 =
+      candidate.bridge_conversion && IsFloat16Type(input_component_type_id) &&
+      IsFloat32Type(candidate.middle.component_type_id) &&
+      candidate.output.component_type_id ==
+          candidate.middle.component_type_id &&
+      candidate.first_matrix.component_type_id == input_component_type_id &&
+      candidate.second_matrix.component_type_id == input_component_type_id &&
+      second_input_type.component_type_id == input_component_type_id &&
+      bridge_input_type.type_id == candidate.middle.type_id;
+  if (!all_f16 && !mixed_f16_f32) {
     return false;
   }
+  candidate.mixed_precision = mixed_f16_f32;
+  if (candidate.mixed_precision && Has16BitRoundingMode()) return false;
+  candidate.has_fp_fast_math_default = HasFPFastMathDefault();
 
   const uint32_t k = candidate.input.length;
   const uint32_t n = candidate.middle.length;
@@ -216,17 +256,36 @@ bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
   const uint64_t remaining = max_unrolled_matmul_macs_ - first_macs;
   if (uint64_t(p) > remaining / uint64_t(n)) return false;
 
-  candidate.first_fp_fast_math_mode =
-      GetFPFastMathMode(candidate.first->result_id());
-  candidate.relu_fp_fast_math_mode =
-      candidate.relu ? GetFPFastMathMode(candidate.relu->result_id()) : 0;
-  candidate.second_fp_fast_math_mode =
-      GetFPFastMathMode(candidate.second->result_id());
+  candidate.first_has_explicit_fp_fast_math_mode = GetExplicitFPFastMathMode(
+      candidate.first->result_id(), &candidate.first_fp_fast_math_mode);
+  if (candidate.relu) {
+    candidate.relu_has_explicit_fp_fast_math_mode = GetExplicitFPFastMathMode(
+        candidate.relu->result_id(), &candidate.relu_fp_fast_math_mode);
+  }
+  if (candidate.bridge_conversion) {
+    candidate.bridge_has_explicit_fp_fast_math_mode =
+        GetExplicitFPFastMathMode(candidate.bridge_conversion->result_id(),
+                                  &candidate.bridge_fp_fast_math_mode);
+  }
+  candidate.second_has_explicit_fp_fast_math_mode = GetExplicitFPFastMathMode(
+      candidate.second->result_id(), &candidate.second_fp_fast_math_mode);
+  // OpQuantizeToF16 keeps the quantized value in an f32 result.  An explicit
+  // bridge mode can be copied to that result, but an implicit f16 default
+  // cannot safely be replaced by a potentially different f32 default.
+  if (candidate.mixed_precision && candidate.has_fp_fast_math_default &&
+      !candidate.bridge_has_explicit_fp_fast_math_mode) {
+    return false;
+  }
 
   candidate.kill_list.push_back(candidate.first);
   if (candidate.relu) candidate.kill_list.push_back(candidate.relu);
+  if (candidate.bridge_conversion) {
+    candidate.kill_list.push_back(candidate.bridge_conversion);
+  }
   candidate.kill_list.insert(candidate.kill_list.end(),
                              second_transport.begin(), second_transport.end());
+  candidate.kill_list.insert(candidate.kill_list.end(),
+                             bridge_transport.begin(), bridge_transport.end());
   candidate.kill_list.insert(candidate.kill_list.end(), first_transport.begin(),
                              first_transport.end());
 
@@ -312,17 +371,21 @@ bool HwFuseTwoLayerVectorMatmulPass::RewriteMatch(const Match& match) {
   // TypeManager does not model the private HW cooperative type opcodes.  Scan
   // and extend the module's type/value section directly while those types are
   // still present; the outer lowering pass rebuilds TypeManager afterwards.
-  const uint32_t vec2_type_id =
-      GetOrCreateVectorType(match.input.component_type_id, 2);
-  if (vec2_type_id == 0) {
-    ReportError(match.second, "failed to create f16vec2 type for HW fusion");
-    return false;
-  }
-  const uint32_t zero_id = GetOrCreateZero(match.input.component_type_id);
-  const uint32_t zero_vec2_id = GetOrCreateZero(vec2_type_id);
+  const uint32_t operand_component_type_id = match.input.component_type_id;
+  const uint32_t accumulator_component_type_id = match.middle.component_type_id;
+  const uint32_t operand_vec2_type_id =
+      GetOrCreateVectorType(operand_component_type_id, 2);
+  const uint32_t accumulator_vec2_type_id =
+      GetOrCreateVectorType(accumulator_component_type_id, 2);
+  const uint32_t operand_zero_id = GetOrCreateZero(operand_component_type_id);
+  const uint32_t accumulator_zero_id =
+      GetOrCreateZero(accumulator_component_type_id);
+  const uint32_t accumulator_zero_vec2_id =
+      GetOrCreateZero(accumulator_vec2_type_id);
   const uint32_t glsl_import_id = GetOrCreateGLSLStd450Import();
-  if (vec2_type_id == 0 || zero_id == 0 || zero_vec2_id == 0 ||
-      glsl_import_id == 0) {
+  if (operand_vec2_type_id == 0 || accumulator_vec2_type_id == 0 ||
+      operand_zero_id == 0 || accumulator_zero_id == 0 ||
+      accumulator_zero_vec2_id == 0 || glsl_import_id == 0) {
     ReportError(match.second, "failed to create standard types for HW fusion");
     return false;
   }
@@ -338,124 +401,164 @@ bool HwFuseTwoLayerVectorMatmulPass::RewriteMatch(const Match& match) {
   const uint32_t second_matrix_id =
       match.second->GetSingleWordInOperand(kMatrixOperand);
 
-  // Keep adjacent output columns in f16vec2 accumulators.  There are at most
-  // eight of these (P <= 16), and they remain live across all N splits.
+  auto build_bias_element =
+      [this, &builder](const DirectVectorLoadInfo& direct, uint32_t bias_id,
+                       uint32_t target_component_type_id,
+                       uint32_t logical_index) -> uint32_t {
+    if (!direct.source_load) {
+      return BuildExtract(&builder, target_component_type_id, bias_id,
+                          {logical_index});
+    }
+    uint32_t value = BuildVectorElementLoad(
+        &builder, direct.source_component_type_id, direct, logical_index);
+    if (value == 0 ||
+        direct.source_component_type_id == target_component_type_id) {
+      return value;
+    }
+    return BuildFConvert(&builder, target_component_type_id, value,
+                         direct.conversion_fp_fast_math_mode,
+                         direct.conversion_has_explicit_fp_fast_math_mode);
+  };
+
+  auto convert_vec2 = [this, &builder](uint32_t result_type_id,
+                                       uint32_t value_id,
+                                       uint32_t fp_fast_math_mode,
+                                       bool preserve_fp_fast_math_none) {
+    return BuildFConvert(&builder, result_type_id, value_id, fp_fast_math_mode,
+                         preserve_fp_fast_math_none);
+  };
+
+  // Keep adjacent output columns in accumulator vec2 values.  There are at
+  // most eight of these (P <= 16), and they remain live across all N splits.
   std::vector<uint32_t> output_pair_ids;
   output_pair_ids.reserve((match.output.length + 1) / 2);
   for (uint32_t output_col = 0; output_col < match.output.length;
        output_col += 2) {
-    uint32_t bias0 = zero_id;
-    uint32_t bias1 = zero_id;
+    uint32_t bias0 = accumulator_zero_id;
+    uint32_t bias1 = accumulator_zero_id;
     if (IsVectorMatrixMulAdd(match.second)) {
       const uint32_t bias_id =
           match.second->GetSingleWordInOperand(kBiasOperand);
-      bias0 =
-          match.second_direct_bias.source_load
-              ? BuildVectorElementLoad(&builder, match.input.component_type_id,
-                                       match.second_direct_bias, output_col)
-              : BuildExtract(&builder, match.input.component_type_id, bias_id,
-                             {output_col});
+      bias0 = build_bias_element(match.second_direct_bias, bias_id,
+                                 accumulator_component_type_id, output_col);
       if (output_col + 1 < match.output.length) {
-        bias1 = match.second_direct_bias.source_load
-                    ? BuildVectorElementLoad(
-                          &builder, match.input.component_type_id,
-                          match.second_direct_bias, output_col + 1)
-                    : BuildExtract(&builder, match.input.component_type_id,
-                                   bias_id, {output_col + 1});
+        bias1 =
+            build_bias_element(match.second_direct_bias, bias_id,
+                               accumulator_component_type_id, output_col + 1);
       }
       if (bias0 == 0 || bias1 == 0) return false;
     }
-    const uint32_t pair = BuildVec2(&builder, vec2_type_id, bias0, bias1);
+    const uint32_t pair =
+        BuildVec2(&builder, accumulator_vec2_type_id, bias0, bias1);
     if (pair == 0) return false;
     output_pair_ids.push_back(pair);
   }
 
   // Calculate one hidden pair and immediately consume it with the
-  // corresponding two rows of the second matrix.  The f16vec2 lanes represent
-  // adjacent columns, avoiding horizontal reductions and a 16-scalar hidden
-  // live range.
+  // corresponding two rows of the second matrix.  In mixed mode the hidden
+  // pair is accumulated and ReLU'd in f32, rounded to f16 at the explicit
+  // bridge, then widened again for the second layer's f32 accumulation.
   for (uint32_t split_begin = 0; split_begin < match.middle.length;
        split_begin += kSplitWidth) {
     const uint32_t split_end =
         std::min(split_begin + kSplitWidth, match.middle.length);
     for (uint32_t hidden_col = split_begin; hidden_col < split_end;
          hidden_col += 2) {
-      uint32_t bias0 = zero_id;
-      uint32_t bias1 = zero_id;
+      uint32_t bias0 = accumulator_zero_id;
+      uint32_t bias1 = accumulator_zero_id;
       if (IsVectorMatrixMulAdd(match.first)) {
         const uint32_t bias_id =
             match.first->GetSingleWordInOperand(kBiasOperand);
-        bias0 = match.first_direct_bias.source_load
-                    ? BuildVectorElementLoad(
-                          &builder, match.input.component_type_id,
-                          match.first_direct_bias, hidden_col)
-                    : BuildExtract(&builder, match.input.component_type_id,
-                                   bias_id, {hidden_col});
+        bias0 = build_bias_element(match.first_direct_bias, bias_id,
+                                   accumulator_component_type_id, hidden_col);
         if (hidden_col + 1 < split_end) {
-          bias1 = match.first_direct_bias.source_load
-                      ? BuildVectorElementLoad(
-                            &builder, match.input.component_type_id,
-                            match.first_direct_bias, hidden_col + 1)
-                      : BuildExtract(&builder, match.input.component_type_id,
-                                     bias_id, {hidden_col + 1});
+          bias1 =
+              build_bias_element(match.first_direct_bias, bias_id,
+                                 accumulator_component_type_id, hidden_col + 1);
         }
         if (bias0 == 0 || bias1 == 0) return false;
       }
-      uint32_t hidden_pair = BuildVec2(&builder, vec2_type_id, bias0, bias1);
+      uint32_t hidden_pair =
+          BuildVec2(&builder, accumulator_vec2_type_id, bias0, bias1);
       if (hidden_pair == 0) return false;
 
       for (uint32_t row = 0; row < match.input.length; ++row) {
-        const uint32_t input = BuildExtract(
-            &builder, match.input.component_type_id, first_input_id, {row});
+        const uint32_t input = BuildExtract(&builder, operand_component_type_id,
+                                            first_input_id, {row});
         if (input == 0) return false;
-        const uint32_t input_pair =
-            BuildVec2(&builder, vec2_type_id, input, input);
+        uint32_t input_pair =
+            BuildVec2(&builder, operand_vec2_type_id, input, input);
         if (input_pair == 0) return false;
         const uint32_t weight0 =
             match.first_direct_matrix.source_load
-                ? BuildMatrixElementLoad(
-                      &builder, match.input.component_type_id,
-                      match.first_direct_matrix, row, hidden_col)
-                : BuildExtract(&builder, match.input.component_type_id,
+                ? BuildMatrixElementLoad(&builder, operand_component_type_id,
+                                         match.first_direct_matrix, row,
+                                         hidden_col)
+                : BuildExtract(&builder, operand_component_type_id,
                                first_matrix_id, {row, hidden_col});
         if (weight0 == 0) return false;
-        uint32_t weight1 = zero_id;
+        uint32_t weight1 = operand_zero_id;
         if (hidden_col + 1 < split_end) {
           weight1 = match.first_direct_matrix.source_load
                         ? BuildMatrixElementLoad(
-                              &builder, match.input.component_type_id,
+                              &builder, operand_component_type_id,
                               match.first_direct_matrix, row, hidden_col + 1)
-                        : BuildExtract(&builder, match.input.component_type_id,
+                        : BuildExtract(&builder, operand_component_type_id,
                                        first_matrix_id, {row, hidden_col + 1});
           if (weight1 == 0) return false;
         }
-        const uint32_t weight_pair =
-            BuildVec2(&builder, vec2_type_id, weight0, weight1);
+        uint32_t weight_pair =
+            BuildVec2(&builder, operand_vec2_type_id, weight0, weight1);
         if (weight_pair == 0) return false;
-        hidden_pair =
-            BuildFma(&builder, vec2_type_id, glsl_import_id, input_pair,
-                     weight_pair, hidden_pair, match.first_fp_fast_math_mode);
+        if (match.mixed_precision) {
+          input_pair = convert_vec2(accumulator_vec2_type_id, input_pair,
+                                    match.first_fp_fast_math_mode,
+                                    match.first_has_explicit_fp_fast_math_mode);
+          weight_pair =
+              convert_vec2(accumulator_vec2_type_id, weight_pair,
+                           match.first_fp_fast_math_mode,
+                           match.first_has_explicit_fp_fast_math_mode);
+          if (input_pair == 0 || weight_pair == 0) return false;
+        }
+        hidden_pair = BuildFma(&builder, accumulator_vec2_type_id,
+                               glsl_import_id, input_pair, weight_pair,
+                               hidden_pair, match.first_fp_fast_math_mode,
+                               match.first_has_explicit_fp_fast_math_mode);
         if (hidden_pair == 0) return false;
       }
 
       if (match.relu) {
-        hidden_pair =
-            BuildFMaxZero(&builder, vec2_type_id, glsl_import_id, hidden_pair,
-                          zero_vec2_id, match.relu_fp_fast_math_mode);
+        hidden_pair = BuildFMaxZero(
+            &builder, accumulator_vec2_type_id, glsl_import_id, hidden_pair,
+            accumulator_zero_vec2_id, match.relu_fp_fast_math_mode,
+            match.relu_has_explicit_fp_fast_math_mode);
         if (hidden_pair == 0) return false;
       }
 
+      uint32_t second_hidden_pair = hidden_pair;
+      if (match.mixed_precision) {
+        // A back-to-back f32->f16->f32 SSA conversion can be folded by Vulkan
+        // backends and fail to make the activation rounding observable.  The
+        // core quantize instruction preserves the same f16-precision value in
+        // f32 form, which is exactly what the second f32 accumulator consumes.
+        second_hidden_pair = BuildQuantizeToF16(
+            &builder, accumulator_vec2_type_id, second_hidden_pair,
+            match.bridge_fp_fast_math_mode,
+            match.bridge_has_explicit_fp_fast_math_mode);
+        if (second_hidden_pair == 0) return false;
+      }
+
       const uint32_t hidden0 = BuildExtract(
-          &builder, match.input.component_type_id, hidden_pair, {0});
+          &builder, accumulator_component_type_id, second_hidden_pair, {0});
       if (hidden0 == 0) return false;
       const uint32_t hidden1 = BuildExtract(
-          &builder, match.input.component_type_id, hidden_pair, {1});
+          &builder, accumulator_component_type_id, second_hidden_pair, {1});
       if (hidden1 == 0) return false;
       const uint32_t hidden0_pair =
-          BuildVec2(&builder, vec2_type_id, hidden0, hidden0);
+          BuildVec2(&builder, accumulator_vec2_type_id, hidden0, hidden0);
       if (hidden0_pair == 0) return false;
       const uint32_t hidden1_pair =
-          BuildVec2(&builder, vec2_type_id, hidden1, hidden1);
+          BuildVec2(&builder, accumulator_vec2_type_id, hidden1, hidden1);
       if (hidden1_pair == 0) return false;
 
       for (uint32_t output_col = 0; output_col < match.output.length;
@@ -463,62 +566,78 @@ bool HwFuseTwoLayerVectorMatmulPass::RewriteMatch(const Match& match) {
         const size_t output_pair = output_col / 2;
         const uint32_t weight00 =
             match.second_direct_matrix.source_load
-                ? BuildMatrixElementLoad(
-                      &builder, match.input.component_type_id,
-                      match.second_direct_matrix, hidden_col, output_col)
-                : BuildExtract(&builder, match.input.component_type_id,
+                ? BuildMatrixElementLoad(&builder, operand_component_type_id,
+                                         match.second_direct_matrix, hidden_col,
+                                         output_col)
+                : BuildExtract(&builder, operand_component_type_id,
                                second_matrix_id, {hidden_col, output_col});
         if (weight00 == 0) return false;
-        uint32_t weight01 = zero_id;
+        uint32_t weight01 = operand_zero_id;
         if (output_col + 1 < match.output.length) {
-          weight01 = match.second_direct_matrix.source_load
-                         ? BuildMatrixElementLoad(&builder,
-                                                  match.input.component_type_id,
-                                                  match.second_direct_matrix,
-                                                  hidden_col, output_col + 1)
-                         : BuildExtract(&builder, match.input.component_type_id,
-                                        second_matrix_id,
-                                        {hidden_col, output_col + 1});
+          weight01 =
+              match.second_direct_matrix.source_load
+                  ? BuildMatrixElementLoad(&builder, operand_component_type_id,
+                                           match.second_direct_matrix,
+                                           hidden_col, output_col + 1)
+                  : BuildExtract(&builder, operand_component_type_id,
+                                 second_matrix_id,
+                                 {hidden_col, output_col + 1});
           if (weight01 == 0) return false;
         }
-        const uint32_t weight0_pair =
-            BuildVec2(&builder, vec2_type_id, weight00, weight01);
+        uint32_t weight0_pair =
+            BuildVec2(&builder, operand_vec2_type_id, weight00, weight01);
         if (weight0_pair == 0) return false;
-        output_pair_ids[output_pair] = BuildFma(
-            &builder, vec2_type_id, glsl_import_id, hidden0_pair, weight0_pair,
-            output_pair_ids[output_pair], match.second_fp_fast_math_mode);
+        if (match.mixed_precision) {
+          weight0_pair =
+              convert_vec2(accumulator_vec2_type_id, weight0_pair,
+                           match.second_fp_fast_math_mode,
+                           match.second_has_explicit_fp_fast_math_mode);
+          if (weight0_pair == 0) return false;
+        }
+        output_pair_ids[output_pair] =
+            BuildFma(&builder, accumulator_vec2_type_id, glsl_import_id,
+                     hidden0_pair, weight0_pair, output_pair_ids[output_pair],
+                     match.second_fp_fast_math_mode,
+                     match.second_has_explicit_fp_fast_math_mode);
         if (output_pair_ids[output_pair] == 0) return false;
 
         if (hidden_col + 1 < split_end) {
           const uint32_t weight10 =
               match.second_direct_matrix.source_load
-                  ? BuildMatrixElementLoad(
-                        &builder, match.input.component_type_id,
-                        match.second_direct_matrix, hidden_col + 1, output_col)
-                  : BuildExtract(&builder, match.input.component_type_id,
+                  ? BuildMatrixElementLoad(&builder, operand_component_type_id,
+                                           match.second_direct_matrix,
+                                           hidden_col + 1, output_col)
+                  : BuildExtract(&builder, operand_component_type_id,
                                  second_matrix_id,
                                  {hidden_col + 1, output_col});
           if (weight10 == 0) return false;
-          uint32_t weight11 = zero_id;
+          uint32_t weight11 = operand_zero_id;
           if (output_col + 1 < match.output.length) {
-            weight11 =
-                match.second_direct_matrix.source_load
-                    ? BuildMatrixElementLoad(&builder,
-                                             match.input.component_type_id,
-                                             match.second_direct_matrix,
-                                             hidden_col + 1, output_col + 1)
-                    : BuildExtract(&builder, match.input.component_type_id,
-                                   second_matrix_id,
-                                   {hidden_col + 1, output_col + 1});
+            weight11 = match.second_direct_matrix.source_load
+                           ? BuildMatrixElementLoad(
+                                 &builder, operand_component_type_id,
+                                 match.second_direct_matrix, hidden_col + 1,
+                                 output_col + 1)
+                           : BuildExtract(&builder, operand_component_type_id,
+                                          second_matrix_id,
+                                          {hidden_col + 1, output_col + 1});
             if (weight11 == 0) return false;
           }
-          const uint32_t weight1_pair =
-              BuildVec2(&builder, vec2_type_id, weight10, weight11);
+          uint32_t weight1_pair =
+              BuildVec2(&builder, operand_vec2_type_id, weight10, weight11);
           if (weight1_pair == 0) return false;
+          if (match.mixed_precision) {
+            weight1_pair =
+                convert_vec2(accumulator_vec2_type_id, weight1_pair,
+                             match.second_fp_fast_math_mode,
+                             match.second_has_explicit_fp_fast_math_mode);
+            if (weight1_pair == 0) return false;
+          }
           output_pair_ids[output_pair] =
-              BuildFma(&builder, vec2_type_id, glsl_import_id, hidden1_pair,
-                       weight1_pair, output_pair_ids[output_pair],
-                       match.second_fp_fast_math_mode);
+              BuildFma(&builder, accumulator_vec2_type_id, glsl_import_id,
+                       hidden1_pair, weight1_pair, output_pair_ids[output_pair],
+                       match.second_fp_fast_math_mode,
+                       match.second_has_explicit_fp_fast_math_mode);
           if (output_pair_ids[output_pair] == 0) return false;
         }
       }
@@ -530,7 +649,7 @@ bool HwFuseTwoLayerVectorMatmulPass::RewriteMatch(const Match& match) {
   for (uint32_t output_col = 0; output_col < match.output.length;
        ++output_col) {
     const uint32_t scalar =
-        BuildExtract(&builder, match.input.component_type_id,
+        BuildExtract(&builder, accumulator_component_type_id,
                      output_pair_ids[output_col / 2], {output_col % 2});
     if (scalar == 0) return false;
     output_ids.push_back(scalar);
@@ -680,8 +799,11 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectMatrixLoad(
   chain->clear();
 
   Instruction* source = TraceFunctionValueSource(value, before, chain);
+  MatrixTypeInfo source_matrix;
   if (!source || source->opcode() != spv::Op::OpCooperativeMatrixLoadHW ||
-      source->type_id() != matrix.type_id ||
+      !GetMatrixType(source->type_id(), &source_matrix) ||
+      source_matrix.component_type_id != matrix.component_type_id ||
+      source_matrix.rows != matrix.rows || source_matrix.cols != matrix.cols ||
       source->NumInOperands() < kMatrixLoadMemoryOperands ||
       context()->get_instr_block(source) !=
           context()->get_instr_block(before) ||
@@ -713,18 +835,32 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectMatrixLoad(
     return false;
   }
 
-  const uint64_t last_row = uint64_t(direct.offset_row) + matrix.rows;
-  const uint64_t last_col = uint64_t(direct.offset_col) + matrix.cols;
-  if (direct.shape_rows == 0 || direct.shape_cols == 0 ||
-      last_row > direct.shape_rows || last_col > direct.shape_cols) {
+  if (direct.shape_rows == 0 || direct.shape_cols == 0 || matrix.rows == 0 ||
+      matrix.cols == 0) {
     chain->clear();
     return false;
   }
-  // Scalar OpAccessChain indices are 32-bit.  Reject the direct path before
-  // rewriting if even the last element would require a wider flattened index;
-  // the ordinary aggregate lowering remains available as a fallback.
-  const uint64_t max_flat_index =
-      (last_row - 1u) * uint64_t(direct.shape_cols) + (last_col - 1u);
+  // Match generic lowering's row-major address calculation exactly.  Matrix
+  // windows may cross the logical row/column bounds (neural.frag uses this to
+  // address consecutive regions of one packed runtime array), so validate the
+  // flattened address rather than rejecting each coordinate independently.
+  const uint64_t last_row =
+      uint64_t(direct.offset_row) + uint64_t(matrix.rows) - 1u;
+  const uint64_t last_col =
+      uint64_t(direct.offset_col) + uint64_t(matrix.cols) - 1u;
+  if (last_row >
+      std::numeric_limits<uint64_t>::max() / uint64_t(direct.shape_cols)) {
+    chain->clear();
+    return false;
+  }
+  const uint64_t row_base = last_row * uint64_t(direct.shape_cols);
+  if (last_col > std::numeric_limits<uint64_t>::max() - row_base) {
+    chain->clear();
+    return false;
+  }
+  // Scalar OpAccessChain indices are 32-bit. Reject the direct path before
+  // rewriting if even the last element would require a wider flattened index.
+  const uint64_t max_flat_index = row_base + last_col;
   if (max_flat_index > std::numeric_limits<uint32_t>::max()) {
     chain->clear();
     return false;
@@ -767,6 +903,15 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectMatrixLoad(
     chain->clear();
     return false;
   }
+  if (pointee->opcode() == spv::Op::OpTypeArray) {
+    uint32_t array_length = 0;
+    if (pointee->NumInOperands() < 2 ||
+        !GetConstantU32(pointee->GetSingleWordInOperand(1), &array_length) ||
+        max_flat_index >= array_length) {
+      chain->clear();
+      return false;
+    }
+  }
   direct.element_stride_bytes = GetArrayStride(pointee->result_id());
   if (direct.element_stride_bytes == 0) {
     // This pass only accepts f16 matrices.  Undecorated arrays therefore use
@@ -790,8 +935,34 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectVectorLoad(
   chain->clear();
 
   Instruction* source = TraceFunctionValueSource(value, before, chain);
+  Instruction* conversion = nullptr;
+  VectorTypeInfo source_vector = vector;
+  if (source && source->opcode() == spv::Op::OpFConvert) {
+    conversion = source;
+    if (context()->get_decoration_mgr()->HasDecoration(
+            conversion->result_id(), spv::Decoration::FPRoundingMode)) {
+      chain->clear();
+      return false;
+    }
+    Instruction* converted_value =
+        conversion->NumInOperands() == 1
+            ? get_def_use_mgr()->GetDef(conversion->GetSingleWordInOperand(0))
+            : nullptr;
+    if (conversion->type_id() != vector.type_id || !converted_value ||
+        context()->get_instr_block(conversion) !=
+            context()->get_instr_block(before) ||
+        !IsFloat32Type(vector.component_type_id) ||
+        !GetVectorType(converted_value->type_id(), &source_vector) ||
+        !IsFloat16Type(source_vector.component_type_id) ||
+        source_vector.length != vector.length) {
+      chain->clear();
+      return false;
+    }
+    chain->push_back(conversion);
+    source = TraceFunctionValueSource(converted_value, conversion, chain);
+  }
   if (!source || source->opcode() != spv::Op::OpCooperativeVectorLoadHW ||
-      source->type_id() != vector.type_id ||
+      source->type_id() != source_vector.type_id ||
       source->NumInOperands() < kVectorLoadMemoryOperands ||
       context()->get_instr_block(source) !=
           context()->get_instr_block(before) ||
@@ -803,11 +974,18 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectVectorLoad(
 
   DirectVectorLoadInfo direct;
   direct.source_load = source;
+  direct.conversion = conversion;
+  direct.source_component_type_id = source_vector.component_type_id;
+  if (conversion) {
+    direct.conversion_has_explicit_fp_fast_math_mode =
+        GetExplicitFPFastMathMode(conversion->result_id(),
+                                  &direct.conversion_fp_fast_math_mode);
+  }
   direct.pointer_id = source->GetSingleWordInOperand(kVectorLoadPointerOperand);
   const uint32_t offset_id =
       source->GetSingleWordInOperand(kVectorLoadOffsetOperand);
   if (!GetConstantU32(offset_id, &direct.offset) ||
-      uint64_t(direct.offset) + vector.length - 1u >
+      uint64_t(direct.offset) + source_vector.length - 1u >
           std::numeric_limits<uint32_t>::max()) {
     chain->clear();
     return false;
@@ -854,7 +1032,7 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectVectorLoad(
       (pointee->opcode() != spv::Op::OpTypeArray &&
        pointee->opcode() != spv::Op::OpTypeRuntimeArray) ||
       pointee->NumInOperands() < 1 ||
-      pointee->GetSingleWordInOperand(0) != vector.component_type_id) {
+      pointee->GetSingleWordInOperand(0) != source_vector.component_type_id) {
     chain->clear();
     return false;
   }
@@ -862,7 +1040,7 @@ bool HwFuseTwoLayerVectorMatmulPass::GetDirectVectorLoad(
     uint32_t array_length = 0;
     if (pointee->NumInOperands() < 2 ||
         !GetConstantU32(pointee->GetSingleWordInOperand(1), &array_length) ||
-        uint64_t(direct.offset) + vector.length > array_length) {
+        uint64_t(direct.offset) + source_vector.length > array_length) {
       chain->clear();
       return false;
     }
@@ -1076,6 +1254,12 @@ bool HwFuseTwoLayerVectorMatmulPass::IsFloat16Type(uint32_t type_id) const {
          type->NumInOperands() == 1 && type->GetSingleWordInOperand(0) == 16;
 }
 
+bool HwFuseTwoLayerVectorMatmulPass::IsFloat32Type(uint32_t type_id) const {
+  Instruction* type = get_def_use_mgr()->GetDef(type_id);
+  return type && type->opcode() == spv::Op::OpTypeFloat &&
+         type->NumInOperands() == 1 && type->GetSingleWordInOperand(0) == 32;
+}
+
 bool HwFuseTwoLayerVectorMatmulPass::IsZeroConstant(uint32_t id) const {
   std::unordered_set<uint32_t> visited;
   return IsZeroConstantImpl(id, &visited);
@@ -1091,7 +1275,9 @@ bool HwFuseTwoLayerVectorMatmulPass::IsZeroConstantImpl(
   if (!constant) return false;
   if (constant->opcode() == spv::Op::OpConstantNull) return true;
   if (constant->opcode() == spv::Op::OpConstant) {
-    if (!IsFloat16Type(constant->type_id()) || constant->NumInOperands() == 0) {
+    if ((!IsFloat16Type(constant->type_id()) &&
+         !IsFloat32Type(constant->type_id())) ||
+        constant->NumInOperands() == 0) {
       return false;
     }
     for (uint32_t i = 0; i < constant->NumInOperands(); ++i) {
@@ -1140,6 +1326,34 @@ bool HwFuseTwoLayerVectorMatmulPass::IsIgnorableUser(
     const Instruction* inst) const {
   return inst && (spvOpcodeIsDebug(inst->opcode()) || inst->IsDecoration() ||
                   inst->IsNonSemanticInstruction() || inst->IsDebugLineInst());
+}
+
+bool HwFuseTwoLayerVectorMatmulPass::HasFPFastMathDefault() const {
+  for (const Instruction& execution_mode : get_module()->execution_modes()) {
+    if (execution_mode.opcode() == spv::Op::OpExecutionModeId &&
+        execution_mode.NumInOperands() >= 2 &&
+        execution_mode.GetSingleWordInOperand(1) ==
+            uint32_t(spv::ExecutionMode::FPFastMathDefault)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool HwFuseTwoLayerVectorMatmulPass::Has16BitRoundingMode() const {
+  for (const Instruction& execution_mode : get_module()->execution_modes()) {
+    if (execution_mode.opcode() != spv::Op::OpExecutionMode ||
+        execution_mode.NumInOperands() < 3 ||
+        execution_mode.GetSingleWordInOperand(2) != 16u) {
+      continue;
+    }
+    const uint32_t mode = execution_mode.GetSingleWordInOperand(1);
+    if (mode == uint32_t(spv::ExecutionMode::RoundingModeRTE) ||
+        mode == uint32_t(spv::ExecutionMode::RoundingModeRTZ)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 uint32_t HwFuseTwoLayerVectorMatmulPass::GetOrCreateGLSLStd450Import() {
@@ -1286,24 +1500,27 @@ uint32_t HwFuseTwoLayerVectorMatmulPass::GetOrCreateZero(uint32_t type_id) {
   return result_id;
 }
 
-uint32_t HwFuseTwoLayerVectorMatmulPass::GetFPFastMathMode(
-    uint32_t result_id) const {
-  if (result_id == 0) return 0;
+bool HwFuseTwoLayerVectorMatmulPass::GetExplicitFPFastMathMode(
+    uint32_t result_id, uint32_t* mode) const {
+  if (mode) *mode = 0;
+  if (result_id == 0 || !mode) return false;
   for (const Instruction* decoration :
        context()->get_decoration_mgr()->GetDecorationsFor(
            result_id, /*include_linkage=*/false)) {
     if (decoration && decoration->NumInOperands() >= 3 &&
         decoration->GetSingleWordInOperand(1) ==
             uint32_t(spv::Decoration::FPFastMathMode)) {
-      return decoration->GetSingleWordInOperand(2);
+      *mode = decoration->GetSingleWordInOperand(2);
+      return true;
     }
   }
-  return 0;
+  return false;
 }
 
 void HwFuseTwoLayerVectorMatmulPass::ApplyFPFastMathMode(Instruction* inst,
-                                                         uint32_t mode) {
-  if (!inst || inst->result_id() == 0 || mode == 0) return;
+                                                         uint32_t mode,
+                                                         bool preserve_none) {
+  if (!inst || inst->result_id() == 0 || (mode == 0 && !preserve_none)) return;
   context()->get_decoration_mgr()->AddDecorationVal(
       inst->result_id(), uint32_t(spv::Decoration::FPFastMathMode), mode);
 }
@@ -1439,27 +1656,45 @@ uint32_t HwFuseTwoLayerVectorMatmulPass::BuildVec2(InstructionBuilder* builder,
   return value ? value->result_id() : 0;
 }
 
-uint32_t HwFuseTwoLayerVectorMatmulPass::BuildFma(InstructionBuilder* builder,
-                                                  uint32_t vec2_type_id,
-                                                  uint32_t glsl_import_id,
-                                                  uint32_t lhs, uint32_t rhs,
-                                                  uint32_t accumulator,
-                                                  uint32_t fp_fast_math_mode) {
+uint32_t HwFuseTwoLayerVectorMatmulPass::BuildFConvert(
+    InstructionBuilder* builder, uint32_t result_type_id, uint32_t value_id,
+    uint32_t fp_fast_math_mode, bool preserve_fp_fast_math_none) {
+  if (!builder || result_type_id == 0 || value_id == 0) return 0;
+  Instruction* converted =
+      builder->AddUnaryOp(result_type_id, spv::Op::OpFConvert, value_id);
+  ApplyFPFastMathMode(converted, fp_fast_math_mode, preserve_fp_fast_math_none);
+  return converted ? converted->result_id() : 0;
+}
+
+uint32_t HwFuseTwoLayerVectorMatmulPass::BuildQuantizeToF16(
+    InstructionBuilder* builder, uint32_t result_type_id, uint32_t value_id,
+    uint32_t fp_fast_math_mode, bool preserve_fp_fast_math_none) {
+  if (!builder || result_type_id == 0 || value_id == 0) return 0;
+  Instruction* quantized =
+      builder->AddUnaryOp(result_type_id, spv::Op::OpQuantizeToF16, value_id);
+  ApplyFPFastMathMode(quantized, fp_fast_math_mode, preserve_fp_fast_math_none);
+  return quantized ? quantized->result_id() : 0;
+}
+
+uint32_t HwFuseTwoLayerVectorMatmulPass::BuildFma(
+    InstructionBuilder* builder, uint32_t vec2_type_id, uint32_t glsl_import_id,
+    uint32_t lhs, uint32_t rhs, uint32_t accumulator,
+    uint32_t fp_fast_math_mode, bool preserve_fp_fast_math_none) {
   if (!builder) return 0;
   Instruction* fma = builder->AddNaryExtendedInstruction(
       vec2_type_id, glsl_import_id, GLSLstd450Fma, {lhs, rhs, accumulator});
-  ApplyFPFastMathMode(fma, fp_fast_math_mode);
+  ApplyFPFastMathMode(fma, fp_fast_math_mode, preserve_fp_fast_math_none);
   return fma ? fma->result_id() : 0;
 }
 
 uint32_t HwFuseTwoLayerVectorMatmulPass::BuildFMaxZero(
     InstructionBuilder* builder, uint32_t component_type_id,
     uint32_t glsl_import_id, uint32_t value_id, uint32_t zero_id,
-    uint32_t fp_fast_math_mode) {
+    uint32_t fp_fast_math_mode, bool preserve_fp_fast_math_none) {
   if (!builder) return 0;
   Instruction* maximum = builder->AddNaryExtendedInstruction(
       component_type_id, glsl_import_id, GLSLstd450FMax, {value_id, zero_id});
-  ApplyFPFastMathMode(maximum, fp_fast_math_mode);
+  ApplyFPFastMathMode(maximum, fp_fast_math_mode, preserve_fp_fast_math_none);
   return maximum ? maximum->result_id() : 0;
 }
 
