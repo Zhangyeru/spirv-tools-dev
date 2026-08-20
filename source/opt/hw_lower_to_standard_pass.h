@@ -320,6 +320,23 @@ class HwLowerToStandardPass : public Pass {
       bool bias_conversion_has_explicit_fp_fast_math_mode,
       uint32_t bias_constant_id, bool bias_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
+  uint32_t BuildDirectVectorMatmulFunctionUnrolled(
+      const VectorTypeInfo& result, const VectorTypeInfo& input,
+      const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+      uint32_t input_pointer_id, uint32_t input_pointer_type_id,
+      const std::vector<Operand>& input_memory_operands,
+      uint32_t input_constant_id, bool input_is_value,
+      uint32_t matrix_pointer_id, uint32_t matrix_pointer_type_id,
+      uint32_t matrix_shape_id, uint32_t matrix_offset_id,
+      const std::vector<Operand>& matrix_memory_operands,
+      uint32_t matrix_constant_id, bool matrix_is_value,
+      uint32_t bias_pointer_id, uint32_t bias_pointer_type_id,
+      const std::vector<Operand>& bias_memory_operands,
+      uint32_t bias_source_component_type_id, uint32_t bias_offset,
+      uint32_t bias_conversion_fp_fast_math_mode,
+      bool bias_conversion_has_explicit_fp_fast_math_mode,
+      uint32_t bias_constant_id, bool bias_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatmulFunctionPackedVec2(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
@@ -334,6 +351,19 @@ class HwLowerToStandardPass : public Pass {
       bool c_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
   uint32_t BuildDirectMatrixMatmulFunction(
+      const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+      const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
+      uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
+      const std::vector<Operand>& a_memory_operands, uint32_t a_constant_id,
+      bool a_is_value, uint32_t b_pointer_id, uint32_t b_pointer_type_id,
+      uint32_t b_shape_id, uint32_t b_offset_id,
+      const std::vector<Operand>& b_memory_operands, uint32_t b_constant_id,
+      bool b_is_value, uint32_t c_pointer_id, uint32_t c_pointer_type_id,
+      uint32_t c_shape_id, uint32_t c_offset_id,
+      const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
+      bool c_is_value,
+      const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
+  uint32_t BuildDirectMatrixMatmulFunctionUnrolled(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
       uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,

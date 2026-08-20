@@ -1202,6 +1202,327 @@ uint32_t HwLowerToStandardPass::BuildFusedMatrixMatmulStoreFunctionPackedVec2(
   return function_id;
 }
 
+uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
+    const VectorTypeInfo& result, const VectorTypeInfo& input,
+    const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
+    uint32_t input_pointer_id, uint32_t input_pointer_type_id,
+    const std::vector<Operand>& input_memory_operands,
+    uint32_t input_constant_id, bool input_is_value, uint32_t matrix_pointer_id,
+    uint32_t matrix_pointer_type_id, uint32_t matrix_shape_id,
+    uint32_t matrix_offset_id,
+    const std::vector<Operand>& matrix_memory_operands,
+    uint32_t matrix_constant_id, bool matrix_is_value, uint32_t bias_pointer_id,
+    uint32_t bias_pointer_type_id,
+    const std::vector<Operand>& bias_memory_operands,
+    uint32_t bias_source_component_type_id, uint32_t bias_offset,
+    uint32_t bias_conversion_fp_fast_math_mode,
+    bool bias_conversion_has_explicit_fp_fast_math_mode,
+    uint32_t bias_constant_id, bool bias_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  const bool same_component =
+      result.component_type_id == input.component_type_id &&
+      result.component_type_id == matrix.component_type_id &&
+      (!has_bias ||
+       (bias && result.component_type_id == bias->component_type_id)) &&
+      (IsFloat16Type(result.component_type_id) ||
+       IsFloat32Type(result.component_type_id));
+  const bool mixed_f16_f32 =
+      IsFloat32Type(result.component_type_id) &&
+      IsFloat16Type(input.component_type_id) &&
+      IsFloat16Type(matrix.component_type_id) &&
+      (!has_bias || (bias && IsFloat32Type(bias->component_type_id)));
+  if ((!same_component && !mixed_f16_f32) || input.length != matrix.rows ||
+      result.length != matrix.cols ||
+      (has_bias && (!bias || bias->length != result.length))) {
+    return 0;
+  }
+  if (has_bias && !bias_is_value &&
+      bias_source_component_type_id != bias->component_type_id &&
+      !(IsFloat16Type(bias_source_component_type_id) &&
+        IsFloat32Type(bias->component_type_id))) {
+    return 0;
+  }
+  if ((!input_is_value &&
+       (input_pointer_id == 0 || input_pointer_type_id == 0)) ||
+      (!matrix_is_value &&
+       (matrix_pointer_id == 0 || matrix_pointer_type_id == 0 ||
+        matrix_shape_id == 0 || matrix_offset_id == 0)) ||
+      (has_bias && !bias_is_value &&
+       (bias_pointer_id == 0 || bias_pointer_type_id == 0))) {
+    return 0;
+  }
+
+  std::vector<uint32_t> parameter_type_ids;
+  if (input_is_value && input_constant_id == 0) {
+    parameter_type_ids.push_back(input.lowered_type_id);
+  }
+  if (matrix_is_value && matrix_constant_id == 0) {
+    parameter_type_ids.push_back(matrix.lowered_type_id);
+  }
+  if (has_bias && bias_is_value && bias_constant_id == 0) {
+    parameter_type_ids.push_back(bias->lowered_type_id);
+  }
+  if (parameter_type_ids.size() != value_arguments.size()) return 0;
+  for (size_t i = 0; i < parameter_type_ids.size(); ++i) {
+    if (parameter_type_ids[i] != value_arguments[i].second) return 0;
+  }
+
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(result.lowered_type_id, parameter_type_ids);
+  const uint32_t function_id = TakeNextId();
+  if (function_type_id == 0 || function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  size_t parameter_index = 0;
+  auto add_parameter = [&](uint32_t type_id) -> uint32_t {
+    if (parameter_index >= parameter_type_ids.size() ||
+        parameter_type_ids[parameter_index] != type_id) {
+      return 0;
+    }
+    const uint32_t parameter_id = TakeNextId();
+    if (parameter_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, type_id, parameter_id,
+        std::initializer_list<Operand>{}));
+    ++parameter_index;
+    return parameter_id;
+  };
+
+  uint32_t input_value_id = input_constant_id;
+  if (input_is_value && input_value_id == 0) {
+    input_value_id = add_parameter(input.lowered_type_id);
+  }
+  uint32_t matrix_value_id = matrix_constant_id;
+  if (matrix_is_value && matrix_value_id == 0) {
+    matrix_value_id = add_parameter(matrix.lowered_type_id);
+  }
+  uint32_t bias_value_id = bias_constant_id;
+  if (has_bias && bias_is_value && bias_value_id == 0) {
+    bias_value_id = add_parameter(bias->lowered_type_id);
+  }
+  if ((input_is_value && input_value_id == 0) ||
+      (matrix_is_value && matrix_value_id == 0) ||
+      (has_bias && bias_is_value && bias_value_id == 0) ||
+      parameter_index != parameter_type_ids.size()) {
+    return 0;
+  }
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
+  if (!block) return 0;
+  InstructionBuilder builder(context(), block.get());
+
+  const uint32_t captured_input_pointer_id =
+      input_is_value ? 0 : BuildCapturedPointer(&builder, input_pointer_id);
+  const uint32_t captured_matrix_pointer_id =
+      matrix_is_value ? 0 : BuildCapturedPointer(&builder, matrix_pointer_id);
+  const uint32_t captured_bias_pointer_id =
+      !has_bias || bias_is_value
+          ? 0
+          : BuildCapturedPointer(&builder, bias_pointer_id);
+  if ((!input_is_value && captured_input_pointer_id == 0) ||
+      (!matrix_is_value && captured_matrix_pointer_id == 0) ||
+      (has_bias && !bias_is_value && captured_bias_pointer_id == 0)) {
+    return 0;
+  }
+
+  auto load_buffer_scalar_id =
+      [&](uint32_t pointer_type_id, uint32_t pointer_id,
+          uint32_t component_type_id, uint32_t index_id,
+          const std::vector<Operand>& memory_operands) -> uint32_t {
+    const uint32_t element_pointer_id =
+        index_id ? BuildElementAccessFromPointerType(
+                       &builder, pointer_type_id, pointer_id, component_type_id,
+                       index_id)
+                 : 0;
+    return element_pointer_id ? AddLoad(&builder, component_type_id,
+                                        element_pointer_id, memory_operands)
+                              : 0;
+  };
+  auto load_buffer_scalar =
+      [&](uint32_t pointer_type_id, uint32_t pointer_id,
+          uint32_t component_type_id, uint32_t index,
+          const std::vector<Operand>& memory_operands) -> uint32_t {
+    const uint32_t index_id = GetOrCreateUIntConstant(index);
+    return index_id ? load_buffer_scalar_id(pointer_type_id, pointer_id,
+                                            component_type_id, index_id,
+                                            memory_operands)
+                    : 0;
+  };
+  auto load_input_scalar = [&](uint32_t index) -> uint32_t {
+    return input_is_value
+               ? ExtractVectorScalar(&builder, input, input_value_id, index)
+               : load_buffer_scalar(
+                     input_pointer_type_id, captured_input_pointer_id,
+                     input.component_type_id, index, input_memory_operands);
+  };
+  auto load_matrix_scalar = [&](uint32_t row, uint32_t col) -> uint32_t {
+    if (matrix_is_value) {
+      return ExtractMatrixScalar(&builder, matrix, matrix_value_id, row, col);
+    }
+    const uint64_t flat_index = static_cast<uint64_t>(row) * matrix.cols + col;
+    if (flat_index > std::numeric_limits<uint32_t>::max()) return 0;
+    const uint32_t flat_index_id =
+        GetOrCreateUIntConstant(static_cast<uint32_t>(flat_index));
+    const uint32_t memory_index_id =
+        flat_index_id ? BuildRowMajorMatrixMemoryIndex(
+                            &builder, nullptr, matrix_shape_id,
+                            matrix_offset_id, matrix.cols, flat_index_id)
+                      : 0;
+    return memory_index_id
+               ? load_buffer_scalar_id(matrix_pointer_type_id,
+                                       captured_matrix_pointer_id,
+                                       matrix.component_type_id,
+                                       memory_index_id, matrix_memory_operands)
+               : 0;
+  };
+  auto load_bias_scalar = [&](uint32_t index) -> uint32_t {
+    if (!has_bias || !bias) return 0;
+    if (bias_is_value) {
+      return ExtractVectorScalar(&builder, *bias, bias_value_id, index);
+    }
+    const uint64_t source_index = static_cast<uint64_t>(bias_offset) + index;
+    if (source_index > std::numeric_limits<uint32_t>::max()) return 0;
+    uint32_t value_id = load_buffer_scalar(
+        bias_pointer_type_id, captured_bias_pointer_id,
+        bias_source_component_type_id, static_cast<uint32_t>(source_index),
+        bias_memory_operands);
+    if (value_id == 0 ||
+        bias_source_component_type_id == bias->component_type_id) {
+      return value_id;
+    }
+    Instruction* converted = builder.AddUnaryOp(bias->component_type_id,
+                                                spv::Op::OpFConvert, value_id);
+    ApplyFPFastMathMode(converted, bias_conversion_fp_fast_math_mode,
+                        bias_conversion_has_explicit_fp_fast_math_mode);
+    return converted ? converted->result_id() : 0;
+  };
+  Instruction* type_insertion_point =
+      get_def_use_mgr()->GetDef(result.lowered_type_id);
+  if (!type_insertion_point) return 0;
+  const uint32_t input_vec2_type_id = GetOrCreateVectorType(
+      input.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t result_vec2_type_id = GetOrCreateVectorType(
+      result.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t input_zero_id = GetOrCreateZero(input.component_type_id);
+  const uint32_t result_zero2_id = GetOrCreateZero(result_vec2_type_id);
+  if (input_vec2_type_id == 0 || result_vec2_type_id == 0 ||
+      input_zero_id == 0 || result_zero2_id == 0) {
+    return 0;
+  }
+  auto widen_vec = [&](uint32_t value_id) -> uint32_t {
+    if (value_id == 0 || input.component_type_id == result.component_type_id) {
+      return value_id;
+    }
+    Instruction* converted =
+        builder.AddUnaryOp(result_vec2_type_id, spv::Op::OpFConvert, value_id);
+    ApplyActiveFPFastMathMode(converted);
+    return converted ? converted->result_id() : 0;
+  };
+
+  std::vector<uint32_t> input_scalar_ids(input.length, 0);
+  for (uint32_t k = 0; k < input.length; ++k) {
+    input_scalar_ids[k] = load_input_scalar(k);
+    if (input_scalar_ids[k] == 0) return 0;
+  }
+  std::vector<uint32_t> matrix_scalar_ids(input.length * result.length, 0);
+  for (uint32_t k = 0; k < input.length; ++k) {
+    for (uint32_t col = 0; col < result.length; ++col) {
+      const uint32_t index = k * result.length + col;
+      matrix_scalar_ids[index] = load_matrix_scalar(k, col);
+      if (matrix_scalar_ids[index] == 0) return 0;
+    }
+  }
+
+  std::vector<uint32_t> scalar_ids;
+  scalar_ids.reserve(result.length);
+  for (uint32_t col = 0; col < result.length; ++col) {
+    uint32_t accumulator_vec_id = result_zero2_id;
+    for (uint32_t k = 0; k < input.length; k += kPackedVec2Width) {
+      std::vector<uint32_t> input_lane_ids;
+      std::vector<uint32_t> weight_lane_ids;
+      input_lane_ids.reserve(kPackedVec2Width);
+      weight_lane_ids.reserve(kPackedVec2Width);
+      for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+        const uint32_t input_index = k + lane;
+        const uint32_t input_id = input_index < input.length
+                                      ? input_scalar_ids[input_index]
+                                      : input_zero_id;
+        const uint32_t weight_id =
+            input_index < input.length
+                ? matrix_scalar_ids[input_index * result.length + col]
+                : input_zero_id;
+        if (input_id == 0 || weight_id == 0) return 0;
+        input_lane_ids.push_back(input_id);
+        weight_lane_ids.push_back(weight_id);
+      }
+      Instruction* input_vec =
+          builder.AddCompositeConstruct(input_vec2_type_id, input_lane_ids);
+      Instruction* weight_vec =
+          builder.AddCompositeConstruct(input_vec2_type_id, weight_lane_ids);
+      const uint32_t compute_input_id =
+          input_vec ? widen_vec(input_vec->result_id()) : 0;
+      const uint32_t compute_weight_id =
+          weight_vec ? widen_vec(weight_vec->result_id()) : 0;
+      if (compute_input_id == 0 || compute_weight_id == 0) return 0;
+      accumulator_vec_id =
+          BuildFma(&builder, result_vec2_type_id, compute_input_id,
+                   compute_weight_id, accumulator_vec_id);
+      if (accumulator_vec_id == 0) return 0;
+    }
+    uint32_t accumulator_id = BuildHorizontalReduce(
+        &builder, result.component_type_id, accumulator_vec_id);
+    if (accumulator_id == 0) return 0;
+    if (has_bias) {
+      const uint32_t bias_id = load_bias_scalar(col);
+      Instruction* sum = bias_id ? builder.AddBinaryOp(result.component_type_id,
+                                                       spv::Op::OpFAdd,
+                                                       accumulator_id, bias_id)
+                                 : nullptr;
+      if (!sum) return 0;
+      ApplyActiveFPFastMathMode(sum);
+      accumulator_id = sum->result_id();
+    }
+    scalar_ids.push_back(accumulator_id);
+  }
+
+  std::vector<uint32_t> piece_ids;
+  if (IsPackedVec2(result)) {
+    piece_ids.reserve(result.packed_length);
+    for (uint32_t pack = 0; pack < result.packed_length; ++pack) {
+      Instruction* piece = builder.AddCompositeConstruct(
+          result.packed_vec2_type_id,
+          {scalar_ids[pack * kPackedVec2Width],
+           scalar_ids[pack * kPackedVec2Width + 1]});
+      if (!piece) return 0;
+      piece_ids.push_back(piece->result_id());
+    }
+  } else {
+    piece_ids = scalar_ids;
+  }
+  Instruction* result_value =
+      builder.AddCompositeConstruct(result.lowered_type_id, piece_ids);
+  if (!result_value || !builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                                           result_value->result_id())) {
+    return 0;
+  }
+  function->AddBasicBlock(std::move(block));
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
+  return function_id;
+}
+
 uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec2(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
@@ -1219,6 +1540,21 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec2(
     bool bias_conversion_has_explicit_fp_fast_math_mode,
     uint32_t bias_constant_id, bool bias_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  const uint64_t mac_count = static_cast<uint64_t>(input.length) *
+                             static_cast<uint64_t>(result.length);
+  if (mac_count <= max_unrolled_matmul_macs_) {
+    return BuildDirectVectorMatmulFunctionUnrolled(
+        result, input, matrix, bias, has_bias, input_pointer_id,
+        input_pointer_type_id, input_memory_operands, input_constant_id,
+        input_is_value, matrix_pointer_id, matrix_pointer_type_id,
+        matrix_shape_id, matrix_offset_id, matrix_memory_operands,
+        matrix_constant_id, matrix_is_value, bias_pointer_id,
+        bias_pointer_type_id, bias_memory_operands,
+        bias_source_component_type_id, bias_offset,
+        bias_conversion_fp_fast_math_mode,
+        bias_conversion_has_explicit_fp_fast_math_mode, bias_constant_id,
+        bias_is_value, value_arguments);
+  }
   const bool same_component =
       result.component_type_id == input.component_type_id &&
       result.component_type_id == matrix.component_type_id &&
@@ -2232,6 +2568,283 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec2(
   return function_id;
 }
 
+uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionUnrolled(
+    const MatrixTypeInfo& result, const MatrixTypeInfo& a,
+    const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
+    uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
+    const std::vector<Operand>& a_memory_operands, uint32_t a_constant_id,
+    bool a_is_value, uint32_t b_pointer_id, uint32_t b_pointer_type_id,
+    uint32_t b_shape_id, uint32_t b_offset_id,
+    const std::vector<Operand>& b_memory_operands, uint32_t b_constant_id,
+    bool b_is_value, uint32_t c_pointer_id, uint32_t c_pointer_type_id,
+    uint32_t c_shape_id, uint32_t c_offset_id,
+    const std::vector<Operand>& c_memory_operands, uint32_t c_constant_id,
+    bool c_is_value,
+    const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  if (!CanUseDirectMatrixMulAdd(result, a, b, c) || result.rows != a.rows ||
+      result.cols != b.cols || a.cols != b.rows || c.rows != result.rows ||
+      c.cols != result.cols) {
+    return 0;
+  }
+  if ((!a_is_value && (a_pointer_id == 0 || a_pointer_type_id == 0 ||
+                       a_shape_id == 0 || a_offset_id == 0)) ||
+      (!b_is_value && (b_pointer_id == 0 || b_pointer_type_id == 0 ||
+                       b_shape_id == 0 || b_offset_id == 0)) ||
+      (!c_is_value && (c_pointer_id == 0 || c_pointer_type_id == 0 ||
+                       c_shape_id == 0 || c_offset_id == 0))) {
+    return 0;
+  }
+
+  std::vector<uint32_t> parameter_type_ids;
+  if (a_is_value && a_constant_id == 0) {
+    parameter_type_ids.push_back(a.lowered_type_id);
+  }
+  if (b_is_value && b_constant_id == 0) {
+    parameter_type_ids.push_back(b.lowered_type_id);
+  }
+  if (c_is_value && c_constant_id == 0) {
+    parameter_type_ids.push_back(c.lowered_type_id);
+  }
+  if (parameter_type_ids.size() != value_arguments.size()) return 0;
+  for (size_t i = 0; i < parameter_type_ids.size(); ++i) {
+    if (parameter_type_ids[i] != value_arguments[i].second) return 0;
+  }
+
+  const uint32_t function_type_id =
+      GetOrCreateFunctionType(result.lowered_type_id, parameter_type_ids);
+  const uint32_t function_id = TakeNextId();
+  if (function_type_id == 0 || function_id == 0) return 0;
+  std::unique_ptr<Instruction> function_start = MakeUnique<Instruction>(
+      context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+      std::initializer_list<Operand>{});
+  function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
+  function_start->AddOperand(IdOperand(function_type_id));
+  std::unique_ptr<Function> function =
+      MakeUnique<Function>(std::move(function_start));
+
+  size_t parameter_index = 0;
+  auto add_parameter = [&](uint32_t type_id) -> uint32_t {
+    if (parameter_index >= parameter_type_ids.size() ||
+        parameter_type_ids[parameter_index] != type_id) {
+      return 0;
+    }
+    const uint32_t parameter_id = TakeNextId();
+    if (parameter_id == 0) return 0;
+    function->AddParameter(MakeUnique<Instruction>(
+        context(), spv::Op::OpFunctionParameter, type_id, parameter_id,
+        std::initializer_list<Operand>{}));
+    ++parameter_index;
+    return parameter_id;
+  };
+
+  uint32_t a_value_id = a_constant_id;
+  if (a_is_value && a_value_id == 0) {
+    a_value_id = add_parameter(a.lowered_type_id);
+  }
+  uint32_t b_value_id = b_constant_id;
+  if (b_is_value && b_value_id == 0) {
+    b_value_id = add_parameter(b.lowered_type_id);
+  }
+  uint32_t c_value_id = c_constant_id;
+  if (c_is_value && c_value_id == 0) {
+    c_value_id = add_parameter(c.lowered_type_id);
+  }
+  if ((a_is_value && a_value_id == 0) || (b_is_value && b_value_id == 0) ||
+      (c_is_value && c_value_id == 0) ||
+      parameter_index != parameter_type_ids.size()) {
+    return 0;
+  }
+
+  const uint32_t label_id = TakeNextId();
+  if (label_id == 0) return 0;
+  std::unique_ptr<BasicBlock> block =
+      std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
+  if (!block) return 0;
+  InstructionBuilder builder(context(), block.get());
+
+  const uint32_t captured_a_pointer_id =
+      a_is_value ? 0 : BuildCapturedPointer(&builder, a_pointer_id);
+  const uint32_t captured_b_pointer_id =
+      b_is_value ? 0 : BuildCapturedPointer(&builder, b_pointer_id);
+  const uint32_t captured_c_pointer_id =
+      c_is_value ? 0 : BuildCapturedPointer(&builder, c_pointer_id);
+  if ((!a_is_value && captured_a_pointer_id == 0) ||
+      (!b_is_value && captured_b_pointer_id == 0) ||
+      (!c_is_value && captured_c_pointer_id == 0)) {
+    return 0;
+  }
+
+  auto load_buffer_scalar_id =
+      [&](uint32_t pointer_type_id, uint32_t pointer_id,
+          uint32_t component_type_id, uint32_t index_id,
+          const std::vector<Operand>& memory_operands) -> uint32_t {
+    const uint32_t element_pointer_id =
+        index_id ? BuildElementAccessFromPointerType(
+                       &builder, pointer_type_id, pointer_id, component_type_id,
+                       index_id)
+                 : 0;
+    return element_pointer_id ? AddLoad(&builder, component_type_id,
+                                        element_pointer_id, memory_operands)
+                              : 0;
+  };
+  auto load_matrix_scalar =
+      [&](const MatrixTypeInfo& info, bool is_value, uint32_t value_id,
+          uint32_t pointer_type_id, uint32_t pointer_id, uint32_t shape_id,
+          uint32_t offset_id, const std::vector<Operand>& memory_operands,
+          uint32_t row, uint32_t col) -> uint32_t {
+    if (is_value) {
+      return ExtractMatrixScalar(&builder, info, value_id, row, col);
+    }
+    const uint64_t flat_index = static_cast<uint64_t>(row) * info.cols + col;
+    if (flat_index > std::numeric_limits<uint32_t>::max()) return 0;
+    const uint32_t flat_index_id =
+        GetOrCreateUIntConstant(static_cast<uint32_t>(flat_index));
+    const uint32_t memory_index_id =
+        flat_index_id ? BuildRowMajorMatrixMemoryIndex(&builder, nullptr,
+                                                       shape_id, offset_id,
+                                                       info.cols, flat_index_id)
+                      : 0;
+    return memory_index_id
+               ? load_buffer_scalar_id(pointer_type_id, pointer_id,
+                                       info.component_type_id, memory_index_id,
+                                       memory_operands)
+               : 0;
+  };
+  Instruction* type_insertion_point =
+      get_def_use_mgr()->GetDef(result.lowered_type_id);
+  if (!type_insertion_point) return 0;
+  const uint32_t operand_vec2_type_id = GetOrCreateVectorType(
+      a.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t result_vec2_type_id = GetOrCreateVectorType(
+      result.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t operand_zero_id = GetOrCreateZero(a.component_type_id);
+  const uint32_t result_zero2_id = GetOrCreateZero(result_vec2_type_id);
+  if (operand_vec2_type_id == 0 || result_vec2_type_id == 0 ||
+      operand_zero_id == 0 || result_zero2_id == 0) {
+    return 0;
+  }
+  auto widen_vec = [&](uint32_t value_id) -> uint32_t {
+    if (value_id == 0 || a.component_type_id == result.component_type_id) {
+      return value_id;
+    }
+    Instruction* converted =
+        builder.AddUnaryOp(result_vec2_type_id, spv::Op::OpFConvert, value_id);
+    ApplyActiveFPFastMathMode(converted);
+    return converted ? converted->result_id() : 0;
+  };
+
+  std::vector<uint32_t> a_scalar_ids(a.rows * a.cols, 0);
+  for (uint32_t row = 0; row < a.rows; ++row) {
+    for (uint32_t col = 0; col < a.cols; ++col) {
+      const uint32_t index = MatrixFlatIndex(a, row, col);
+      a_scalar_ids[index] = load_matrix_scalar(
+          a, a_is_value, a_value_id, a_pointer_type_id, captured_a_pointer_id,
+          a_shape_id, a_offset_id, a_memory_operands, row, col);
+      if (a_scalar_ids[index] == 0) return 0;
+    }
+  }
+  std::vector<uint32_t> b_scalar_ids(b.rows * b.cols, 0);
+  for (uint32_t row = 0; row < b.rows; ++row) {
+    for (uint32_t col = 0; col < b.cols; ++col) {
+      const uint32_t index = MatrixFlatIndex(b, row, col);
+      b_scalar_ids[index] = load_matrix_scalar(
+          b, b_is_value, b_value_id, b_pointer_type_id, captured_b_pointer_id,
+          b_shape_id, b_offset_id, b_memory_operands, row, col);
+      if (b_scalar_ids[index] == 0) return 0;
+    }
+  }
+  std::vector<uint32_t> c_scalar_ids(c.rows * c.cols, 0);
+  for (uint32_t row = 0; row < c.rows; ++row) {
+    for (uint32_t col = 0; col < c.cols; ++col) {
+      const uint32_t index = MatrixFlatIndex(c, row, col);
+      c_scalar_ids[index] = load_matrix_scalar(
+          c, c_is_value, c_value_id, c_pointer_type_id, captured_c_pointer_id,
+          c_shape_id, c_offset_id, c_memory_operands, row, col);
+      if (c_scalar_ids[index] == 0) return 0;
+    }
+  }
+
+  std::vector<uint32_t> scalar_ids(result.rows * result.cols, 0);
+  for (uint32_t row = 0; row < result.rows; ++row) {
+    for (uint32_t col = 0; col < result.cols; ++col) {
+      uint32_t accumulator_vec_id = result_zero2_id;
+      for (uint32_t k = 0; k < a.cols; k += kPackedVec2Width) {
+        std::vector<uint32_t> lhs_lane_ids;
+        std::vector<uint32_t> rhs_lane_ids;
+        lhs_lane_ids.reserve(kPackedVec2Width);
+        rhs_lane_ids.reserve(kPackedVec2Width);
+        for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+          const uint32_t k_index = k + lane;
+          const uint32_t lhs_id =
+              k_index < a.cols ? a_scalar_ids[MatrixFlatIndex(a, row, k_index)]
+                               : operand_zero_id;
+          const uint32_t rhs_id =
+              k_index < a.cols ? b_scalar_ids[MatrixFlatIndex(b, k_index, col)]
+                               : operand_zero_id;
+          if (lhs_id == 0 || rhs_id == 0) return 0;
+          lhs_lane_ids.push_back(lhs_id);
+          rhs_lane_ids.push_back(rhs_id);
+        }
+        Instruction* lhs_vec =
+            builder.AddCompositeConstruct(operand_vec2_type_id, lhs_lane_ids);
+        Instruction* rhs_vec =
+            builder.AddCompositeConstruct(operand_vec2_type_id, rhs_lane_ids);
+        const uint32_t compute_lhs_id =
+            lhs_vec ? widen_vec(lhs_vec->result_id()) : 0;
+        const uint32_t compute_rhs_id =
+            rhs_vec ? widen_vec(rhs_vec->result_id()) : 0;
+        if (compute_lhs_id == 0 || compute_rhs_id == 0) return 0;
+        accumulator_vec_id =
+            BuildFma(&builder, result_vec2_type_id, compute_lhs_id,
+                     compute_rhs_id, accumulator_vec_id);
+        if (accumulator_vec_id == 0) return 0;
+      }
+      const uint32_t accumulator_id = BuildHorizontalReduce(
+          &builder, result.component_type_id, accumulator_vec_id);
+      if (accumulator_id == 0) return 0;
+      const uint32_t c_id = c_scalar_ids[MatrixFlatIndex(c, row, col)];
+      Instruction* sum =
+          c_id ? builder.AddBinaryOp(result.component_type_id, spv::Op::OpFAdd,
+                                     accumulator_id, c_id)
+               : nullptr;
+      if (!sum) return 0;
+      ApplyActiveFPFastMathMode(sum);
+      scalar_ids[MatrixFlatIndex(result, row, col)] = sum->result_id();
+    }
+  }
+
+  std::vector<uint32_t> piece_ids;
+  if (IsPackedVec2(result)) {
+    piece_ids.reserve(result.rows * result.packed_cols);
+    for (uint32_t row = 0; row < result.rows; ++row) {
+      for (uint32_t pack = 0; pack < result.packed_cols; ++pack) {
+        const uint32_t col = pack * kPackedVec2Width;
+        Instruction* piece = builder.AddCompositeConstruct(
+            result.packed_vec2_type_id,
+            {scalar_ids[MatrixFlatIndex(result, row, col)],
+             scalar_ids[MatrixFlatIndex(result, row, col + 1)]});
+        if (!piece) return 0;
+        piece_ids.push_back(piece->result_id());
+      }
+    }
+  } else {
+    piece_ids = scalar_ids;
+  }
+  Instruction* result_value =
+      builder.AddCompositeConstruct(result.lowered_type_id, piece_ids);
+  if (!result_value || !builder.AddUnaryOp(0, spv::Op::OpReturnValue,
+                                           result_value->result_id())) {
+    return 0;
+  }
+  function->AddBasicBlock(std::move(block));
+  function->SetFunctionEnd(
+      MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                              std::initializer_list<Operand>{}));
+  AddGeneratedFunction(std::move(function), function_id,
+                       /*may_write_memory=*/false);
+  return function_id;
+}
+
 uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunction(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
@@ -2246,6 +2859,18 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunction(
     bool c_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
   if (!CanUseDirectMatrixMulAdd(result, a, b, c)) return 0;
+  const uint64_t mac_count = static_cast<uint64_t>(result.rows) *
+                             static_cast<uint64_t>(result.cols) *
+                             static_cast<uint64_t>(a.cols);
+  if (mac_count <= max_unrolled_matmul_macs_) {
+    return BuildDirectMatrixMatmulFunctionUnrolled(
+        result, a, b, c, a_pointer_id, a_pointer_type_id, a_shape_id,
+        a_offset_id, a_memory_operands, a_constant_id, a_is_value, b_pointer_id,
+        b_pointer_type_id, b_shape_id, b_offset_id, b_memory_operands,
+        b_constant_id, b_is_value, c_pointer_id, c_pointer_type_id, c_shape_id,
+        c_offset_id, c_memory_operands, c_constant_id, c_is_value,
+        value_arguments);
+  }
   if (CanUsePackedVec2MatrixMulAdd(result, a, b, c)) {
     return BuildDirectMatmulFunctionPackedVec2(
         result, a, b, c, a_pointer_id, a_pointer_type_id, a_shape_id,

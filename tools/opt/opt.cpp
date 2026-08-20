@@ -112,7 +112,8 @@ Options (in lexicographical order):)",
                  max-elements=N,max-macs=N,
                  unroll-elements=N,unroll-macs=N
                Values must be positive and each unroll limit must not exceed
-               its corresponding hard limit.)");
+               its corresponding hard limit. unroll-macs also selects
+               unrolled versus rolled matrix/vector direct helpers.)");
   printf(R"(
   --hw-lower-to-standard-extension-free[=<options>]
                Lowers supported HW cooperative matrix/vector ops and types and

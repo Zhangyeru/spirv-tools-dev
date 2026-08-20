@@ -60,7 +60,8 @@ struct HwLowerToStandardOptions {
   uint64_t max_matmul_macs = 16777216;
 
   // Operations above these thresholds are emitted as structured loops rather
-  // than being fully unrolled.
+  // than being fully unrolled. The matmul threshold also selects the rolled
+  // form of matrix/vector direct helpers.
   uint32_t max_unrolled_elements = 4096;
   uint64_t max_unrolled_matmul_macs = 4096;
 };
