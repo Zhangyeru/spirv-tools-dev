@@ -1227,7 +1227,7 @@ Optimizer::PassToken CreateHwLowerToStandardPass(
   const auto mode =
       options.force_scalar_lowering
           ? opt::HwLowerToStandardPass::LoweringMode::kForceScalar
-          : opt::HwLowerToStandardPass::LoweringMode::kPreferPackedVec4;
+          : opt::HwLowerToStandardPass::LoweringMode::kPreferPackedVec2;
   const auto completeness_mode =
       options.completeness == HwLoweringCompleteness::kExtensionFree
           ? opt::HwLowerToStandardPass::CompletenessMode::kExtensionFree

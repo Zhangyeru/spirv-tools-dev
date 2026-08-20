@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -374,8 +373,8 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     return false;
   }
 
-  if ((matrix && !IsPackedVec4(*matrix)) ||
-      (vector && !IsPackedVec4(*vector))) {
+  if ((matrix && !IsPackedVec2(*matrix)) ||
+      (vector && !IsPackedVec2(*vector))) {
     if (is_replicate) inst->SetOpcode(lowered_constituent_opcode);
     std::vector<Operand> operands;
     operands.reserve(scalar_ids.size());
@@ -388,17 +387,17 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   }
 
   // Find insertion point that is after both the scalar constants AND the
-  // packed_vec4_type_id (which may have been created after the scalars).
+  // packed_vec2_type_id (which may have been created after the scalars).
   // Track which appears last in the module order.
   Instruction* insert_after = nullptr;
-  const uint32_t packed_vec4_type_id =
-      matrix ? matrix->packed_vec4_type_id : vector->packed_vec4_type_id;
+  const uint32_t packed_vec2_type_id =
+      matrix ? matrix->packed_vec2_type_id : vector->packed_vec2_type_id;
   for (Instruction& candidate : get_module()->types_values()) {
     const uint32_t candidate_id = candidate.result_id();
     if (candidate_id == 0) continue;
-    // Update insert_after whenever we see a scalar or the packed vec4 type.
+    // Update insert_after whenever we see a scalar or the packed vec2 type.
     // Since we iterate in module order, the last match will be the later one.
-    if (candidate_id == packed_vec4_type_id ||
+    if (candidate_id == packed_vec2_type_id ||
         std::find(scalar_ids.begin(), scalar_ids.end(), candidate_id) !=
             scalar_ids.end()) {
       insert_after = &candidate;
@@ -415,13 +414,13 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     for (uint32_t row = 0; row < matrix->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < matrix->packed_cols; ++col_pack) {
         std::vector<uint32_t> lane_ids;
-        lane_ids.reserve(kPackedVec4Width);
-        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+        lane_ids.reserve(kPackedVec2Width);
+        for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
           lane_ids.push_back(scalar_ids[MatrixFlatIndex(
-              *matrix, row, col_pack * kPackedVec4Width + lane)]);
+              *matrix, row, col_pack * kPackedVec2Width + lane)]);
         }
         const uint32_t element_id = GetOrCreateCompositeConstant(
-            matrix->packed_vec4_type_id, lane_ids, &insert_after,
+            matrix->packed_vec2_type_id, lane_ids, &insert_after, inst,
             lowered_constituent_opcode);
         if (element_id == 0) return false;
         element_ids[MatrixPackedIndex(*matrix, row, col_pack)] = element_id;
@@ -431,12 +430,12 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
     element_ids.resize(vector->packed_length, 0);
     for (uint32_t pack = 0; pack < vector->packed_length; ++pack) {
       std::vector<uint32_t> lane_ids;
-      lane_ids.reserve(kPackedVec4Width);
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-        lane_ids.push_back(scalar_ids[pack * kPackedVec4Width + lane]);
+      lane_ids.reserve(kPackedVec2Width);
+      for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+        lane_ids.push_back(scalar_ids[pack * kPackedVec2Width + lane]);
       }
       element_ids[pack] = GetOrCreateCompositeConstant(
-          vector->packed_vec4_type_id, lane_ids, &insert_after,
+          vector->packed_vec2_type_id, lane_ids, &insert_after, inst,
           lowered_constituent_opcode);
       if (element_ids[pack] == 0) return false;
     }
@@ -500,7 +499,7 @@ bool HwLowerToStandardPass::RemapCompositeIndices(
         ReportError(inst, "HW matrix composite index is out of range");
         return false;
       }
-      if (IsPackedVec4(*matrix)) {
+      if (IsPackedVec2(*matrix)) {
         operands.push_back(
             {SPV_OPERAND_TYPE_LITERAL_INTEGER,
              {MatrixPackedIndex(*matrix, row, VectorPackedIndex(col))}});
@@ -519,7 +518,7 @@ bool HwLowerToStandardPass::RemapCompositeIndices(
         ReportError(inst, "HW vector composite index is out of range");
         return false;
       }
-      if (IsPackedVec4(*vector)) {
+      if (IsPackedVec2(*vector)) {
         operands.push_back(
             {SPV_OPERAND_TYPE_LITERAL_INTEGER, {VectorPackedIndex(index)}});
         operands.push_back(
@@ -598,7 +597,7 @@ bool HwLowerToStandardPass::LowerAccessChain(Instruction* inst) {
     const VectorTypeInfo* vector = GetVectorType(current_type_id);
     if (matrix || vector) {
       const bool packed =
-          matrix ? IsPackedVec4(*matrix) : IsPackedVec4(*vector);
+          matrix ? IsPackedVec2(*matrix) : IsPackedVec2(*vector);
       const uint32_t component_type_id =
           matrix ? matrix->component_type_id : vector->component_type_id;
       if (!packed) {
@@ -616,14 +615,15 @@ bool HwLowerToStandardPass::LowerAccessChain(Instruction* inst) {
                       "most 64 bits");
           return false;
         }
-        const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+        const uint32_t packed_width_id =
+            GetOrCreateConstant(index->type_id(), kPackedVec2Width);
         const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
         Instruction* piece = builder.AddBinaryOp(
             index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
-            index_id, four_id);
+            index_id, packed_width_id);
         Instruction* lane = builder.AddBinaryOp(
             index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
-            index_id, four_id);
+            index_id, packed_width_id);
         if (!piece || !lane) return false;
         operands.push_back(IdOperand(piece->result_id()));
         operands.push_back(IdOperand(lane->result_id()));
@@ -756,7 +756,7 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
   uint32_t piece_index_id = index_id;
   uint32_t lane_id = 0;
   uint32_t piece_type_id = vector->component_type_id;
-  if (IsPackedVec4(*vector)) {
+  if (IsPackedVec2(*vector)) {
     Instruction* index = get_def_use_mgr()->GetDef(index_id);
     Instruction* index_type =
         index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
@@ -764,18 +764,19 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
         index_type->NumInOperands() < 2) {
       return false;
     }
-    const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+    const uint32_t packed_width_id =
+        GetOrCreateConstant(index->type_id(), kPackedVec2Width);
     const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
     Instruction* piece_index = builder.AddBinaryOp(
         index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
-        index_id, four_id);
+        index_id, packed_width_id);
     Instruction* lane = builder.AddBinaryOp(
         index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
-        index_id, four_id);
+        index_id, packed_width_id);
     if (!piece_index || !lane) return false;
     piece_index_id = piece_index->result_id();
     lane_id = lane->result_id();
-    piece_type_id = vector->packed_vec4_type_id;
+    piece_type_id = vector->packed_vec2_type_id;
   }
 
   const uint32_t piece_ptr_type =
@@ -787,7 +788,7 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
       AddLoad(&builder, piece_type_id, pointer->result_id(), {});
   if (piece == 0) return false;
   uint32_t result_id = piece;
-  if (IsPackedVec4(*vector)) {
+  if (IsPackedVec2(*vector)) {
     Instruction* extract =
         builder.AddBinaryOp(vector->component_type_id,
                             spv::Op::OpVectorExtractDynamic, piece, lane_id);
@@ -825,7 +826,7 @@ bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
   uint32_t piece_index_id = index_id;
   uint32_t lane_id = 0;
   uint32_t piece_type_id = vector->component_type_id;
-  if (IsPackedVec4(*vector)) {
+  if (IsPackedVec2(*vector)) {
     Instruction* index = get_def_use_mgr()->GetDef(index_id);
     Instruction* index_type =
         index ? get_def_use_mgr()->GetDef(index->type_id()) : nullptr;
@@ -833,18 +834,19 @@ bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
         index_type->NumInOperands() < 2) {
       return false;
     }
-    const uint32_t four_id = GetOrCreateConstant(index->type_id(), 4);
+    const uint32_t packed_width_id =
+        GetOrCreateConstant(index->type_id(), kPackedVec2Width);
     const bool is_signed = index_type->GetSingleWordInOperand(1) != 0;
     Instruction* piece_index = builder.AddBinaryOp(
         index->type_id(), is_signed ? spv::Op::OpSDiv : spv::Op::OpUDiv,
-        index_id, four_id);
+        index_id, packed_width_id);
     Instruction* lane = builder.AddBinaryOp(
         index->type_id(), is_signed ? spv::Op::OpSRem : spv::Op::OpUMod,
-        index_id, four_id);
+        index_id, packed_width_id);
     if (!piece_index || !lane) return false;
     piece_index_id = piece_index->result_id();
     lane_id = lane->result_id();
-    piece_type_id = vector->packed_vec4_type_id;
+    piece_type_id = vector->packed_vec2_type_id;
   }
 
   const uint32_t piece_ptr_type =
@@ -853,7 +855,7 @@ bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
       piece_ptr_type, variable->result_id(), {piece_index_id});
   if (!pointer) return false;
   uint32_t stored_id = object_id;
-  if (IsPackedVec4(*vector)) {
+  if (IsPackedVec2(*vector)) {
     const uint32_t old_piece =
         AddLoad(&builder, piece_type_id, pointer->result_id(), {});
     Instruction* inserted =
@@ -888,13 +890,13 @@ uint32_t HwLowerToStandardPass::ExtractVectorScalar(InstructionBuilder* builder,
                                                     const VectorTypeInfo& info,
                                                     uint32_t vector_id,
                                                     uint32_t index) {
-  if (!IsPackedVec4(info)) {
+  if (!IsPackedVec2(info)) {
     return ExtractCompositeElement(builder, info.component_type_id, vector_id,
                                    index);
   }
 
   const uint32_t vec_id = ExtractCompositeElement(
-      builder, info.packed_vec4_type_id, vector_id, VectorPackedIndex(index));
+      builder, info.packed_vec2_type_id, vector_id, VectorPackedIndex(index));
   if (vec_id == 0) return 0;
   return ExtractCompositeElement(builder, info.component_type_id, vec_id,
                                  PackedLane(index));
@@ -905,13 +907,13 @@ uint32_t HwLowerToStandardPass::ExtractMatrixScalar(InstructionBuilder* builder,
                                                     uint32_t matrix_id,
                                                     uint32_t row,
                                                     uint32_t col) {
-  if (!IsPackedVec4(info)) {
+  if (!IsPackedVec2(info)) {
     return ExtractCompositeElement(builder, info.component_type_id, matrix_id,
                                    MatrixFlatIndex(info, row, col));
   }
 
   const uint32_t vec_id = ExtractCompositeElement(
-      builder, info.packed_vec4_type_id, matrix_id,
+      builder, info.packed_vec2_type_id, matrix_id,
       MatrixPackedIndex(info, row, VectorPackedIndex(col)));
   if (vec_id == 0) return 0;
   return ExtractCompositeElement(builder, info.component_type_id, vec_id,
@@ -930,11 +932,11 @@ bool HwLowerToStandardPass::DescribeVectorValue(uint32_t value_id,
   if (const VectorTypeInfo* info = GetVectorType(value->type_id())) {
     if (info->length != expected_length) return false;
     layout->component_type_id = info->component_type_id;
-    layout->piece_type_id = IsPackedVec4(*info) ? info->packed_vec4_type_id
+    layout->piece_type_id = IsPackedVec2(*info) ? info->packed_vec2_type_id
                                                 : info->component_type_id;
     layout->piece_count =
-        IsPackedVec4(*info) ? info->packed_length : info->length;
-    layout->packed_vec4 = IsPackedVec4(*info);
+        IsPackedVec2(*info) ? info->packed_length : info->length;
+    layout->packed_vec2 = IsPackedVec2(*info);
     return true;
   }
 
@@ -955,12 +957,12 @@ bool HwLowerToStandardPass::DescribeVectorValue(uint32_t value_id,
 
   if (element_type->opcode() == spv::Op::OpTypeVector &&
       element_type->NumInOperands() >= 2 &&
-      element_type->GetSingleWordInOperand(1) == kPackedVec4Width) {
-    if (array_length * kPackedVec4Width != expected_length) return false;
+      element_type->GetSingleWordInOperand(1) == kPackedVec2Width) {
+    if (array_length * kPackedVec2Width != expected_length) return false;
     layout->component_type_id = element_type->GetSingleWordInOperand(0);
     layout->piece_type_id = element_type->result_id();
     layout->piece_count = array_length;
-    layout->packed_vec4 = true;
+    layout->packed_vec2 = true;
     return true;
   }
 
@@ -970,7 +972,7 @@ bool HwLowerToStandardPass::DescribeVectorValue(uint32_t value_id,
   layout->component_type_id = element_type->result_id();
   layout->piece_type_id = element_type->result_id();
   layout->piece_count = array_length;
-  layout->packed_vec4 = false;
+  layout->packed_vec2 = false;
   return true;
 }
 
@@ -989,11 +991,11 @@ bool HwLowerToStandardPass::DescribeMatrixValue(uint32_t value_id,
       return false;
     }
     layout->component_type_id = info->component_type_id;
-    layout->piece_type_id = IsPackedVec4(*info) ? info->packed_vec4_type_id
+    layout->piece_type_id = IsPackedVec2(*info) ? info->packed_vec2_type_id
                                                 : info->component_type_id;
-    layout->piece_count = IsPackedVec4(*info) ? info->rows * info->packed_cols
+    layout->piece_count = IsPackedVec2(*info) ? info->rows * info->packed_cols
                                               : info->rows * info->cols;
-    layout->packed_vec4 = IsPackedVec4(*info);
+    layout->packed_vec2 = IsPackedVec2(*info);
     return true;
   }
 
@@ -1014,15 +1016,15 @@ bool HwLowerToStandardPass::DescribeMatrixValue(uint32_t value_id,
 
   if (element_type->opcode() == spv::Op::OpTypeVector &&
       element_type->NumInOperands() >= 2 &&
-      element_type->GetSingleWordInOperand(1) == kPackedVec4Width) {
-    if (expected_cols % kPackedVec4Width != 0 ||
-        array_length * kPackedVec4Width != expected_rows * expected_cols) {
+      element_type->GetSingleWordInOperand(1) == kPackedVec2Width) {
+    if (expected_cols % kPackedVec2Width != 0 ||
+        array_length * kPackedVec2Width != expected_rows * expected_cols) {
       return false;
     }
     layout->component_type_id = element_type->GetSingleWordInOperand(0);
     layout->piece_type_id = element_type->result_id();
     layout->piece_count = array_length;
-    layout->packed_vec4 = true;
+    layout->packed_vec2 = true;
     return true;
   }
 
@@ -1033,7 +1035,7 @@ bool HwLowerToStandardPass::DescribeMatrixValue(uint32_t value_id,
   layout->component_type_id = element_type->result_id();
   layout->piece_type_id = element_type->result_id();
   layout->piece_count = array_length;
-  layout->packed_vec4 = false;
+  layout->packed_vec2 = false;
   return true;
 }
 
@@ -1048,7 +1050,7 @@ uint32_t HwLowerToStandardPass::ExtractValuePiece(InstructionBuilder* builder,
 uint32_t HwLowerToStandardPass::ExtractVectorValueScalar(
     InstructionBuilder* builder, const ValueLayout& layout, uint32_t value_id,
     uint32_t index) {
-  if (!layout.packed_vec4) {
+  if (!layout.packed_vec2) {
     return ExtractValuePiece(builder, layout, value_id, index);
   }
 
@@ -1062,11 +1064,11 @@ uint32_t HwLowerToStandardPass::ExtractVectorValueScalar(
 uint32_t HwLowerToStandardPass::ExtractMatrixValueScalar(
     InstructionBuilder* builder, const ValueLayout& layout, uint32_t value_id,
     uint32_t cols, uint32_t row, uint32_t col) {
-  if (!layout.packed_vec4) {
+  if (!layout.packed_vec2) {
     return ExtractValuePiece(builder, layout, value_id, row * cols + col);
   }
 
-  const uint32_t packed_cols = cols / kPackedVec4Width;
+  const uint32_t packed_cols = cols / kPackedVec2Width;
   const uint32_t piece_id = ExtractValuePiece(
       builder, layout, value_id, row * packed_cols + VectorPackedIndex(col));
   if (piece_id == 0) return 0;
@@ -1079,8 +1081,8 @@ bool HwLowerToStandardPass::RebuildVectorFromScalars(
     const std::vector<uint32_t>& scalar_ids) {
   return RebuildAggregateFromScalars(
       inst, info.lowered_type_id,
-      IsPackedVec4(info) ? info.packed_vec4_type_id : 0,
-      IsPackedVec4(info) ? info.packed_length : 0, info.length, scalar_ids,
+      IsPackedVec2(info) ? info.packed_vec2_type_id : 0,
+      IsPackedVec2(info) ? info.packed_length : 0, info.length, scalar_ids,
       "invalid HW vector scalar rebuild");
 }
 
@@ -1089,23 +1091,23 @@ bool HwLowerToStandardPass::RebuildMatrixFromScalars(
     const std::vector<uint32_t>& scalar_ids) {
   return RebuildAggregateFromScalars(
       inst, info.lowered_type_id,
-      IsPackedVec4(info) ? info.packed_vec4_type_id : 0,
-      IsPackedVec4(info) ? info.rows * info.packed_cols : 0,
+      IsPackedVec2(info) ? info.packed_vec2_type_id : 0,
+      IsPackedVec2(info) ? info.rows * info.packed_cols : 0,
       info.rows * info.cols, scalar_ids, "invalid HW matrix scalar rebuild");
 }
 
 bool HwLowerToStandardPass::RebuildAggregateFromScalars(
-    Instruction* inst, uint32_t lowered_type_id, uint32_t packed_vec4_type_id,
+    Instruction* inst, uint32_t lowered_type_id, uint32_t packed_vec2_type_id,
     uint32_t packed_piece_count, uint32_t expected_scalar_count,
     const std::vector<uint32_t>& scalar_ids, const char* error_message) {
   if (scalar_ids.size() != expected_scalar_count ||
-      (packed_vec4_type_id != 0 &&
-       packed_piece_count * kPackedVec4Width != expected_scalar_count)) {
+      (packed_vec2_type_id != 0 &&
+       packed_piece_count * kPackedVec2Width != expected_scalar_count)) {
     ReportError(inst, error_message);
     return false;
   }
 
-  if (packed_vec4_type_id == 0) {
+  if (packed_vec2_type_id == 0) {
     RebuildAsCompositeConstruct(inst, lowered_type_id, scalar_ids);
     return true;
   }
@@ -1117,12 +1119,12 @@ bool HwLowerToStandardPass::RebuildAggregateFromScalars(
   piece_ids.reserve(packed_piece_count);
   for (uint32_t piece = 0; piece < packed_piece_count; ++piece) {
     std::vector<uint32_t> lane_ids;
-    lane_ids.reserve(kPackedVec4Width);
-    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-      lane_ids.push_back(scalar_ids[piece * kPackedVec4Width + lane]);
+    lane_ids.reserve(kPackedVec2Width);
+    for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+      lane_ids.push_back(scalar_ids[piece * kPackedVec2Width + lane]);
     }
     Instruction* vec =
-        builder.AddCompositeConstruct(packed_vec4_type_id, lane_ids);
+        builder.AddCompositeConstruct(packed_vec2_type_id, lane_ids);
     if (!vec) return false;
     piece_ids.push_back(vec->result_id());
   }
@@ -1132,20 +1134,20 @@ bool HwLowerToStandardPass::RebuildAggregateFromScalars(
 
 uint32_t HwLowerToStandardPass::BuildMatrixRowVector(
     InstructionBuilder* builder, const MatrixTypeInfo& info, uint32_t matrix_id,
-    uint32_t row, uint32_t col_start, uint32_t vec4_type_id) {
-  if (IsPackedVec4(info) && col_start % kPackedVec4Width == 0 &&
-      col_start + kPackedVec4Width <= info.cols &&
-      info.packed_vec4_type_id == vec4_type_id) {
+    uint32_t row, uint32_t col_start, uint32_t vec2_type_id) {
+  if (IsPackedVec2(info) && col_start % kPackedVec2Width == 0 &&
+      col_start + kPackedVec2Width <= info.cols &&
+      info.packed_vec2_type_id == vec2_type_id) {
     return ExtractCompositeElement(
-        builder, vec4_type_id, matrix_id,
-        MatrixPackedIndex(info, row, col_start / kPackedVec4Width));
+        builder, vec2_type_id, matrix_id,
+        MatrixPackedIndex(info, row, col_start / kPackedVec2Width));
   }
 
   const uint32_t zero_id = GetOrCreateZero(info.component_type_id);
   if (zero_id == 0) return 0;
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     const uint32_t col = col_start + lane;
     const uint32_t value_id =
         col < info.cols
@@ -1154,19 +1156,19 @@ uint32_t HwLowerToStandardPass::BuildMatrixRowVector(
     if (value_id == 0) return 0;
     lane_ids.push_back(value_id);
   }
-  Instruction* vec = builder->AddCompositeConstruct(vec4_type_id, lane_ids);
+  Instruction* vec = builder->AddCompositeConstruct(vec2_type_id, lane_ids);
   return vec ? vec->result_id() : 0;
 }
 
 uint32_t HwLowerToStandardPass::BuildMatrixColumnVector(
     InstructionBuilder* builder, const MatrixTypeInfo& info, uint32_t matrix_id,
-    uint32_t row_start, uint32_t col, uint32_t vec4_type_id) {
+    uint32_t row_start, uint32_t col, uint32_t vec2_type_id) {
   const uint32_t zero_id = GetOrCreateZero(info.component_type_id);
   if (zero_id == 0) return 0;
 
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     const uint32_t row = row_start + lane;
     const uint32_t value_id =
         row < info.rows && col < info.cols
@@ -1175,7 +1177,7 @@ uint32_t HwLowerToStandardPass::BuildMatrixColumnVector(
     if (value_id == 0) return 0;
     lane_ids.push_back(value_id);
   }
-  Instruction* vec = builder->AddCompositeConstruct(vec4_type_id, lane_ids);
+  Instruction* vec = builder->AddCompositeConstruct(vec2_type_id, lane_ids);
   return vec ? vec->result_id() : 0;
 }
 

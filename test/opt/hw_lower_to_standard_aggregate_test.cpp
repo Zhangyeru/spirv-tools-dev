@@ -125,10 +125,10 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v4float %uint_4"));
+            disassembly.find("OpTypeArray %v2float %uint_8"));
   EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_16"));
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v4float %uint_2"));
+            disassembly.find("OpTypeArray %v2float %uint_4"));
   EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_8"));
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpBitcast %uint"));
@@ -201,7 +201,46 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(4u, CountSubstring(disassembly, "OpConstantComposite %v4float"));
+  EXPECT_EQ(7u, CountSubstring(disassembly, "OpConstantComposite %v2float"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       PackedConstantDoesNotReuseLaterCompositeConstituent) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_8 = OpConstant %uint 8
+%float = OpTypeFloat 32
+%float_0 = OpConstant %float 0
+%v2float = OpTypeVector %float 2
+%vec8 = OpTypeCooperativeVectorHW %float %uint_8
+%early = OpConstantComposite %vec8 %float_0 %float_0 %float_0 %float_0
+    %float_0 %float_0 %float_0 %float_0
+%late = OpConstantComposite %v2float %float_0 %float_0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  const size_t packed_piece = disassembly.find("OpConstantComposite %v2float");
+  const size_t packed_array =
+      disassembly.find("OpConstantComposite %_arr_v2float_uint_4");
+  ASSERT_NE(std::string::npos, packed_piece);
+  ASSERT_NE(std::string::npos, packed_array);
+  EXPECT_LT(packed_piece, packed_array);
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -209,8 +248,8 @@ TEST_F(HwLowerToStandardTest,
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK-NOT: OpConstantCompositeReplicateEXT
-; CHECK: OpConstantComposite %v4half
-; CHECK: OpExtInst %v4half
+; CHECK: OpConstantComposite %v2half
+; CHECK: OpExtInst %v2half
 OpCapability Shader
 OpCapability Float16
 OpCapability ReplicatedCompositesEXT
@@ -241,19 +280,23 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpConstantCompositeReplicateEXT"));
-  EXPECT_GT(CountSubstring(disassembly, "OpConstantComposite %v4half"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v4half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpConstantComposite %v2half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
 }
 
 TEST_F(HwLowerToStandardTest, LowerCompositeConstructPackedF16Matrix) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: OpTypeVector %half 4
-; CHECK: OpTypeArray %v4half %uint_4
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpTypeVector %half 2
+; CHECK: OpTypeArray %v2half %uint_8
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixHW
@@ -299,10 +342,16 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeConstructPackedF32Matrix) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: OpTypeVector %float 4
-; CHECK: OpTypeArray %v4float %uint_4
-; CHECK: OpCompositeConstruct %v4float {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4float {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpTypeVector %float 2
+; CHECK: OpTypeArray %v2float %uint_8
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -391,10 +440,12 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeConstructPackedF16Vector) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: OpTypeVector %half 4
-; CHECK: OpTypeArray %v4half %uint_2
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4half {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpTypeVector %half 2
+; CHECK: OpTypeArray %v2half %uint_4
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2half {{%\w+}} {{%\w+}}
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorHW
@@ -431,10 +482,12 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeConstructPackedF32Vector) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: OpTypeVector %float 4
-; CHECK: OpTypeArray %v4float %uint_2
-; CHECK: OpCompositeConstruct %v4float {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
-; CHECK: OpCompositeConstruct %v4float {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpTypeVector %float 2
+; CHECK: OpTypeArray %v2float %uint_4
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
+; CHECK: OpCompositeConstruct %v2float {{%\w+}} {{%\w+}}
 OpCapability Shader
 OpCapability CooperativeVectorHW
 OpExtension "SPV_HW_neural_shader"
@@ -534,11 +587,11 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v4float %uint_4"));
+            disassembly.find("OpTypeArray %v2float %uint_8"));
   EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %float %uint_15"));
-  EXPECT_EQ(4u, CountSubstring(disassembly, "OpCompositeConstruct %v4float"));
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpCompositeConstruct %v2float"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpCompositeConstruct %_arr_v4float_uint_4"));
+                               "OpCompositeConstruct %_arr_v2float_uint_8"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
                                "OpCompositeConstruct %_arr_float_uint_15"));
 }
@@ -569,14 +622,14 @@ OpFunctionEnd
 )";
 
   auto unrolled = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u, 1024ull,
       8u, 1024ull);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(unrolled));
   ExpectNoHwOrCoopMatrix(std::get<0>(unrolled));
   EXPECT_EQ(0u, CountSubstring(std::get<0>(unrolled), "OpLoopMerge"));
-  EXPECT_EQ(2u, CountSubstring(std::get<0>(unrolled),
-                               "OpCompositeConstruct %v4float"));
+  EXPECT_EQ(4u, CountSubstring(std::get<0>(unrolled),
+                               "OpCompositeConstruct %v2float"));
 
   auto looped = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
       text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar,
@@ -591,7 +644,7 @@ OpFunctionEnd
   EXPECT_NE(std::string::npos,
             std::get<0>(looped).find("OpTypeArray %float %uint_8"));
   EXPECT_EQ(std::string::npos,
-            std::get<0>(looped).find("OpTypeVector %float 4"));
+            std::get<0>(looped).find("OpTypeVector %float 2"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -654,14 +707,14 @@ OpExecutionMode %main LocalSize 1 1 1
 %f6 = OpUndef %float
 %f7 = OpUndef %float
 %v3float = OpTypeVector %float 3
-%v4float = OpTypeVector %float 4
+%ordinary_v4float = OpTypeVector %float 4
 %vec8 = OpTypeCooperativeVectorHW %float %uint_8
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
 %entry = OpLabel
 %three = OpCompositeConstruct %v3float %f1 %f2 %f3
-%four = OpCompositeConstruct %v4float %f4 %f5 %f6 %f7
+%four = OpCompositeConstruct %ordinary_v4float %f4 %f5 %f6 %f7
 %mixed = OpCompositeConstruct %vec8 %f0 %three %four
 OpReturn
 OpFunctionEnd
@@ -673,10 +726,10 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v4float %uint_2"));
+            disassembly.find("OpTypeArray %v2float %uint_4"));
   EXPECT_EQ(7u, CountSubstring(disassembly, "OpCompositeExtract %float"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpCompositeConstruct %_arr_v4float_uint_2"));
+                               "OpCompositeConstruct %_arr_v2float_uint_4"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -692,9 +745,9 @@ OpExecutionMode %main LocalSize 1 1 1
 %uint_1 = OpConstant %uint 1
 %uint_4 = OpConstant %uint 4
 %float = OpTypeFloat 32
-%v4float = OpTypeVector %float 4
+%ordinary_v4float = OpTypeVector %float 4
 %vec4 = OpTypeCooperativeVectorHW %float %uint_4
-%ordinary = OpUndef %v4float
+%ordinary = OpUndef %ordinary_v4float
 %void = OpTypeVoid
 %fn = OpTypeFunction %void
 %main = OpFunction %void None %fn
@@ -706,7 +759,7 @@ OpFunctionEnd
 )";
 
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u, 1024ull,
       2u, 1024ull);
   const std::string& disassembly = std::get<0>(result);
@@ -714,7 +767,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpCompositeConstruct %_arr_v4float_uint_1"));
+                               "OpCompositeConstruct %_arr_v2float_uint_2"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -756,14 +809,14 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  // The four identical matrix packs share one specialized vec4 constant;
-  // the vector contributes two distinct packs.
-  EXPECT_EQ(3u,
-            CountSubstring(disassembly, "OpSpecConstantComposite %v4float"));
+  // The eight identical matrix packs share one specialized vec2 constant;
+  // the vector contributes four distinct packs.
+  EXPECT_EQ(5u,
+            CountSubstring(disassembly, "OpSpecConstantComposite %v2float"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpSpecConstantComposite %_arr_v4float_uint_4"));
+                               "OpSpecConstantComposite %_arr_v2float_uint_8"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpSpecConstantComposite %_arr_v4float_uint_2"));
+                               "OpSpecConstantComposite %_arr_v2float_uint_4"));
 }
 
 TEST_F(HwLowerToStandardTest, DefaultPreferPackedFallsBackToScalarF16Matrix) {
@@ -806,7 +859,7 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 2"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -846,14 +899,14 @@ OpFunctionEnd
       text, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 2"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowerCompositeExtractPackedF16Matrix) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpCompositeExtract %half {{%\w+}} 7 2
+; CHECK: {{%\w+}} = OpCompositeExtract %half {{%\w+}} 15 0
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixHW
@@ -882,7 +935,7 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeExtractPackedF32Matrix) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpCompositeExtract %float {{%\w+}} 7 2
+; CHECK: {{%\w+}} = OpCompositeExtract %float {{%\w+}} 15 0
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -939,7 +992,7 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeExtractPackedF16Vector) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpCompositeExtract %half {{%\w+}} 1 2
+; CHECK: {{%\w+}} = OpCompositeExtract %half {{%\w+}} 3 0
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorHW
@@ -968,7 +1021,7 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerCompositeExtractPackedF32Vector) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpCompositeExtract %float {{%\w+}} 1 2
+; CHECK: {{%\w+}} = OpCompositeExtract %float {{%\w+}} 3 0
 OpCapability Shader
 OpCapability CooperativeVectorHW
 OpExtension "SPV_HW_neural_shader"
@@ -1054,13 +1107,13 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowerConstantNullPackedMatrix) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpConstantNull %_arr_v4half_uint_16
+; CHECK: {{%\w+}} = OpConstantNull %_arr_v2half_uint_32
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixHW
@@ -1089,7 +1142,7 @@ OpFunctionEnd
 TEST_F(HwLowerToStandardTest, LowerUndefPackedVector) {
   const std::string text = R"(
 ; CHECK-NOT: HW
-; CHECK: {{%\w+}} = OpUndef %_arr_v4half_uint_2
+; CHECK: {{%\w+}} = OpUndef %_arr_v2half_uint_4
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeVectorHW
@@ -1146,9 +1199,9 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConstantComposite %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConstantComposite %v2float"));
   EXPECT_EQ(2u, CountSubstring(disassembly,
-                               "OpConstantComposite %_arr_v4float_uint_1"));
+                               "OpConstantComposite %_arr_v2float_uint_2"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -1239,9 +1292,9 @@ OpFunctionEnd
   EXPECT_EQ(0u,
             CountSubstring(disassembly, "OpSpecConstantCompositeReplicateEXT"));
   EXPECT_EQ(1u,
-            CountSubstring(disassembly, "OpSpecConstantComposite %v4float"));
+            CountSubstring(disassembly, "OpSpecConstantComposite %v2float"));
   EXPECT_EQ(1u, CountSubstring(disassembly,
-                               "OpSpecConstantComposite %_arr_v4float_uint_2"));
+                               "OpSpecConstantComposite %_arr_v2float_uint_4"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersHwFunctionParameterAndCall) {
@@ -1279,7 +1332,7 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpFunctionParameter %_arr_v4float_uint_4"));
+            disassembly.find("OpFunctionParameter %_arr_v2float_uint_8"));
   EXPECT_NE(std::string::npos, disassembly.find("OpFunctionCall %void"));
 }
 
@@ -1432,9 +1485,9 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpPhi %_arr_v4float_uint_4"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpPhi %_arr_v2float_uint_8"));
   EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 1u);
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v4float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v2float"), 0u);
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -1569,19 +1622,19 @@ OpFunctionEnd
 
   SetTargetEnv(SPV_ENV_UNIVERSAL_1_3);
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1024u, 1024ull,
       4u, 1024ull);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %bool 4"));
-  const size_t splat = disassembly.find("OpCompositeConstruct %v4bool");
+  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %bool 2"));
+  const size_t splat = disassembly.find("OpCompositeConstruct %v2bool");
   const size_t loop_merge = disassembly.find("OpLoopMerge");
   ASSERT_NE(std::string::npos, splat);
   ASSERT_NE(std::string::npos, loop_merge);
   EXPECT_LT(splat, loop_merge);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSelect %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSelect %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersCompositeInsertOnHwValue) {
@@ -1662,13 +1715,13 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v4float %uint_2"));
-  EXPECT_GE(CountSubstring(disassembly, "OpPhi %_arr_v4float_uint_2"), 1u);
+            disassembly.find("OpTypeArray %v2float %uint_4"));
+  EXPECT_GE(CountSubstring(disassembly, "OpPhi %_arr_v2float_uint_4"), 1u);
   EXPECT_GT(CountSubstring(disassembly, "OpSelect"), 0u);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpCompositeInsert"));
   EXPECT_NE(
       std::string::npos,
-      disassembly.find("OpCompositeInsert %_arr_v4float_uint_2 %float_1"));
+      disassembly.find("OpCompositeInsert %_arr_v2float_uint_4 %float_1"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -1716,10 +1769,10 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpCompositeExtract %float"));
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpCompositeInsert"));
-  EXPECT_NE(std::string::npos, disassembly.find(" 1 0 1 3 2"));
-  EXPECT_NE(std::string::npos, disassembly.find(" 1 1 1 2"));
-  EXPECT_NE(std::string::npos, disassembly.find(" 1 0 0 1 1"));
-  EXPECT_NE(std::string::npos, disassembly.find(" 1 1 1 1"));
+  EXPECT_NE(std::string::npos, disassembly.find(" 1 0 1 7 0"));
+  EXPECT_NE(std::string::npos, disassembly.find(" 1 1 3 0"));
+  EXPECT_NE(std::string::npos, disassembly.find(" 1 0 0 2 1"));
+  EXPECT_NE(std::string::npos, disassembly.find(" 1 1 2 1"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -1806,7 +1859,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpUDiv %ulong"));
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpUMod %ulong"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorInsertDynamic %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorInsertDynamic %v2float"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
 }
 

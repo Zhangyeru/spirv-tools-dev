@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -116,14 +115,14 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     return false;
   }
 
-  const bool result_packed = result_vector ? IsPackedVec4(*result_vector)
-                                           : IsPackedVec4(*result_matrix);
+  const bool result_packed = result_vector ? IsPackedVec2(*result_vector)
+                                           : IsPackedVec2(*result_matrix);
   const uint32_t result_component_type_id =
       result_vector ? result_vector->component_type_id
                     : result_matrix->component_type_id;
   const uint32_t result_piece_type_id =
-      result_packed ? (result_vector ? result_vector->packed_vec4_type_id
-                                     : result_matrix->packed_vec4_type_id)
+      result_packed ? (result_vector ? result_vector->packed_vec2_type_id
+                                     : result_matrix->packed_vec2_type_id)
                     : result_component_type_id;
   const uint32_t result_piece_count =
       result_vector
@@ -314,10 +313,10 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
 
   Instruction* type_insertion_point = &*(--context()->types_values_end());
   for (LoopOperand& operand : loop_operands) {
-    if (result_packed && !operand.layout.packed_vec4) {
+    if (result_packed && !operand.layout.packed_vec2) {
       operand.loop_piece_type_id =
           GetOrCreateVectorType(operand.layout.component_type_id,
-                                kPackedVec4Width, &type_insertion_point);
+                                kPackedVec2Width, &type_insertion_point);
       if (operand.loop_piece_type_id == 0) return false;
     }
     operand.scalar_pointer_type_id = GetOrCreatePointerType(
@@ -344,18 +343,19 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     Instruction* bool_type = get_def_use_mgr()->GetDef(bool_type_id);
     if (bool_type) {
       packed_select_condition_type_id =
-          GetOrCreateVectorType(bool_type_id, kPackedVec4Width, &bool_type);
+          GetOrCreateVectorType(bool_type_id, kPackedVec2Width, &bool_type);
     }
   }
   const uint32_t zero_id = GetOrCreateUIntConstant(0);
   const uint32_t one_id = GetOrCreateUIntConstant(1);
-  const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_id = GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t piece_count_id = GetOrCreateUIntConstant(result_piece_count);
   if (result_pointer_type_id == 0 || result_piece_pointer_type_id == 0 ||
       uint_type_id == 0 || uint_pointer_type_id == 0 || bool_type_id == 0 ||
       (kind == ElementwiseLoopKind::kSelect && result_packed &&
        packed_select_condition_type_id == 0) ||
-      zero_id == 0 || one_id == 0 || four_id == 0 || piece_count_id == 0) {
+      zero_id == 0 || one_id == 0 || packed_width_id == 0 ||
+      piece_count_id == 0) {
     return false;
   }
 
@@ -463,7 +463,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   auto load_scalar = [&](const LoopOperand& operand,
                          uint32_t logical_index_id) -> uint32_t {
-    if (!operand.layout.packed_vec4) {
+    if (!operand.layout.packed_vec2) {
       Instruction* pointer =
           body_builder.AddAccessChain(operand.scalar_pointer_type_id,
                                       operand.variable_id, {logical_index_id});
@@ -475,9 +475,9 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     }
 
     Instruction* packed_index = body_builder.AddBinaryOp(
-        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
-    Instruction* lane = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUMod,
-                                                 logical_index_id, four_id);
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, packed_width_id);
+    Instruction* lane = body_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpUMod, logical_index_id, packed_width_id);
     if (!packed_index || !lane) return 0;
     Instruction* pointer = body_builder.AddAccessChain(
         operand.piece_pointer_type_id, operand.variable_id,
@@ -496,7 +496,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
 
   auto load_for_result_piece = [&](const LoopOperand& operand) -> uint32_t {
     if (!result_packed) return load_scalar(operand, index->result_id());
-    if (operand.layout.packed_vec4) {
+    if (operand.layout.packed_vec2) {
       Instruction* pointer = body_builder.AddAccessChain(
           operand.piece_pointer_type_id, operand.variable_id,
           {index->result_id()});
@@ -507,12 +507,12 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
       return value ? value->result_id() : 0;
     }
 
-    Instruction* base = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpIMul,
-                                                 index->result_id(), four_id);
+    Instruction* base = body_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpIMul, index->result_id(), packed_width_id);
     if (!base) return 0;
     std::vector<uint32_t> constituents;
-    constituents.reserve(kPackedVec4Width);
-    for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+    constituents.reserve(kPackedVec2Width);
+    for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
       uint32_t logical_index_id = base->result_id();
       if (lane != 0) {
         const uint32_t lane_id = GetOrCreateUIntConstant(lane);

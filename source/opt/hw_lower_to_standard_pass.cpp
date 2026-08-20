@@ -92,7 +92,7 @@ Pass::Status HwLowerToStandardPass::Process() {
 
   if (!PreflightNoContractionVectorMatmul()) return Status::Failure;
 
-  if (lowering_mode_ == LoweringMode::kPreferPackedVec4) {
+  if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
     HwFuseTwoLayerVectorMatmulPass fusion(max_unrolled_matmul_macs_);
     fusion.SetMessageConsumer(consumer());
     if (fusion.Run(context()) == Status::Failure) return Status::Failure;
@@ -183,10 +183,10 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         ok = TryLowerDirectMatrixMulAdd(inst, &handled);
         break;
       case spv::Op::OpCooperativeVectorMatrixMulHW:
-        ok = TryLowerDirectVectorMatrixMulPackedVec4(inst, false, &handled);
+        ok = TryLowerDirectVectorMatrixMulPackedVec2(inst, false, &handled);
         break;
       case spv::Op::OpCooperativeVectorMatrixMulAddHW:
-        ok = TryLowerDirectVectorMatrixMulPackedVec4(inst, true, &handled);
+        ok = TryLowerDirectVectorMatrixMulPackedVec2(inst, true, &handled);
         break;
       default:
         break;

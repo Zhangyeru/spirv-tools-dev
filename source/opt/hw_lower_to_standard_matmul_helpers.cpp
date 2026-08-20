@@ -46,7 +46,7 @@ using namespace hw_lower_internal;
 
 bool HwLowerToStandardPass::PrepareMatmulPatternFunctions() {
   // Validation only — pattern functions are created lazily via
-  // GetOrCreateMatmulPatternFunctionPackedVec4 when needed (by the direct
+  // GetOrCreateMatmulPatternFunctionPackedVec2 when needed (by the direct
   // matmul path or the non-fused store path).  This avoids generating dead
   // pattern functions for matmuls that will be handled by the fused
   // matrix-matmul-store path in LowerHwInstructions.
@@ -173,7 +173,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateFunctionType(
   return type_id;
 }
 
-uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec2(
     const MatrixTypeInfo& matrix) {
   const std::string key = TileWeightFunctionKey(matrix);
   auto cached = tile_weight_functions_.find(key);
@@ -183,7 +183,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
       get_def_use_mgr()->GetDef(matrix.lowered_type_id);
   if (!insertion_point) return 0;
   const uint32_t weight_array_type_id = GetOrCreatePackedArrayType(
-      matrix.packed_vec4_type_id, kPackedVec4Width, insertion_point);
+      matrix.packed_vec2_type_id, kPackedVec2Width, insertion_point);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t function_type_id = GetOrCreateFunctionType(
       weight_array_type_id,
@@ -227,10 +227,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
   InstructionBuilder builder(context(), block.get());
   const uint32_t matrix_ptr_type_id = GetOrCreatePointerType(
       matrix.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_ptr_type_id = GetOrCreatePointerType(
-      matrix.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_ptr_type_id = GetOrCreatePointerType(
+      matrix.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t packed_cols_id = GetOrCreateUIntConstant(matrix.packed_cols);
-  if (matrix_ptr_type_id == 0 || vec4_ptr_type_id == 0 || packed_cols_id == 0) {
+  if (matrix_ptr_type_id == 0 || vec2_ptr_type_id == 0 || packed_cols_id == 0) {
     return 0;
   }
 
@@ -240,8 +240,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
   if (!builder.AddStore(matrix_var->result_id(), matrix_param_id)) return 0;
 
   std::vector<uint32_t> weight_vec_ids;
-  weight_vec_ids.reserve(kPackedVec4Width);
-  for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+  weight_vec_ids.reserve(kPackedVec2Width);
+  for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
     const uint32_t row_lane_id = GetOrCreateUIntConstant(row_lane);
     if (row_lane_id == 0) return 0;
     Instruction* row = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
@@ -255,10 +255,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
                             row_offset->result_id(), col_pack_param_id);
     if (!flat_index) return 0;
     Instruction* vec_ptr = builder.AddAccessChain(
-        vec4_ptr_type_id, matrix_var->result_id(), {flat_index->result_id()});
+        vec2_ptr_type_id, matrix_var->result_id(), {flat_index->result_id()});
     if (!vec_ptr) return 0;
     Instruction* vec =
-        builder.AddLoad(matrix.packed_vec4_type_id, vec_ptr->result_id());
+        builder.AddLoad(matrix.packed_vec2_type_id, vec_ptr->result_id());
     if (!vec) return 0;
     weight_vec_ids.push_back(vec->result_id());
   }
@@ -281,7 +281,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateTileWeightFunctionPackedVec4(
   return function_id;
 }
 
-uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec2(
     const MatrixTypeInfo& matrix) {
   const std::string key = MatmulTileWeightFunctionKey(matrix);
   auto cached = matmul_tile_weight_functions_.find(key);
@@ -291,7 +291,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
       get_def_use_mgr()->GetDef(matrix.lowered_type_id);
   if (!insertion_point) return 0;
   const uint32_t weight_array_type_id = GetOrCreatePackedArrayType(
-      matrix.packed_vec4_type_id, kPackedVec4Width, insertion_point);
+      matrix.packed_vec2_type_id, kPackedVec2Width, insertion_point);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t function_type_id = GetOrCreateFunctionType(
       weight_array_type_id,
@@ -335,10 +335,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
   InstructionBuilder builder(context(), block.get());
   const uint32_t matrix_ptr_type_id = GetOrCreatePointerType(
       matrix.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_ptr_type_id = GetOrCreatePointerType(
-      matrix.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_ptr_type_id = GetOrCreatePointerType(
+      matrix.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t packed_cols_id = GetOrCreateUIntConstant(matrix.packed_cols);
-  if (matrix_ptr_type_id == 0 || vec4_ptr_type_id == 0 || packed_cols_id == 0) {
+  if (matrix_ptr_type_id == 0 || vec2_ptr_type_id == 0 || packed_cols_id == 0) {
     return 0;
   }
 
@@ -348,11 +348,11 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
   if (!builder.AddStore(matrix_var->result_id(), matrix_param_id)) return 0;
 
   std::vector<uint32_t> weight_vec_ids;
-  weight_vec_ids.reserve(kPackedVec4Width);
-  for (uint32_t col_lane = 0; col_lane < kPackedVec4Width; ++col_lane) {
+  weight_vec_ids.reserve(kPackedVec2Width);
+  for (uint32_t col_lane = 0; col_lane < kPackedVec2Width; ++col_lane) {
     std::vector<uint32_t> lane_ids;
-    lane_ids.reserve(kPackedVec4Width);
-    for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+    lane_ids.reserve(kPackedVec2Width);
+    for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
       const uint32_t row_lane_id = GetOrCreateUIntConstant(row_lane);
       if (row_lane_id == 0) return 0;
       Instruction* row = builder.AddBinaryOp(uint_type_id, spv::Op::OpIAdd,
@@ -366,10 +366,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
                               row_offset->result_id(), col_pack_param_id);
       if (!flat_index) return 0;
       Instruction* vec_ptr = builder.AddAccessChain(
-          vec4_ptr_type_id, matrix_var->result_id(), {flat_index->result_id()});
+          vec2_ptr_type_id, matrix_var->result_id(), {flat_index->result_id()});
       if (!vec_ptr) return 0;
       Instruction* vec =
-          builder.AddLoad(matrix.packed_vec4_type_id, vec_ptr->result_id());
+          builder.AddLoad(matrix.packed_vec2_type_id, vec_ptr->result_id());
       if (!vec) return 0;
       const uint32_t value_id = ExtractCompositeElement(
           &builder, matrix.component_type_id, vec->result_id(), col_lane);
@@ -378,7 +378,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
     }
 
     Instruction* weight_vec =
-        builder.AddCompositeConstruct(matrix.packed_vec4_type_id, lane_ids);
+        builder.AddCompositeConstruct(matrix.packed_vec2_type_id, lane_ids);
     if (!weight_vec) return 0;
     weight_vec_ids.push_back(weight_vec->result_id());
   }
@@ -402,7 +402,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulTileWeightFunctionPackedVec4(
 }
 
 uint32_t
-HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec2(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias) {
   const std::string key =
@@ -410,7 +410,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
   auto cached = vector_matmul_pattern_functions_.find(key);
   if (cached != vector_matmul_pattern_functions_.end()) return cached->second;
 
-  // The packed loop below groups four K terms and horizontally reduces them.
+  // The packed loop below groups two K terms and horizontally reduces them.
   // That changes the specified K-order unless reassociation is explicitly
   // allowed.  Small operations use the strict, K-ordered builder here; large
   // operations have already been redirected to the generic structured-loop
@@ -462,13 +462,13 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
                               std::initializer_list<Operand>{}));
 
   InstructionBuilder builder(context(), block.get());
-  const uint32_t vec4_type_id = result.packed_vec4_type_id;
-  const uint32_t zero4_id = GetOrCreateZero(vec4_type_id);
-  if (zero4_id == 0) return 0;
+  const uint32_t vec2_type_id = result.packed_vec2_type_id;
+  const uint32_t zero2_id = GetOrCreateZero(vec2_type_id);
+  if (zero2_id == 0) return 0;
 
   if (!use_loop_path) {
     std::vector<uint32_t> element_ids;
-    if (!BuildVectorMatrixMulPatternPackedVec4(
+    if (!BuildVectorMatrixMulPatternPackedVec2(
             &builder, result, input, matrix, bias, input_param_id,
             matrix_param_id, bias_param_id, has_bias, &element_ids)) {
       return 0;
@@ -502,15 +502,16 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
       has_bias ? GetOrCreatePointerType(bias->lowered_type_id,
                                         spv::StorageClass::Function)
                : 0;
-  const uint32_t vec4_function_ptr_type_id =
-      GetOrCreatePointerType(vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id =
+      GetOrCreatePointerType(vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
   const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t result_packed_length_id =
       GetOrCreateUIntConstant(result.packed_length);
   const uint32_t input_packed_length_id =
@@ -520,9 +521,9 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
   if (result_function_ptr_type_id == 0 || input_function_ptr_type_id == 0 ||
       matrix_function_ptr_type_id == 0 ||
       (has_bias && bias_function_ptr_type_id == 0) ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || bool_type_id == 0 ||
-      zero_uint_id == 0 || one_uint_id == 0 || four_uint_id == 0 ||
+      zero_uint_id == 0 || one_uint_id == 0 || packed_width_uint_id == 0 ||
       result_packed_length_id == 0 || input_packed_length_id == 0 ||
       matrix_packed_cols_id == 0) {
     return 0;
@@ -584,10 +585,10 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
   Instruction* k_pack_var =
       builder.AddVariable(uint_function_ptr_type_id,
                           static_cast<uint32_t>(spv::StorageClass::Function));
-  std::array<Instruction*, kPackedVec4Width> acc_vars = {};
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  std::array<Instruction*, kPackedVec2Width> acc_vars = {};
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     acc_vars[lane] =
-        builder.AddVariable(vec4_function_ptr_type_id,
+        builder.AddVariable(vec2_function_ptr_type_id,
                             static_cast<uint32_t>(spv::StorageClass::Function));
   }
   if (!result_var || !input_var || !matrix_var || (has_bias && !bias_var) ||
@@ -624,7 +625,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
 
   InstructionBuilder out_body_builder(context(), out_body_block.get());
   for (Instruction* acc_var : acc_vars) {
-    if (!out_body_builder.AddStore(acc_var->result_id(), zero4_id)) return 0;
+    if (!out_body_builder.AddStore(acc_var->result_id(), zero2_id)) return 0;
   }
   if (!out_body_builder.AddStore(k_pack_var->result_id(), zero_uint_id) ||
       !out_body_builder.AddBranch(k_header_label_id)) {
@@ -649,17 +650,18 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
 
   InstructionBuilder k_body_builder(context(), k_body_block.get());
   Instruction* input_vec_ptr = k_body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, input_var->result_id(),
+      vec2_function_ptr_type_id, input_var->result_id(),
       {k_pack_load->result_id()});
   if (!input_vec_ptr) return 0;
-  Instruction* input_vec = k_body_builder.AddLoad(input.packed_vec4_type_id,
+  Instruction* input_vec = k_body_builder.AddLoad(input.packed_vec2_type_id,
                                                   input_vec_ptr->result_id());
   if (!input_vec) return 0;
   Instruction* k_element_base = k_body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, k_pack_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIMul, k_pack_load->result_id(),
+      packed_width_uint_id);
   if (!k_element_base) return 0;
-  std::array<uint32_t, kPackedVec4Width> weight_row_ids = {};
-  for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+  std::array<uint32_t, kPackedVec2Width> weight_row_ids = {};
+  for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
     const uint32_t lane_id = GetOrCreateUIntConstant(row_lane);
     if (lane_id == 0) return 0;
     Instruction* matrix_row = k_body_builder.AddBinaryOp(
@@ -674,18 +676,18 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
         out_pack_load->result_id());
     if (!matrix_flat_index) return 0;
     Instruction* weight_ptr = k_body_builder.AddAccessChain(
-        vec4_function_ptr_type_id, matrix_var->result_id(),
+        vec2_function_ptr_type_id, matrix_var->result_id(),
         {matrix_flat_index->result_id()});
     if (!weight_ptr) return 0;
-    Instruction* weight_row = k_body_builder.AddLoad(matrix.packed_vec4_type_id,
+    Instruction* weight_row = k_body_builder.AddLoad(matrix.packed_vec2_type_id,
                                                      weight_ptr->result_id());
     if (!weight_row) return 0;
     weight_row_ids[row_lane] = weight_row->result_id();
   }
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     std::vector<uint32_t> weight_lane_ids;
-    weight_lane_ids.reserve(kPackedVec4Width);
-    for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+    weight_lane_ids.reserve(kPackedVec2Width);
+    for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
       const uint32_t weight_scalar =
           ExtractCompositeElement(&k_body_builder, result.component_type_id,
                                   weight_row_ids[row_lane], lane);
@@ -693,12 +695,12 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
       weight_lane_ids.push_back(weight_scalar);
     }
     Instruction* weight =
-        k_body_builder.AddCompositeConstruct(vec4_type_id, weight_lane_ids);
+        k_body_builder.AddCompositeConstruct(vec2_type_id, weight_lane_ids);
     Instruction* acc =
-        k_body_builder.AddLoad(vec4_type_id, acc_vars[lane]->result_id());
+        k_body_builder.AddLoad(vec2_type_id, acc_vars[lane]->result_id());
     if (!weight || !acc) return 0;
     const uint32_t fma =
-        BuildFma(&k_body_builder, vec4_type_id, input_vec->result_id(),
+        BuildFma(&k_body_builder, vec2_type_id, input_vec->result_id(),
                  weight->result_id(), acc->result_id());
     if (fma == 0) return 0;
     if (!k_body_builder.AddStore(acc_vars[lane]->result_id(), fma)) return 0;
@@ -717,10 +719,10 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
 
   InstructionBuilder k_merge_builder(context(), k_merge_block.get());
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     Instruction* acc =
-        k_merge_builder.AddLoad(vec4_type_id, acc_vars[lane]->result_id());
+        k_merge_builder.AddLoad(vec2_type_id, acc_vars[lane]->result_id());
     if (!acc) return 0;
     uint32_t reduced = BuildHorizontalReduce(
         &k_merge_builder, result.component_type_id, acc->result_id());
@@ -728,24 +730,24 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
     lane_ids.push_back(reduced);
   }
   Instruction* result_vec =
-      k_merge_builder.AddCompositeConstruct(vec4_type_id, lane_ids);
+      k_merge_builder.AddCompositeConstruct(vec2_type_id, lane_ids);
   if (!result_vec) return 0;
   if (has_bias) {
     Instruction* bias_vec_ptr = k_merge_builder.AddAccessChain(
-        vec4_function_ptr_type_id, bias_var->result_id(),
+        vec2_function_ptr_type_id, bias_var->result_id(),
         {out_pack_load->result_id()});
     if (!bias_vec_ptr) return 0;
-    Instruction* bias_vec = k_merge_builder.AddLoad(bias->packed_vec4_type_id,
+    Instruction* bias_vec = k_merge_builder.AddLoad(bias->packed_vec2_type_id,
                                                     bias_vec_ptr->result_id());
     if (!bias_vec) return 0;
-    result_vec = k_merge_builder.AddBinaryOp(vec4_type_id, spv::Op::OpFAdd,
+    result_vec = k_merge_builder.AddBinaryOp(vec2_type_id, spv::Op::OpFAdd,
                                              result_vec->result_id(),
                                              bias_vec->result_id());
     if (!result_vec) return 0;
     ApplyActiveFPFastMathMode(result_vec);
   }
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(
-      vec4_function_ptr_type_id, result_var->result_id(),
+      vec2_function_ptr_type_id, result_var->result_id(),
       {out_pack_load->result_id()});
   if (!result_vec_ptr) return 0;
   if (!k_merge_builder.AddStore(result_vec_ptr->result_id(),
@@ -793,13 +795,13 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternFunctionPackedVec4(
 }
 
 uint32_t
-HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
+HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec2(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
     uint32_t input_pointer_type_id, uint32_t matrix_pointer_type_id,
     uint32_t bias_pointer_type_id) {
-  if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
-      (has_bias && (!bias || !IsPackedVec4(*bias)))) {
+  if (!IsPackedVec2(result) || !IsPackedVec2(input) || !IsPackedVec2(matrix) ||
+      (has_bias && (!bias || !IsPackedVec2(*bias)))) {
     return 0;
   }
 
@@ -864,9 +866,9 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
                               std::initializer_list<Operand>{}));
   InstructionBuilder builder(context(), entry_block.get());
 
-  const uint32_t vec4_type_id = result.packed_vec4_type_id;
-  const uint32_t vec4_function_ptr_type_id =
-      GetOrCreatePointerType(vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_type_id = result.packed_vec2_type_id;
+  const uint32_t vec2_function_ptr_type_id =
+      GetOrCreatePointerType(vec2_type_id, spv::StorageClass::Function);
   const uint32_t result_function_ptr_type_id = GetOrCreatePointerType(
       result.lowered_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
@@ -875,20 +877,21 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
   const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t result_packed_length_id =
       GetOrCreateUIntConstant(result.packed_length);
   const uint32_t input_packed_length_id =
       GetOrCreateUIntConstant(input.packed_length);
   const uint32_t matrix_packed_cols_id =
       GetOrCreateUIntConstant(matrix.packed_cols);
-  const uint32_t zero4_id = GetOrCreateZero(vec4_type_id);
-  if (vec4_function_ptr_type_id == 0 || result_function_ptr_type_id == 0 ||
+  const uint32_t zero2_id = GetOrCreateZero(vec2_type_id);
+  if (vec2_function_ptr_type_id == 0 || result_function_ptr_type_id == 0 ||
       uint_type_id == 0 || uint_function_ptr_type_id == 0 ||
       bool_type_id == 0 || zero_uint_id == 0 || one_uint_id == 0 ||
-      four_uint_id == 0 || result_packed_length_id == 0 ||
+      packed_width_uint_id == 0 || result_packed_length_id == 0 ||
       input_packed_length_id == 0 || matrix_packed_cols_id == 0 ||
-      zero4_id == 0) {
+      zero2_id == 0) {
     return 0;
   }
 
@@ -938,10 +941,10 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   Instruction* k_pack_var =
       builder.AddVariable(uint_function_ptr_type_id,
                           static_cast<uint32_t>(spv::StorageClass::Function));
-  std::array<Instruction*, kPackedVec4Width> acc_vars = {};
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  std::array<Instruction*, kPackedVec2Width> acc_vars = {};
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     acc_vars[lane] =
-        builder.AddVariable(vec4_function_ptr_type_id,
+        builder.AddVariable(vec2_function_ptr_type_id,
                             static_cast<uint32_t>(spv::StorageClass::Function));
   }
   if (!result_var || !out_pack_var || !k_pack_var) return 0;
@@ -972,7 +975,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
 
   InstructionBuilder out_body_builder(context(), out_body_block.get());
   for (Instruction* acc_var : acc_vars) {
-    if (!out_body_builder.AddStore(acc_var->result_id(), zero4_id)) return 0;
+    if (!out_body_builder.AddStore(acc_var->result_id(), zero2_id)) return 0;
   }
   if (!out_body_builder.AddStore(k_pack_var->result_id(), zero_uint_id) ||
       !out_body_builder.AddBranch(k_header_label_id)) {
@@ -997,15 +1000,16 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
 
   InstructionBuilder k_body_builder(context(), k_body_block.get());
   Instruction* input_vec_ptr = k_body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, input_param_id, {k_pack_load->result_id()});
+      vec2_function_ptr_type_id, input_param_id, {k_pack_load->result_id()});
   if (!input_vec_ptr) return 0;
-  Instruction* input_vec = k_body_builder.AddLoad(input.packed_vec4_type_id,
+  Instruction* input_vec = k_body_builder.AddLoad(input.packed_vec2_type_id,
                                                   input_vec_ptr->result_id());
   if (!input_vec) return 0;
   Instruction* out_row_base = k_body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIMul, out_pack_load->result_id(),
+      packed_width_uint_id);
   if (!out_row_base) return 0;
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     const uint32_t lane_id = GetOrCreateUIntConstant(lane);
     if (lane_id == 0) return 0;
     Instruction* matrix_row = k_body_builder.AddBinaryOp(
@@ -1020,16 +1024,16 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
         k_pack_load->result_id());
     if (!matrix_flat_index) return 0;
     Instruction* weight_ptr = k_body_builder.AddAccessChain(
-        vec4_function_ptr_type_id, matrix_param_id,
+        vec2_function_ptr_type_id, matrix_param_id,
         {matrix_flat_index->result_id()});
     if (!weight_ptr) return 0;
-    Instruction* weight = k_body_builder.AddLoad(matrix.packed_vec4_type_id,
+    Instruction* weight = k_body_builder.AddLoad(matrix.packed_vec2_type_id,
                                                  weight_ptr->result_id());
     Instruction* acc =
-        k_body_builder.AddLoad(vec4_type_id, acc_vars[lane]->result_id());
+        k_body_builder.AddLoad(vec2_type_id, acc_vars[lane]->result_id());
     if (!weight || !acc) return 0;
     const uint32_t fma =
-        BuildFma(&k_body_builder, vec4_type_id, input_vec->result_id(),
+        BuildFma(&k_body_builder, vec2_type_id, input_vec->result_id(),
                  weight->result_id(), acc->result_id());
     if (fma == 0) return 0;
     if (!k_body_builder.AddStore(acc_vars[lane]->result_id(), fma)) return 0;
@@ -1050,17 +1054,17 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   Instruction* bias_vec = nullptr;
   if (has_bias) {
     Instruction* bias_vec_ptr = k_merge_builder.AddAccessChain(
-        vec4_function_ptr_type_id, bias_param_id, {out_pack_load->result_id()});
+        vec2_function_ptr_type_id, bias_param_id, {out_pack_load->result_id()});
     if (!bias_vec_ptr) return 0;
-    bias_vec = k_merge_builder.AddLoad(bias->packed_vec4_type_id,
+    bias_vec = k_merge_builder.AddLoad(bias->packed_vec2_type_id,
                                        bias_vec_ptr->result_id());
     if (!bias_vec) return 0;
   }
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     Instruction* acc =
-        k_merge_builder.AddLoad(vec4_type_id, acc_vars[lane]->result_id());
+        k_merge_builder.AddLoad(vec2_type_id, acc_vars[lane]->result_id());
     if (!acc) return 0;
     uint32_t reduced = BuildHorizontalReduce(
         &k_merge_builder, result.component_type_id, acc->result_id());
@@ -1079,10 +1083,10 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
     lane_ids.push_back(reduced);
   }
   Instruction* result_vec =
-      k_merge_builder.AddCompositeConstruct(vec4_type_id, lane_ids);
+      k_merge_builder.AddCompositeConstruct(vec2_type_id, lane_ids);
   if (!result_vec) return 0;
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(
-      vec4_function_ptr_type_id, result_var->result_id(),
+      vec2_function_ptr_type_id, result_var->result_id(),
       {out_pack_load->result_id()});
   if (!result_vec_ptr) return 0;
   if (!k_merge_builder.AddStore(result_vec_ptr->result_id(),
@@ -1129,7 +1133,7 @@ HwLowerToStandardPass::GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
   return function_id;
 }
 
-uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
+uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec2(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) {
   const std::string key = MatmulPatternFunctionKey(result, a, b, c);
@@ -1171,15 +1175,15 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       MakeUnique<Instruction>(context(), spv::Op::OpLabel, 0, label_id,
                               std::initializer_list<Operand>{}));
 
-  // The legacy packed loop below reduces groups of four K terms before adding
+  // The legacy packed loop below reduces pairs of K terms before adding
   // C, which reassociates the source expression.  Use the strict K-ordered
   // builder for the ordinary helper path.  Large operations are handled by
   // LowerMatrixMulAddWithLoop before reaching this function.
   const bool use_loop_path = false;
-  if (!use_loop_path || !IsPackedVec4(a)) {
+  if (!use_loop_path || !IsPackedVec2(a)) {
     InstructionBuilder builder(context(), entry_block.get());
     std::vector<uint32_t> element_ids;
-    if (!BuildMatmulPatternPackedVec4(&builder, result, a, b, c, a_param_id,
+    if (!BuildMatmulPatternPackedVec2(&builder, result, a, b, c, a_param_id,
                                       b_param_id, c_param_id, &element_ids)) {
       return 0;
     }
@@ -1210,30 +1214,31 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       GetOrCreatePointerType(b.lowered_type_id, spv::StorageClass::Function);
   const uint32_t c_function_ptr_type_id =
       GetOrCreatePointerType(c.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
-      result.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id = GetOrCreatePointerType(
+      result.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
   const uint32_t one_uint_id = GetOrCreateUIntConstant(1);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t row_count_id = GetOrCreateUIntConstant(result.rows);
   const uint32_t result_packed_cols_id =
       GetOrCreateUIntConstant(result.packed_cols);
   const uint32_t a_packed_cols_id = GetOrCreateUIntConstant(a.packed_cols);
   const uint32_t b_packed_cols_id = GetOrCreateUIntConstant(b.packed_cols);
   const uint32_t k_pack_count_id = GetOrCreateUIntConstant(a.packed_cols);
-  const uint32_t zero4_id = GetOrCreateZero(result.packed_vec4_type_id);
+  const uint32_t zero2_id = GetOrCreateZero(result.packed_vec2_type_id);
   if (lowered_function_ptr_type_id == 0 || a_function_ptr_type_id == 0 ||
       b_function_ptr_type_id == 0 || c_function_ptr_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || bool_type_id == 0 ||
-      zero_uint_id == 0 || one_uint_id == 0 || four_uint_id == 0 ||
+      zero_uint_id == 0 || one_uint_id == 0 || packed_width_uint_id == 0 ||
       row_count_id == 0 || result_packed_cols_id == 0 ||
       a_packed_cols_id == 0 || b_packed_cols_id == 0 || k_pack_count_id == 0 ||
-      zero4_id == 0) {
+      zero2_id == 0) {
     return 0;
   }
 
@@ -1310,10 +1315,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
   Instruction* k_pack_var = entry_builder.AddVariable(
       uint_function_ptr_type_id,
       static_cast<uint32_t>(spv::StorageClass::Function));
-  std::array<Instruction*, kPackedVec4Width> acc_vars = {};
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  std::array<Instruction*, kPackedVec2Width> acc_vars = {};
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     acc_vars[lane] = entry_builder.AddVariable(
-        vec4_function_ptr_type_id,
+        vec2_function_ptr_type_id,
         static_cast<uint32_t>(spv::StorageClass::Function));
   }
   if (!result_var || !a_var || !b_var || !c_var || !row_var || !col_pack_var ||
@@ -1372,7 +1377,7 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
 
   InstructionBuilder col_body_builder(context(), col_body_block.get());
   for (Instruction* acc_var : acc_vars) {
-    if (!col_body_builder.AddStore(acc_var->result_id(), zero4_id)) return 0;
+    if (!col_body_builder.AddStore(acc_var->result_id(), zero2_id)) return 0;
   }
   if (!col_body_builder.AddStore(k_pack_var->result_id(), zero_uint_id) ||
       !col_body_builder.AddBranch(k_header_label_id)) {
@@ -1404,17 +1409,18 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       k_pack_load->result_id());
   if (!a_flat_index) return 0;
   Instruction* a_vec_ptr = k_body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, a_var->result_id(),
+      vec2_function_ptr_type_id, a_var->result_id(),
       {a_flat_index->result_id()});
   if (!a_vec_ptr) return 0;
   Instruction* a_vec =
-      k_body_builder.AddLoad(a.packed_vec4_type_id, a_vec_ptr->result_id());
+      k_body_builder.AddLoad(a.packed_vec2_type_id, a_vec_ptr->result_id());
   if (!a_vec) return 0;
   Instruction* k_base = k_body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIMul, k_pack_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIMul, k_pack_load->result_id(),
+      packed_width_uint_id);
   if (!k_base) return 0;
-  std::array<uint32_t, kPackedVec4Width> b_vecs = {};
-  for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+  std::array<uint32_t, kPackedVec2Width> b_vecs = {};
+  for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
     const uint32_t row_lane_id = GetOrCreateUIntConstant(row_lane);
     if (row_lane_id == 0) return 0;
     Instruction* b_row = k_body_builder.AddBinaryOp(
@@ -1428,30 +1434,30 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
         col_pack_load->result_id());
     if (!b_flat_index) return 0;
     Instruction* b_vec_ptr = k_body_builder.AddAccessChain(
-        vec4_function_ptr_type_id, b_var->result_id(),
+        vec2_function_ptr_type_id, b_var->result_id(),
         {b_flat_index->result_id()});
     if (!b_vec_ptr) return 0;
     Instruction* b_vec =
-        k_body_builder.AddLoad(b.packed_vec4_type_id, b_vec_ptr->result_id());
+        k_body_builder.AddLoad(b.packed_vec2_type_id, b_vec_ptr->result_id());
     if (!b_vec) return 0;
     b_vecs[row_lane] = b_vec->result_id();
   }
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     std::vector<uint32_t> weight_lanes;
-    weight_lanes.reserve(kPackedVec4Width);
-    for (uint32_t row_lane = 0; row_lane < kPackedVec4Width; ++row_lane) {
+    weight_lanes.reserve(kPackedVec2Width);
+    for (uint32_t row_lane = 0; row_lane < kPackedVec2Width; ++row_lane) {
       const uint32_t value = ExtractCompositeElement(
           &k_body_builder, result.component_type_id, b_vecs[row_lane], lane);
       if (value == 0) return 0;
       weight_lanes.push_back(value);
     }
     Instruction* weight_vec = k_body_builder.AddCompositeConstruct(
-        result.packed_vec4_type_id, weight_lanes);
-    Instruction* acc = k_body_builder.AddLoad(result.packed_vec4_type_id,
+        result.packed_vec2_type_id, weight_lanes);
+    Instruction* acc = k_body_builder.AddLoad(result.packed_vec2_type_id,
                                               acc_vars[lane]->result_id());
     if (!weight_vec || !acc) return 0;
     const uint32_t fma =
-        BuildFma(&k_body_builder, result.packed_vec4_type_id,
+        BuildFma(&k_body_builder, result.packed_vec2_type_id,
                  a_vec->result_id(), weight_vec->result_id(), acc->result_id());
     if (fma == 0) return 0;
     if (!k_body_builder.AddStore(acc_vars[lane]->result_id(), fma)) return 0;
@@ -1478,16 +1484,16 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
       col_pack_load->result_id());
   if (!result_flat_index) return 0;
   Instruction* c_vec_ptr = k_merge_builder.AddAccessChain(
-      vec4_function_ptr_type_id, c_var->result_id(),
+      vec2_function_ptr_type_id, c_var->result_id(),
       {result_flat_index->result_id()});
   if (!c_vec_ptr) return 0;
   Instruction* c_vec =
-      k_merge_builder.AddLoad(c.packed_vec4_type_id, c_vec_ptr->result_id());
+      k_merge_builder.AddLoad(c.packed_vec2_type_id, c_vec_ptr->result_id());
   if (!c_vec) return 0;
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-    Instruction* acc = k_merge_builder.AddLoad(result.packed_vec4_type_id,
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+    Instruction* acc = k_merge_builder.AddLoad(result.packed_vec2_type_id,
                                                acc_vars[lane]->result_id());
     if (!acc) return 0;
     const uint32_t reduced = BuildHorizontalReduce(
@@ -1502,10 +1508,10 @@ uint32_t HwLowerToStandardPass::GetOrCreateMatmulPatternFunctionPackedVec4(
     lane_ids.push_back(add->result_id());
   }
   Instruction* result_vec = k_merge_builder.AddCompositeConstruct(
-      result.packed_vec4_type_id, lane_ids);
+      result.packed_vec2_type_id, lane_ids);
   if (!result_vec) return 0;
   Instruction* result_vec_ptr = k_merge_builder.AddAccessChain(
-      vec4_function_ptr_type_id, result_var->result_id(),
+      vec2_function_ptr_type_id, result_var->result_id(),
       {result_flat_index->result_id()});
   if (!result_vec_ptr) return 0;
   if (!k_merge_builder.AddStore(result_vec_ptr->result_id(),
@@ -1581,11 +1587,11 @@ std::string HwLowerToStandardPass::TileWeightFunctionKey(
   key += ':';
   key += std::to_string(matrix.lowered_type_id);
   key += ':';
-  key += std::to_string(matrix.packed_vec4_type_id);
+  key += std::to_string(matrix.packed_vec2_type_id);
   key += ':';
   key += std::to_string(matrix.packed_cols);
   key += ':';
-  key += (matrix.packed_f16vec4 ? "h" : (matrix.packed_f32vec4 ? "f" : "s"));
+  key += (matrix.packed_f16vec2 ? "h" : (matrix.packed_f32vec2 ? "f" : "s"));
   return key;
 }
 
@@ -1607,11 +1613,11 @@ std::string HwLowerToStandardPass::VectorMatmulPatternFunctionKey(
     key += ':';
     key += std::to_string(info.lowered_type_id);
     key += ':';
-    key += std::to_string(info.packed_vec4_type_id);
+    key += std::to_string(info.packed_vec2_type_id);
     key += ':';
     key += std::to_string(info.packed_length);
     key += ':';
-    key += (info.packed_f16vec4 ? "h" : (info.packed_f32vec4 ? "f" : "s"));
+    key += (info.packed_f16vec2 ? "h" : (info.packed_f32vec2 ? "f" : "s"));
   };
   auto append_matrix = [&key](const MatrixTypeInfo& info) {
     key += std::to_string(info.component_type_id);
@@ -1622,11 +1628,11 @@ std::string HwLowerToStandardPass::VectorMatmulPatternFunctionKey(
     key += ':';
     key += std::to_string(info.lowered_type_id);
     key += ':';
-    key += std::to_string(info.packed_vec4_type_id);
+    key += std::to_string(info.packed_vec2_type_id);
     key += ':';
     key += std::to_string(info.packed_cols);
     key += ':';
-    key += (info.packed_f16vec4 ? "h" : (info.packed_f32vec4 ? "f" : "s"));
+    key += (info.packed_f16vec2 ? "h" : (info.packed_f32vec2 ? "f" : "s"));
   };
   append_vector(result);
   key += '|';
@@ -1658,11 +1664,11 @@ std::string HwLowerToStandardPass::MatmulPatternFunctionKey(
     key += ':';
     key += std::to_string(info.lowered_type_id);
     key += ':';
-    key += std::to_string(info.packed_vec4_type_id);
+    key += std::to_string(info.packed_vec2_type_id);
     key += ':';
     key += std::to_string(info.packed_cols);
     key += ':';
-    key += (info.packed_f16vec4 ? "h" : (info.packed_f32vec4 ? "f" : "s"));
+    key += (info.packed_f16vec2 ? "h" : (info.packed_f32vec2 ? "f" : "s"));
   };
   append_matrix(result);
   key += '|';
@@ -1676,43 +1682,43 @@ std::string HwLowerToStandardPass::MatmulPatternFunctionKey(
   return key;
 }
 
-bool HwLowerToStandardPass::IsPackedVec4(const MatrixTypeInfo& info) const {
-  return info.packed_f16vec4 || info.packed_f32vec4;
+bool HwLowerToStandardPass::IsPackedVec2(const MatrixTypeInfo& info) const {
+  return info.packed_f16vec2 || info.packed_f32vec2;
 }
 
-bool HwLowerToStandardPass::IsPackedVec4(const VectorTypeInfo& info) const {
-  return info.packed_f16vec4 || info.packed_f32vec4;
+bool HwLowerToStandardPass::IsPackedVec2(const VectorTypeInfo& info) const {
+  return info.packed_f16vec2 || info.packed_f32vec2;
 }
 
-bool HwLowerToStandardPass::IsSamePackedVec4Kind(
+bool HwLowerToStandardPass::IsSamePackedVec2Kind(
     const MatrixTypeInfo& a, const MatrixTypeInfo& b) const {
-  return IsPackedVec4(a) && IsPackedVec4(b) &&
-         a.packed_f16vec4 == b.packed_f16vec4 &&
-         a.packed_f32vec4 == b.packed_f32vec4 &&
+  return IsPackedVec2(a) && IsPackedVec2(b) &&
+         a.packed_f16vec2 == b.packed_f16vec2 &&
+         a.packed_f32vec2 == b.packed_f32vec2 &&
          a.component_type_id == b.component_type_id &&
-         a.packed_vec4_type_id == b.packed_vec4_type_id;
+         a.packed_vec2_type_id == b.packed_vec2_type_id;
 }
 
-bool HwLowerToStandardPass::IsSamePackedVec4Kind(
+bool HwLowerToStandardPass::IsSamePackedVec2Kind(
     const VectorTypeInfo& a, const VectorTypeInfo& b) const {
-  return IsPackedVec4(a) && IsPackedVec4(b) &&
-         a.packed_f16vec4 == b.packed_f16vec4 &&
-         a.packed_f32vec4 == b.packed_f32vec4 &&
+  return IsPackedVec2(a) && IsPackedVec2(b) &&
+         a.packed_f16vec2 == b.packed_f16vec2 &&
+         a.packed_f32vec2 == b.packed_f32vec2 &&
          a.component_type_id == b.component_type_id &&
-         a.packed_vec4_type_id == b.packed_vec4_type_id;
+         a.packed_vec2_type_id == b.packed_vec2_type_id;
 }
 
-bool HwLowerToStandardPass::CanUsePackedVec4MatrixMulAdd(
+bool HwLowerToStandardPass::CanUsePackedVec2MatrixMulAdd(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
-  return IsPackedVec4(result) && IsSamePackedVec4Kind(result, a) &&
-         IsSamePackedVec4Kind(result, b) && IsSamePackedVec4Kind(result, c);
+  return IsPackedVec2(result) && IsSamePackedVec2Kind(result, a) &&
+         IsSamePackedVec2Kind(result, b) && IsSamePackedVec2Kind(result, c);
 }
 
 bool HwLowerToStandardPass::CanUseDirectMatrixMulAdd(
     const MatrixTypeInfo& result, const MatrixTypeInfo& a,
     const MatrixTypeInfo& b, const MatrixTypeInfo& c) const {
-  if (lowering_mode_ != LoweringMode::kPreferPackedVec4 ||
+  if (lowering_mode_ != LoweringMode::kPreferPackedVec2 ||
       result.rows != a.rows || result.cols != b.cols || a.cols != b.rows ||
       c.rows != result.rows || c.cols != result.cols) {
     return false;
@@ -1730,10 +1736,10 @@ bool HwLowerToStandardPass::CanUseDirectMatrixMulAdd(
   return same_component || mixed_f16_f32;
 }
 
-bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
+bool HwLowerToStandardPass::CanUsePackedVec2VectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
-  if (!IsPackedVec4(result) || !IsPackedVec4(input) || !IsPackedVec4(matrix) ||
+  if (!IsPackedVec2(result) || !IsPackedVec2(input) || !IsPackedVec2(matrix) ||
       result.component_type_id != input.component_type_id ||
       result.component_type_id != matrix.component_type_id) {
     return false;
@@ -1741,13 +1747,13 @@ bool HwLowerToStandardPass::CanUsePackedVec4VectorMatrixMul(
   if (result.length != matrix.cols || input.length != matrix.rows) {
     return false;
   }
-  return !bias || IsSamePackedVec4Kind(result, *bias);
+  return !bias || IsSamePackedVec2Kind(result, *bias);
 }
 
 bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
-  if (lowering_mode_ != LoweringMode::kPreferPackedVec4 ||
+  if (lowering_mode_ != LoweringMode::kPreferPackedVec2 ||
       result.length != matrix.cols || input.length != matrix.rows ||
       (bias && bias->length != result.length)) {
     return false;
@@ -1766,9 +1772,9 @@ bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
   return same_component || mixed_f16_f32;
 }
 
-bool HwLowerToStandardPass::ShouldUsePackedVec4(uint32_t extent) const {
-  return lowering_mode_ == LoweringMode::kPreferPackedVec4 &&
-         extent % kPackedVec4Width == 0;
+bool HwLowerToStandardPass::ShouldUsePackedVec2(uint32_t extent) const {
+  return lowering_mode_ == LoweringMode::kPreferPackedVec2 &&
+         extent % kPackedVec2Width == 0;
 }
 
 uint32_t HwLowerToStandardPass::MatrixFlatIndex(const MatrixTypeInfo& info,
@@ -1784,11 +1790,11 @@ uint32_t HwLowerToStandardPass::MatrixPackedIndex(const MatrixTypeInfo& info,
 }
 
 uint32_t HwLowerToStandardPass::VectorPackedIndex(uint32_t scalar_index) const {
-  return scalar_index / kPackedVec4Width;
+  return scalar_index / kPackedVec2Width;
 }
 
 uint32_t HwLowerToStandardPass::PackedLane(uint32_t scalar_index) const {
-  return scalar_index % kPackedVec4Width;
+  return scalar_index % kPackedVec2Width;
 }
 
 uint32_t HwLowerToStandardPass::GetOrCreateGLSLStd450Import() {

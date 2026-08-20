@@ -1565,16 +1565,16 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest,
        PreferPackedLoweringConsumesFusedPairsAndOddTail) {
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
       MakeMultiLayerMulAddChain(/*include_odd_tail=*/true), true, true,
-      HwLowerToStandardPass::LoweringMode::kPreferPackedVec4);
+      HwLowerToStandardPass::LoweringMode::kPreferPackedVec2);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeMatrixHW"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "SPV_HW_neural_shader"));
   EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 2"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 4"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 2"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v4half"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2half"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
 }
 
@@ -1582,7 +1582,7 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest,
        PreferPackedLoweringConsumesMixedPrecisionPair) {
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
       MakeMixedPrecisionChain(), true, true,
-      HwLowerToStandardPass::LoweringMode::kPreferPackedVec4);
+      HwLowerToStandardPass::LoweringMode::kPreferPackedVec2);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));

@@ -48,7 +48,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v2float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
 }
 
@@ -113,7 +113,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
@@ -146,7 +146,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorIMulScalarFallback) {
@@ -179,7 +179,7 @@ OpFunctionEnd
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpIMul %int"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorConvertFToSWithPackedInput) {
@@ -213,7 +213,7 @@ OpFunctionEnd
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorSNegateScalarFallback) {
@@ -244,7 +244,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixIAdd) {
@@ -277,7 +277,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpIAdd %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersPackedMatrixFConvert) {
@@ -311,7 +311,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFConvert %v2float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert %float"));
 }
 
@@ -346,7 +346,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersPackedMatrixFAdd) {
@@ -378,7 +378,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
@@ -413,7 +413,7 @@ OpFunctionEnd
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpMatrixTimesScalar"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %float"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixIMulScalarFallback) {
@@ -447,7 +447,7 @@ OpFunctionEnd
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpIMul %int"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, ForceScalarModeLowersVectorFAddToScalar) {
@@ -479,7 +479,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersScalarToPackedVectorConversionWithLoop) {
@@ -511,8 +511,8 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertSToF %v4float"));
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %int 4"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertSToF %v2float"));
+  EXPECT_NE(std::string::npos, disassembly.find("OpTypeVector %int 2"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersPackedToScalarMatrixConversionWithLoop) {
@@ -577,7 +577,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpExtInst %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpExtInst %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersChainedElementwiseOpsToSeparateLoops) {
@@ -610,8 +610,8 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpULessThan"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, PreservesEnclosingLoopHeaderWhenSplitting) {
@@ -652,7 +652,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersIntegerCooperativeVectorBitwiseOps) {
@@ -741,12 +741,12 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(5u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(7u, CountSubstring(disassembly, "OpFConvert %v4"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v4float"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFSub %v4half"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v4float"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFDiv %v4half"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v4float"));
+  EXPECT_EQ(7u, CountSubstring(disassembly, "OpFConvert %v2"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFSub %v2half"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v2float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFDiv %v2half"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMixedWidthFloatMatrixArithmeticScalar) {

@@ -53,9 +53,9 @@ OpExecutionMode %main LocalSize 1 1 1
 %float = OpTypeFloat 32
 %hw_vec = OpTypeCooperativeVectorHW %float %uint_16
 %hw_ptr = OpTypePointer Function %hw_vec
-%late_uint_4 = OpConstant %uint 4
-%late_v4float = OpTypeVector %float 4
-%late_array = OpTypeArray %late_v4float %late_uint_4
+%late_uint_8 = OpConstant %uint 8
+%late_v2float = OpTypeVector %float 2
+%late_array = OpTypeArray %late_v2float %late_uint_8
 %value = OpUndef %hw_vec
 %main = OpFunction %void None %fn
 %entry = OpLabel
@@ -68,7 +68,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpTypeVector %float 4"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpTypeVector %float 2"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpTypeArray"));
 }
 
@@ -136,14 +136,14 @@ OpFunctionEnd
 )";
 
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   EXPECT_EQ(0u, CountSubstring(disassembly, "CooperativeVectorHW"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "SPV_HW_neural_shader"));
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpBarrierArriveHW"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v4float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v2float"), 0u);
 }
 
 TEST_F(HwLowerToStandardTest, FailsUnsupportedCooperativeVectorExtInst) {
@@ -290,7 +290,7 @@ TEST_F(HwLowerToStandardTest,
        RejectsConversionUnlessInputAndResultAreCooperative) {
   const std::vector<std::string> instructions = {
       "%bad = OpFConvert %fvec4 %ordinary_half",
-      "%bad = OpFConvert %v4float %hw_half",
+      "%bad = OpFConvert %v2float %hw_half",
       "%bad = OpFConvert %fmat2 %ordinary_half_matrix",
       "%bad = OpFConvert %m2float %hw_half_matrix",
   };
@@ -306,7 +306,7 @@ TEST_F(HwLowerToStandardTest,
        RejectsArithmeticUnlessInputAndResultAreCooperative) {
   const std::vector<std::string> instructions = {
       "%bad = OpFNegate %fvec4 %ordinary_float",
-      "%bad = OpFNegate %v4float %hw_float",
+      "%bad = OpFNegate %v2float %hw_float",
       "%bad = OpFNegate %fmat2 %ordinary_float_matrix",
       "%bad = OpFNegate %m2float %hw_float_matrix",
   };
@@ -321,7 +321,7 @@ TEST_F(HwLowerToStandardTest,
 TEST_F(HwLowerToStandardTest, RejectsScaleUnlessInputAndResultAreCooperative) {
   const std::vector<std::string> instructions = {
       "%bad = OpVectorTimesScalar %fvec4 %ordinary_float %one",
-      "%bad = OpVectorTimesScalar %v4float %hw_float %one",
+      "%bad = OpVectorTimesScalar %v2float %hw_float %one",
       "%bad = OpMatrixTimesScalar %fmat2 %ordinary_float_matrix %one",
       "%bad = OpMatrixTimesScalar %m2float %hw_float_matrix %one",
   };
@@ -388,7 +388,7 @@ OpFunctionEnd
 )";
 
   SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1048576u,
       65536ull, 4096u, 4096ull);
 }
@@ -423,7 +423,7 @@ OpFunctionEnd
 )";
 
   SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 1048576u,
       65536ull, 4096u, 4096ull);
 }
@@ -489,7 +489,7 @@ OpFunctionEnd
 )";
 
     SinglePassRunAndFail<HwLowerToStandardPass>(
-        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
         HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
         16777216ull, 70000u, 4096ull);
   }
@@ -698,7 +698,7 @@ OpFunctionEnd
 )";
 
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
-      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kExtensionFree);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(std::get<0>(result));
@@ -750,7 +750,7 @@ OpFunctionEnd
 )";
 
     SinglePassRunAndFail<HwLowerToStandardPass>(
-        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
         HwLowerToStandardPass::CompletenessMode::kExtensionFree);
   }
 }
@@ -779,7 +779,7 @@ OpFunctionEnd
 )";
 
   SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec4,
+      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kExtensionFree);
 }
 

@@ -22,13 +22,13 @@ TEST_F(HwLowerToStandardTest, LowersMatrixLoadStoreF32) {
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK-NOT: CooperativeMatrixKHR
-; CHECK: OpTypeVector %float 4
-; CHECK: OpTypeArray %v4float %uint_4
+; CHECK: OpTypeVector %float 2
+; CHECK: OpTypeArray %v2float %uint_8
 ; CHECK-DAG: OpLoopMerge
 ; CHECK-DAG: OpLoad %float
 ; CHECK-DAG: OpCompositeConstruct
 ; CHECK-DAG: OpCompositeExtract %float
-; CHECK-DAG: OpFunctionCall %v4float
+; CHECK-DAG: OpFunctionCall %v2float
 ; CHECK-DAG: OpFunctionCall %void
 ; CHECK-DAG: OpCopyObject
 ; CHECK-DAG: OpStore
@@ -119,7 +119,7 @@ OpFunctionEnd
       this, text, spv::Op::OpCooperativeMatrixLoadHW);
   ExpectNoHwOrCoopMatrix(result);
   EXPECT_EQ(0u, CountSubstring(result, "Aligned 16"));
-  EXPECT_EQ(4u, CountSubstring(result, "Aligned 4"));
+  EXPECT_EQ(2u, CountSubstring(result, "Aligned 4"));
 }
 
 TEST_F(HwLowerToStandardTest, MatrixStorePreservesAlignedMemoryAccess) {
@@ -168,7 +168,7 @@ OpFunctionEnd
       this, text, spv::Op::OpCooperativeMatrixStoreHW);
   ExpectNoHwOrCoopMatrix(result);
   EXPECT_EQ(0u, CountSubstring(result, "Aligned 16"));
-  EXPECT_EQ(4u, CountSubstring(result, "Aligned 4"));
+  EXPECT_EQ(2u, CountSubstring(result, "Aligned 4"));
 }
 
 TEST_F(HwLowerToStandardTest, VectorLoadPreservesAlignedMemoryAccess) {
@@ -209,7 +209,7 @@ OpFunctionEnd
       this, text, spv::Op::OpCooperativeVectorLoadHW);
   ExpectNoHwOrCoopMatrix(result);
   EXPECT_EQ(0u, CountSubstring(result, "Aligned 16"));
-  EXPECT_EQ(4u, CountSubstring(result, "Aligned 4"));
+  EXPECT_EQ(2u, CountSubstring(result, "Aligned 4"));
 }
 
 TEST_F(HwLowerToStandardTest, VectorStorePreservesAlignedMemoryAccess) {
@@ -251,7 +251,7 @@ OpFunctionEnd
       this, text, spv::Op::OpCooperativeVectorStoreHW);
   ExpectNoHwOrCoopMatrix(result);
   EXPECT_EQ(0u, CountSubstring(result, "Aligned 16"));
-  EXPECT_EQ(4u, CountSubstring(result, "Aligned 4"));
+  EXPECT_EQ(2u, CountSubstring(result, "Aligned 4"));
 }
 
 TEST_F(HwLowerToStandardTest, VectorLoadPreservesFullMemoryAccessOperands) {
@@ -578,7 +578,7 @@ TEST_F(HwLowerToStandardTest, ForceScalarModeLowersF16VectorLoadStoreToScalar) {
 ; CHECK: OpTypeArray %half %uint_8
 ; CHECK: OpLoad %half
 ; CHECK: OpStore
-; CHECK-NOT: OpTypeVector %half 4
+; CHECK-NOT: OpTypeVector %half 2
 ; CHECK-NOT: OpFunctionCall
 ; CHECK-NOT: OpLoopMerge
 OpCapability Shader
@@ -619,7 +619,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(8u, CountSubstring(disassembly, "OpLoad %half"));
   EXPECT_EQ(8u, CountSubstring(disassembly, "OpStore"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 2"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
 }
@@ -630,7 +630,7 @@ TEST_F(HwLowerToStandardTest, ForceScalarModeLowersF16MatrixLoadStoreToScalar) {
 ; CHECK: OpTypeArray %half %uint_16
 ; CHECK: OpLoad %half
 ; CHECK: OpStore
-; CHECK-NOT: OpTypeVector %half 4
+; CHECK-NOT: OpTypeVector %half 2
 ; CHECK-NOT: OpFunctionCall
 ; CHECK-NOT: OpLoopMerge
 OpCapability Shader
@@ -678,7 +678,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(16u, CountSubstring(disassembly, "OpLoad %half"));
   EXPECT_EQ(16u, CountSubstring(disassembly, "OpStore"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 4"));
+  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %half 2"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
 }
@@ -687,13 +687,13 @@ TEST_F(HwLowerToStandardTest, LowersVectorLoadStoreF16Packed) {
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK: OpTypeFloat 16
-; CHECK: OpTypeVector %half 4
-; CHECK: OpTypeArray %v4half %uint_2
+; CHECK: OpTypeVector %half 2
+; CHECK: OpTypeArray %v2half %uint_4
 ; CHECK-DAG: OpLoopMerge
 ; CHECK-DAG: OpLoad %half
-; CHECK-DAG: OpLoad %v4half
+; CHECK-DAG: OpLoad %v2half
 ; CHECK-DAG: OpCompositeExtract %half
-; CHECK-DAG: OpFunctionCall %v4half
+; CHECK-DAG: OpFunctionCall %v2half
 ; CHECK-DAG: OpFunctionCall %void
 ; CHECK-DAG: OpStore
 OpCapability Shader
@@ -738,13 +738,13 @@ TEST_F(HwLowerToStandardTest, LowersMatrixLoadStoreF16PackedRowMajor) {
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK: OpTypeFloat 16
-; CHECK: OpTypeVector %half 4
-; CHECK: OpTypeArray %v4half %uint_8
+; CHECK: OpTypeVector %half 2
+; CHECK: OpTypeArray %v2half %uint_16
 ; CHECK-DAG: OpLoopMerge
 ; CHECK-DAG: OpLoad %half
-; CHECK-DAG: OpLoad %v4half
+; CHECK-DAG: OpLoad %v2half
 ; CHECK-DAG: OpCompositeExtract %half
-; CHECK-DAG: OpFunctionCall %v4half
+; CHECK-DAG: OpFunctionCall %v2half
 ; CHECK-DAG: OpFunctionCall %void
 ; CHECK-DAG: OpStore
 OpCapability Shader
@@ -794,11 +794,11 @@ TEST_F(HwLowerToStandardTest, LowersMatrixLoadStoreF16PackedColumnMajor) {
   const std::string text = R"(
 ; CHECK-NOT: HW
 ; CHECK: OpTypeFloat 16
-; CHECK: OpTypeVector %half 4
-; CHECK: OpTypeArray %v4half %uint_8
+; CHECK: OpTypeVector %half 2
+; CHECK: OpTypeArray %v2half %uint_16
 ; CHECK: OpLoad %half
-; CHECK: OpCompositeConstruct %v4half
-; CHECK: OpCompositeExtract %v4half
+; CHECK: OpCompositeConstruct %v2half
+; CHECK: OpCompositeExtract %v2half
 ; CHECK: OpCompositeExtract %half
 ; CHECK: OpStore
 OpCapability Shader
@@ -893,11 +893,11 @@ OpFunctionEnd
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypePointer Function %_arr_v4float_uint_2"));
-  EXPECT_GE(CountSubstring(disassembly, "OpLoad %_arr_v4float_uint_2"), 2u);
+            disassembly.find("OpTypePointer Function %_arr_v2float_uint_4"));
+  EXPECT_GE(CountSubstring(disassembly, "OpLoad %_arr_v2float_uint_4"), 2u);
   EXPECT_GE(CountSubstring(disassembly, "OpStore"), 2u);
   EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 2u);
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v4float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %v2float"), 0u);
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -936,7 +936,7 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpLoad %_arr_v4float_uint_1"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpLoad %_arr_v2float_uint_2"));
   EXPECT_NE(std::string::npos, disassembly.find("OpStore %"));
   EXPECT_NE(std::string::npos, disassembly.find("%float_1"));
 }
@@ -972,7 +972,7 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpLoad %_arr_v4float_uint_1"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpLoad %_arr_v2float_uint_2"));
   EXPECT_EQ(1u, CountSubstring(disassembly, " Volatile"));
 }
 

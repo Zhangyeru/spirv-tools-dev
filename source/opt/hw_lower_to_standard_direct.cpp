@@ -116,7 +116,7 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
     bias_constant_id = bias_source->result_id();
   }
   if (!result || !input || !matrix ||
-      !CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)) {
+      !CanUsePackedVec2VectorMatrixMul(*result, *input, *matrix, bias)) {
     return true;
   }
 
@@ -283,13 +283,13 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx);
   const uint32_t function_id =
       has_bias
-          ? BuildFusedVectorMatmulAddStoreFunctionPackedVec4(
+          ? BuildFusedVectorMatmulAddStoreFunctionPackedVec2(
                 *result, *input, *matrix, bias, has_bias, bias_constant_id,
                 input_pointer_id, input_pointer_type_id, input_memory_operands,
                 matrix_pointer_id, matrix_pointer_type_id, matrix_shape_id,
                 matrix_offset_id, matrix_memory_operands, output_pointer_id,
                 output_pointer_type_id, output_memory_operands)
-          : BuildFusedVectorMatmulStoreFunctionPackedVec4(
+          : BuildFusedVectorMatmulStoreFunctionPackedVec2(
                 *result, *input, *matrix, input_pointer_id,
                 input_pointer_type_id, input_memory_operands, matrix_pointer_id,
                 matrix_pointer_type_id, matrix_shape_id, matrix_offset_id,
@@ -356,7 +356,7 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
   const MatrixTypeInfo* b = GetMatrixTypeForValue(b_load);
   const MatrixTypeInfo* c = GetMatrixTypeForValue(c_load);
   if (!result || !a || !b || !c ||
-      !CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)) {
+      !CanUsePackedVec2MatrixMulAdd(*result, *a, *b, *c)) {
     return true;
   }
 
@@ -529,7 +529,7 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
     }
   }
 
-  const uint32_t function_id = BuildFusedMatrixMatmulStoreFunctionPackedVec4(
+  const uint32_t function_id = BuildFusedMatrixMatmulStoreFunctionPackedVec2(
       *result, *a, *b, *c, a_pointer_id, a_pointer_type_id, a_shape_id,
       a_offset_id, CopyMemoryOperands(a_load, kHwMatrixLoadMemoryOperandsInIdx),
       b_pointer_id, b_pointer_type_id, b_shape_id, b_offset_id,
@@ -1073,7 +1073,7 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAdd(Instruction* inst,
   return true;
 }
 
-bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
+bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec2(
     Instruction* inst, bool has_bias, bool* handled) {
   if (handled) *handled = false;
   if (!handled || !inst ||
@@ -1454,7 +1454,7 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec4(
   }
   if (!DirectKillListUsersAreClosed(inst, kill_list)) return true;
 
-  const uint32_t function_id = BuildDirectVectorMatmulFunctionPackedVec4(
+  const uint32_t function_id = BuildDirectVectorMatmulFunctionPackedVec2(
       *result, *input, *matrix, bias, has_bias,
       input_is_value ? 0 : direct_input.pointer_id,
       input_is_value ? 0 : direct_input.pointer_type_id,

@@ -33,12 +33,12 @@ class BasicBlock;
 struct Operand;
 
 // Lowers HW cooperative matrix/vector types and operations to ordinary SPIR-V
-// array code.  By default, f16/f32 values use packed vec4 arrays when naturally
-// 4-wide, and scalar arrays otherwise.
+// array code.  By default, even-width f16/f32 values use packed vec2 arrays,
+// and odd-width values use scalar arrays.
 class HwLowerToStandardPass : public Pass {
  public:
   enum class LoweringMode {
-    kPreferPackedVec4,
+    kPreferPackedVec2,
     kForceScalar,
   };
 
@@ -48,7 +48,7 @@ class HwLowerToStandardPass : public Pass {
   };
 
   explicit HwLowerToStandardPass(
-      LoweringMode lowering_mode = LoweringMode::kPreferPackedVec4,
+      LoweringMode lowering_mode = LoweringMode::kPreferPackedVec2,
       CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly,
       uint32_t max_elements = 1048576, uint64_t max_matmul_macs = 16777216,
       uint32_t max_unrolled_elements = 4096,
@@ -73,9 +73,9 @@ class HwLowerToStandardPass : public Pass {
     spv::CooperativeMatrixUseHW matrix_use =
         spv::CooperativeMatrixUseHW::MatrixUseAHW;
     uint32_t lowered_type_id = 0;
-    bool packed_f16vec4 = false;
-    bool packed_f32vec4 = false;
-    uint32_t packed_vec4_type_id = 0;
+    bool packed_f16vec2 = false;
+    bool packed_f32vec2 = false;
+    uint32_t packed_vec2_type_id = 0;
     uint32_t packed_cols = 0;
   };
 
@@ -84,9 +84,9 @@ class HwLowerToStandardPass : public Pass {
     uint32_t component_type_id = 0;
     uint32_t length = 0;
     uint32_t lowered_type_id = 0;
-    bool packed_f16vec4 = false;
-    bool packed_f32vec4 = false;
-    uint32_t packed_vec4_type_id = 0;
+    bool packed_f16vec2 = false;
+    bool packed_f32vec2 = false;
+    uint32_t packed_vec2_type_id = 0;
     uint32_t packed_length = 0;
   };
 
@@ -94,7 +94,7 @@ class HwLowerToStandardPass : public Pass {
     uint32_t component_type_id = 0;
     uint32_t piece_type_id = 0;
     uint32_t piece_count = 0;
-    bool packed_vec4 = false;
+    bool packed_vec2 = false;
   };
 
   // Describes a cooperative load that can be folded into a generated direct
@@ -145,7 +145,7 @@ class HwLowerToStandardPass : public Pass {
   bool LowerMatrixLoad(Instruction* inst);
   bool LowerMatrixStore(Instruction* inst, std::vector<Instruction*>* to_kill);
   bool LowerMatrixMulAdd(Instruction* inst);
-  bool LowerMatrixMulAddPackedVec4(Instruction* inst);
+  bool LowerMatrixMulAddPackedVec2(Instruction* inst);
   bool LowerMatrixMulAddScalarFallback(Instruction* inst);
   bool LowerMatrixMulAddWithLoop(Instruction* inst);
   bool LowerMatrixLength(Instruction* inst, std::vector<Instruction*>* to_kill);
@@ -158,10 +158,10 @@ class HwLowerToStandardPass : public Pass {
   bool TryLowerFusedVectorMatmulStore(Instruction* inst, bool* handled);
   bool TryLowerFusedMatrixMatmulStore(Instruction* inst, bool* handled);
   bool TryLowerDirectMatrixMulAdd(Instruction* inst, bool* handled);
-  bool TryLowerDirectVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias,
+  bool TryLowerDirectVectorMatrixMulPackedVec2(Instruction* inst, bool has_bias,
                                                bool* handled);
   bool LowerVectorMatrixMul(Instruction* inst, bool has_bias);
-  bool LowerVectorMatrixMulPackedVec4(Instruction* inst, bool has_bias);
+  bool LowerVectorMatrixMulPackedVec2(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulScalarFallback(Instruction* inst, bool has_bias);
   bool LowerVectorMatrixMulWithLoop(Instruction* inst, bool has_bias);
   bool LowerConstantComposite(Instruction* inst);
@@ -184,7 +184,7 @@ class HwLowerToStandardPass : public Pass {
   uint32_t GetOrCreateVectorType(uint32_t component_type_id,
                                  uint32_t component_count,
                                  Instruction** insert_after);
-  uint32_t GetOrCreatePackedArrayType(uint32_t vec4_type_id, uint32_t length,
+  uint32_t GetOrCreatePackedArrayType(uint32_t vec2_type_id, uint32_t length,
                                       Instruction* insert_after);
   uint32_t GetOrCreatePointerType(uint32_t pointee_type_id,
                                   spv::StorageClass storage_class);
@@ -200,7 +200,7 @@ class HwLowerToStandardPass : public Pass {
   uint32_t GetOrCreateZero(uint32_t type_id);
   uint32_t GetOrCreateCompositeConstant(
       uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
-      Instruction** insert_after, spv::Op opcode);
+      Instruction** insert_after, Instruction* reuse_before, spv::Op opcode);
   bool RemapCompositeIndices(Instruction* inst, uint32_t composite_in_operand,
                              uint32_t first_index_in_operand);
   bool LowerAccessChain(Instruction* inst);
@@ -233,12 +233,12 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildLogicalAggregateLoad(InstructionBuilder* builder,
                                      uint32_t aggregate_pointer_id,
                                      uint32_t component_type_id,
-                                     uint32_t packed_vec4_type_id,
+                                     uint32_t packed_vec2_type_id,
                                      uint32_t logical_index_id);
   bool BuildLogicalAggregateStore(InstructionBuilder* builder,
                                   uint32_t aggregate_pointer_id,
                                   uint32_t component_type_id,
-                                  uint32_t packed_vec4_type_id,
+                                  uint32_t packed_vec2_type_id,
                                   uint32_t logical_index_id, uint32_t value_id);
   BasicBlock* MakeBasicBlock(uint32_t label_id);
   bool BuildPackedMatrixLoadOuterLoop(
@@ -265,12 +265,12 @@ class HwLowerToStandardPass : public Pass {
                              uint32_t pointer_id, uint32_t object_id,
                              uint32_t shape_id, uint32_t offset_id,
                              uint32_t matrix_cols, uint32_t layout,
-                             bool is_matrix, uint32_t packed_vec4_type_id,
+                             bool is_matrix, uint32_t packed_vec2_type_id,
                              const std::vector<Operand>& memory_operands,
                              uint32_t* result_id);
   uint32_t BuildConstantPackedVectorSelectFunction(const VectorTypeInfo& vector,
                                                    uint32_t constant_id);
-  uint32_t BuildFusedVectorMatmulStoreFunctionPackedVec4(
+  uint32_t BuildFusedVectorMatmulStoreFunctionPackedVec2(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, uint32_t input_pointer_id,
       uint32_t input_pointer_type_id,
@@ -280,7 +280,7 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t output_pointer_id, uint32_t output_pointer_type_id,
       const std::vector<Operand>& output_memory_operands);
-  uint32_t BuildFusedVectorMatmulAddStoreFunctionPackedVec4(
+  uint32_t BuildFusedVectorMatmulAddStoreFunctionPackedVec2(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
       uint32_t bias_constant_id, uint32_t input_pointer_id,
@@ -291,7 +291,7 @@ class HwLowerToStandardPass : public Pass {
       const std::vector<Operand>& matrix_memory_operands,
       uint32_t output_pointer_id, uint32_t output_pointer_type_id,
       const std::vector<Operand>& output_memory_operands);
-  uint32_t BuildFusedMatrixMatmulStoreFunctionPackedVec4(
+  uint32_t BuildFusedMatrixMatmulStoreFunctionPackedVec2(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
       uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
@@ -303,7 +303,7 @@ class HwLowerToStandardPass : public Pass {
       uint32_t output_pointer_type_id, uint32_t output_shape_id,
       uint32_t output_offset_id,
       const std::vector<Operand>& output_memory_operands);
-  uint32_t BuildDirectVectorMatmulFunctionPackedVec4(
+  uint32_t BuildDirectVectorMatmulFunctionPackedVec2(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
       uint32_t input_pointer_id, uint32_t input_pointer_type_id,
@@ -320,7 +320,7 @@ class HwLowerToStandardPass : public Pass {
       bool bias_conversion_has_explicit_fp_fast_math_mode,
       uint32_t bias_constant_id, bool bias_is_value,
       const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments = {});
-  uint32_t BuildDirectMatmulFunctionPackedVec4(
+  uint32_t BuildDirectMatmulFunctionPackedVec2(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c, uint32_t a_pointer_id,
       uint32_t a_pointer_type_id, uint32_t a_shape_id, uint32_t a_offset_id,
@@ -402,7 +402,7 @@ class HwLowerToStandardPass : public Pass {
   bool RebuildMatrixFromScalars(Instruction* inst, const MatrixTypeInfo& info,
                                 const std::vector<uint32_t>& scalar_ids);
   bool RebuildAggregateFromScalars(Instruction* inst, uint32_t lowered_type_id,
-                                   uint32_t packed_vec4_type_id,
+                                   uint32_t packed_vec2_type_id,
                                    uint32_t packed_piece_count,
                                    uint32_t expected_scalar_count,
                                    const std::vector<uint32_t>& scalar_ids,
@@ -410,15 +410,15 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildMatrixRowVector(InstructionBuilder* builder,
                                 const MatrixTypeInfo& info, uint32_t matrix_id,
                                 uint32_t row, uint32_t col_start,
-                                uint32_t vec4_type_id);
+                                uint32_t vec2_type_id);
   uint32_t BuildMatrixColumnVector(InstructionBuilder* builder,
                                    const MatrixTypeInfo& info,
                                    uint32_t matrix_id, uint32_t row_start,
-                                   uint32_t col, uint32_t vec4_type_id);
+                                   uint32_t col, uint32_t vec2_type_id);
   uint32_t BuildVectorTimesScalar(InstructionBuilder* builder,
-                                  spv::Op scale_opcode, uint32_t vec4_type_id,
+                                  spv::Op scale_opcode, uint32_t vec2_type_id,
                                   uint32_t vector_id, uint32_t scalar_id);
-  uint32_t BuildScalarSplat(InstructionBuilder* builder, uint32_t vec4_type_id,
+  uint32_t BuildScalarSplat(InstructionBuilder* builder, uint32_t vec2_type_id,
                             uint32_t scalar_id);
   uint32_t BuildFma(InstructionBuilder* builder, uint32_t type_id,
                     uint32_t multiplicand_id, uint32_t multiplier_id,
@@ -434,12 +434,12 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildReduceCombine(InstructionBuilder* builder,
                               uint32_t component_type_id, uint32_t combine_op,
                               uint32_t lhs_id, uint32_t rhs_id);
-  bool BuildVectorMatrixMulPatternPackedVec4(
+  bool BuildVectorMatrixMulPatternPackedVec2(
       InstructionBuilder* builder, const VectorTypeInfo& result,
       const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
       const VectorTypeInfo* bias, uint32_t input_id, uint32_t matrix_id,
       uint32_t bias_id, bool has_bias, std::vector<uint32_t>* element_ids);
-  bool BuildMatmulPatternPackedVec4(InstructionBuilder* builder,
+  bool BuildMatmulPatternPackedVec2(InstructionBuilder* builder,
                                     const MatrixTypeInfo& result,
                                     const MatrixTypeInfo& a,
                                     const MatrixTypeInfo& b,
@@ -454,23 +454,23 @@ class HwLowerToStandardPass : public Pass {
                                    const std::vector<uint32_t>& param_type_ids);
   uint32_t GetOrCreatePackedLoadChunkFunction(
       uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
-      uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
+      uint32_t vec2_type_id, const std::vector<Operand>& memory_operands);
   uint32_t GetOrCreatePackedStoreChunkFunction(
       uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
-      uint32_t vec4_type_id, const std::vector<Operand>& memory_operands);
-  uint32_t GetOrCreateTileWeightFunctionPackedVec4(
+      uint32_t vec2_type_id, const std::vector<Operand>& memory_operands);
+  uint32_t GetOrCreateTileWeightFunctionPackedVec2(
       const MatrixTypeInfo& matrix);
-  uint32_t GetOrCreateMatmulTileWeightFunctionPackedVec4(
+  uint32_t GetOrCreateMatmulTileWeightFunctionPackedVec2(
       const MatrixTypeInfo& matrix);
-  uint32_t GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+  uint32_t GetOrCreateVectorMatmulPatternFunctionPackedVec2(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias);
-  uint32_t GetOrCreateVectorMatmulPatternPointerFunctionPackedVec4(
+  uint32_t GetOrCreateVectorMatmulPatternPointerFunctionPackedVec2(
       const VectorTypeInfo& result, const VectorTypeInfo& input,
       const MatrixTypeInfo& matrix, const VectorTypeInfo* bias, bool has_bias,
       uint32_t input_pointer_type_id, uint32_t matrix_pointer_type_id,
       uint32_t bias_pointer_type_id);
-  uint32_t GetOrCreateMatmulPatternFunctionPackedVec4(
+  uint32_t GetOrCreateMatmulPatternFunctionPackedVec2(
       const MatrixTypeInfo& result, const MatrixTypeInfo& a,
       const MatrixTypeInfo& b, const MatrixTypeInfo& c);
   uint32_t GetFunctionPointerOperandForLoad(Instruction* inst,
@@ -571,13 +571,13 @@ class HwLowerToStandardPass : public Pass {
                                        const MatrixTypeInfo& a,
                                        const MatrixTypeInfo& b,
                                        const MatrixTypeInfo& c) const;
-  bool IsPackedVec4(const MatrixTypeInfo& info) const;
-  bool IsPackedVec4(const VectorTypeInfo& info) const;
-  bool IsSamePackedVec4Kind(const MatrixTypeInfo& a,
+  bool IsPackedVec2(const MatrixTypeInfo& info) const;
+  bool IsPackedVec2(const VectorTypeInfo& info) const;
+  bool IsSamePackedVec2Kind(const MatrixTypeInfo& a,
                             const MatrixTypeInfo& b) const;
-  bool IsSamePackedVec4Kind(const VectorTypeInfo& a,
+  bool IsSamePackedVec2Kind(const VectorTypeInfo& a,
                             const VectorTypeInfo& b) const;
-  bool CanUsePackedVec4MatrixMulAdd(const MatrixTypeInfo& result,
+  bool CanUsePackedVec2MatrixMulAdd(const MatrixTypeInfo& result,
                                     const MatrixTypeInfo& a,
                                     const MatrixTypeInfo& b,
                                     const MatrixTypeInfo& c) const;
@@ -585,7 +585,7 @@ class HwLowerToStandardPass : public Pass {
                                 const MatrixTypeInfo& a,
                                 const MatrixTypeInfo& b,
                                 const MatrixTypeInfo& c) const;
-  bool CanUsePackedVec4VectorMatrixMul(const VectorTypeInfo& result,
+  bool CanUsePackedVec2VectorMatrixMul(const VectorTypeInfo& result,
                                        const VectorTypeInfo& input,
                                        const MatrixTypeInfo& matrix,
                                        const VectorTypeInfo* bias) const;
@@ -593,7 +593,7 @@ class HwLowerToStandardPass : public Pass {
                                    const VectorTypeInfo& input,
                                    const MatrixTypeInfo& matrix,
                                    const VectorTypeInfo* bias) const;
-  bool ShouldUsePackedVec4(uint32_t extent) const;
+  bool ShouldUsePackedVec2(uint32_t extent) const;
   uint32_t MatrixFlatIndex(const MatrixTypeInfo& info, uint32_t row,
                            uint32_t col) const;
   uint32_t MatrixPackedIndex(const MatrixTypeInfo& info, uint32_t row,
@@ -656,7 +656,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> generated_function_ids_;
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
   std::vector<std::pair<uint32_t, uint32_t>> pending_fp_fast_math_modes_;
-  LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec4;
+  LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec2;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
   uint32_t max_elements_ = 1048576;
   uint64_t max_matmul_macs_ = 16777216;

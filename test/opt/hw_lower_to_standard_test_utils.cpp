@@ -52,16 +52,16 @@ OpExecutionMode %main LocalSize 1 1 1
 %one = OpConstant %float 1
 %v2half = OpTypeVector %half 2
 %v2float = OpTypeVector %float 2
-%v4half = OpTypeVector %half 4
-%v4float = OpTypeVector %float 4
+%ordinary_v4half = OpTypeVector %half 4
+%ordinary_v4float = OpTypeVector %float 4
 %m2half = OpTypeMatrix %v2half 2
 %m2float = OpTypeMatrix %v2float 2
 %hvec4 = OpTypeCooperativeVectorHW %half %uint_4
 %fvec4 = OpTypeCooperativeVectorHW %float %uint_4
 %hmat2 = OpTypeCooperativeMatrixHW %half %uint_2 %uint_2
 %fmat2 = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
-%ordinary_half = OpUndef %v4half
-%ordinary_float = OpUndef %v4float
+%ordinary_half = OpUndef %ordinary_v4half
+%ordinary_float = OpUndef %ordinary_v4float
 %ordinary_half_matrix = OpUndef %m2half
 %ordinary_float_matrix = OpUndef %m2float
 %hw_half = OpUndef %hvec4
@@ -122,24 +122,24 @@ void ExpectNoHwOrCoopMatrix(const std::string& text) {
   EXPECT_EQ(0u, CountSubstring(text, "OpCooperativeMatrix"));
 }
 
-void ExpectPackedVec4Math(const std::string& text,
+void ExpectPackedVec2Math(const std::string& text,
                           const std::string& component_name) {
   ExpectNoHwOrCoopMatrix(text);
   EXPECT_NE(std::string::npos,
-            text.find("OpTypeVector " + component_name + " 4"));
-  EXPECT_GT(CountSubstring(text, "OpTypeArray %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpExtInst %v4"), 0u);
+            text.find("OpTypeVector " + component_name + " 2"));
+  EXPECT_GT(CountSubstring(text, "OpTypeArray %v2"), 0u);
+  EXPECT_GT(CountSubstring(text, "OpExtInst %v2"), 0u);
   EXPECT_GT(CountSubstring(text, " Fma "), 0u);
   EXPECT_EQ(0u, CountSubstring(text, "OpVectorTimesScalar"));
 }
 
-void ExpectPackedVec4MatmulPattern(const std::string& text,
+void ExpectPackedVec2MatmulPattern(const std::string& text,
                                    const std::string& component_name) {
   ExpectNoHwOrCoopMatrix(text);
   EXPECT_NE(std::string::npos,
-            text.find("OpTypeVector " + component_name + " 4"));
-  EXPECT_GT(CountSubstring(text, "OpTypeArray %v4"), 0u);
-  EXPECT_GT(CountSubstring(text, "OpExtInst %v4"), 0u);
+            text.find("OpTypeVector " + component_name + " 2"));
+  EXPECT_GT(CountSubstring(text, "OpTypeArray %v2"), 0u);
+  EXPECT_GT(CountSubstring(text, "OpExtInst %v2"), 0u);
   EXPECT_GT(CountSubstring(text, " Fma "), 0u);
   EXPECT_GT(CountSubstring(text, "OpCompositeExtract " + component_name), 0u);
   EXPECT_GT(CountSubstring(text, "OpFunctionCall"), 0u);

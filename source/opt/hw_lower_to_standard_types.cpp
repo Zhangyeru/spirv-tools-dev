@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -114,13 +113,13 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       }
 
       if (IsFloat16Type(info.component_type_id) &&
-          ShouldUsePackedVec4(info.cols)) {
-        info.packed_f16vec4 = true;
-        info.packed_cols = info.cols / kPackedVec4Width;
+          ShouldUsePackedVec2(info.cols)) {
+        info.packed_f16vec2 = true;
+        info.packed_cols = info.cols / kPackedVec2Width;
       } else if (IsFloat32Type(info.component_type_id) &&
-                 ShouldUsePackedVec4(info.cols)) {
-        info.packed_f32vec4 = true;
-        info.packed_cols = info.cols / kPackedVec4Width;
+                 ShouldUsePackedVec2(info.cols)) {
+        info.packed_f32vec2 = true;
+        info.packed_cols = info.cols / kPackedVec2Width;
       }
       matrix_types_[info.type_id] = info;
       continue;
@@ -161,13 +160,13 @@ bool HwLowerToStandardPass::CollectHwTypes() {
     }
 
     if (IsFloat16Type(info.component_type_id) &&
-        ShouldUsePackedVec4(info.length)) {
-      info.packed_f16vec4 = true;
-      info.packed_length = info.length / kPackedVec4Width;
+        ShouldUsePackedVec2(info.length)) {
+      info.packed_f16vec2 = true;
+      info.packed_length = info.length / kPackedVec2Width;
     } else if (IsFloat32Type(info.component_type_id) &&
-               ShouldUsePackedVec4(info.length)) {
-      info.packed_f32vec4 = true;
-      info.packed_length = info.length / kPackedVec4Width;
+               ShouldUsePackedVec2(info.length)) {
+      info.packed_f32vec2 = true;
+      info.packed_length = info.length / kPackedVec2Width;
     }
     vector_types_[info.type_id] = info;
   }
@@ -192,12 +191,12 @@ bool HwLowerToStandardPass::MaterializeLoweredTypes() {
       MatrixTypeInfo& info = matrix_entry->second;
       Instruction* insertion_point = get_def_use_mgr()->GetDef(info.type_id);
       if (!insertion_point) return false;
-      if (IsPackedVec4(info)) {
-        info.packed_vec4_type_id = GetOrCreateVectorType(
-            info.component_type_id, kPackedVec4Width, &insertion_point);
-        if (info.packed_vec4_type_id == 0) return false;
+      if (IsPackedVec2(info)) {
+        info.packed_vec2_type_id = GetOrCreateVectorType(
+            info.component_type_id, kPackedVec2Width, &insertion_point);
+        if (info.packed_vec2_type_id == 0) return false;
         info.lowered_type_id = GetOrCreatePackedArrayType(
-            info.packed_vec4_type_id, info.rows * info.packed_cols,
+            info.packed_vec2_type_id, info.rows * info.packed_cols,
             insertion_point);
       } else {
         info.lowered_type_id = GetOrCreateArrayType(
@@ -213,12 +212,12 @@ bool HwLowerToStandardPass::MaterializeLoweredTypes() {
       VectorTypeInfo& info = vector_entry->second;
       Instruction* insertion_point = get_def_use_mgr()->GetDef(info.type_id);
       if (!insertion_point) return false;
-      if (IsPackedVec4(info)) {
-        info.packed_vec4_type_id = GetOrCreateVectorType(
-            info.component_type_id, kPackedVec4Width, &insertion_point);
-        if (info.packed_vec4_type_id == 0) return false;
+      if (IsPackedVec2(info)) {
+        info.packed_vec2_type_id = GetOrCreateVectorType(
+            info.component_type_id, kPackedVec2Width, &insertion_point);
+        if (info.packed_vec2_type_id == 0) return false;
         info.lowered_type_id = GetOrCreatePackedArrayType(
-            info.packed_vec4_type_id, info.packed_length, insertion_point);
+            info.packed_vec2_type_id, info.packed_length, insertion_point);
       } else {
         info.lowered_type_id = GetOrCreateArrayType(
             info.component_type_id, info.length, insertion_point);
@@ -322,8 +321,8 @@ uint32_t HwLowerToStandardPass::GetOrCreateVectorType(
 }
 
 uint32_t HwLowerToStandardPass::GetOrCreatePackedArrayType(
-    uint32_t vec4_type_id, uint32_t length, Instruction* insert_after) {
-  return GetOrCreateArrayType(vec4_type_id, length, insert_after);
+    uint32_t vec2_type_id, uint32_t length, Instruction* insert_after) {
+  return GetOrCreateArrayType(vec2_type_id, length, insert_after);
 }
 
 uint32_t HwLowerToStandardPass::GetOrCreatePointerType(
@@ -533,24 +532,25 @@ uint32_t HwLowerToStandardPass::GetOrCreateZero(uint32_t type_id) {
 
 uint32_t HwLowerToStandardPass::GetOrCreateCompositeConstant(
     uint32_t type_id, const std::vector<uint32_t>& constituent_ids,
-    Instruction** insert_after, spv::Op opcode) {
+    Instruction** insert_after, Instruction* reuse_before, spv::Op opcode) {
   if (opcode != spv::Op::OpConstantComposite &&
       opcode != spv::Op::OpSpecConstantComposite) {
     return 0;
   }
+  bool can_reuse = true;
   for (Instruction& inst : get_module()->types_values()) {
-    if (inst.opcode() != opcode || inst.type_id() != type_id ||
-        inst.NumInOperands() != constituent_ids.size()) {
-      continue;
-    }
-    bool matches = true;
-    for (uint32_t i = 0; i < constituent_ids.size(); ++i) {
-      if (inst.GetSingleWordInOperand(i) != constituent_ids[i]) {
-        matches = false;
-        break;
+    if (&inst == reuse_before) can_reuse = false;
+    if (can_reuse && inst.opcode() == opcode && inst.type_id() == type_id &&
+        inst.NumInOperands() == constituent_ids.size()) {
+      bool matches = true;
+      for (uint32_t i = 0; i < constituent_ids.size(); ++i) {
+        if (inst.GetSingleWordInOperand(i) != constituent_ids[i]) {
+          matches = false;
+          break;
+        }
       }
+      if (matches) return inst.result_id();
     }
-    if (matches) return inst.result_id();
   }
 
   const uint32_t result_id = TakeNextId();

@@ -105,10 +105,10 @@ Options (in lexicographical order):)",
   --hw-lower-to-standard[=<options>]
                Lowers supported HW cooperative matrix/vector ops and types to
                ordinary SPIR-V arrays while retaining other HW extension
-               features. Defaults to pack, which uses packed vec4 arrays for
-               f16/f32 types and scalar arrays otherwise. Use scalar to force
-               scalar arrays. Options are a comma-separated list containing an
-               optional pack or scalar mode and any of:
+               features. Defaults to pack, which uses packed vec2 arrays for
+               even-width f16/f32 types and scalar arrays otherwise. Use scalar
+               to force scalar arrays. Options are a comma-separated list
+               containing an optional pack or scalar mode and any of:
                  max-elements=N,max-macs=N,
                  unroll-elements=N,unroll-macs=N
                Values must be positive and each unroll limit must not exceed

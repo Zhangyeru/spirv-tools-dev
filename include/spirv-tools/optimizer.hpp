@@ -46,7 +46,7 @@ enum class HwLoweringCompleteness {
 // Configuration for the HW cooperative matrix/vector lowering pass.
 struct HwLowerToStandardOptions {
   // Use scalar arrays for every lowered value instead of preferring packed
-  // vec4 arrays for naturally aligned f16/f32 values.
+  // vec2 arrays for even-width f16/f32 values.
   bool force_scalar_lowering = false;
 
   // Controls whether unsupported, non-cooperative HW extension features may
@@ -273,7 +273,7 @@ class SPIRV_TOOLS_EXPORT Optimizer {
 
  private:
   struct SPIRV_TOOLS_LOCAL Impl;  // Opaque struct for holding internal data.
-  std::unique_ptr<Impl> impl_;  // Unique pointer to internal data.
+  std::unique_ptr<Impl> impl_;    // Unique pointer to internal data.
 };
 
 // Creates a null pass.

@@ -68,15 +68,15 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
                              static_cast<uint64_t>(a->cols);
   bool lowered = mac_count > max_unrolled_matmul_macs_
                      ? LowerMatrixMulAddWithLoop(inst)
-                     : (CanUsePackedVec4MatrixMulAdd(*result, *a, *b, *c)
-                            ? LowerMatrixMulAddPackedVec4(inst)
+                     : (CanUsePackedVec2MatrixMulAdd(*result, *a, *b, *c)
+                            ? LowerMatrixMulAddPackedVec2(inst)
                             : LowerMatrixMulAddScalarFallback(inst));
   if (lowered) RemoveFPFastMathMode(inst->result_id());
   active_fp_fast_math_mode_ = saved_fast_math_mode;
   return lowered;
 }
 
-bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
+bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec2(Instruction* inst) {
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
@@ -97,7 +97,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAddPackedVec4(Instruction* inst) {
   if (handled) return true;
 
   const uint32_t function_id =
-      GetOrCreateMatmulPatternFunctionPackedVec4(*result, *a, *b, *c);
+      GetOrCreateMatmulPatternFunctionPackedVec2(*result, *a, *b, *c);
   if (function_id == 0) {
     return false;
   }
@@ -192,18 +192,18 @@ bool HwLowerToStandardPass::LowerMatrixMulAddScalarFallback(Instruction* inst) {
     if (id == 0) return false;
   }
 
-  if (IsPackedVec4(*result)) {
+  if (IsPackedVec2(*result)) {
     std::vector<uint32_t> element_ids(result->rows * result->packed_cols, 0);
     for (uint32_t row = 0; row < result->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < result->packed_cols; ++col_pack) {
         std::vector<uint32_t> lane_ids;
-        lane_ids.reserve(kPackedVec4Width);
-        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+        lane_ids.reserve(kPackedVec2Width);
+        for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
           lane_ids.push_back(scalar_ids[MatrixFlatIndex(
-              *result, row, col_pack * kPackedVec4Width + lane)]);
+              *result, row, col_pack * kPackedVec2Width + lane)]);
         }
         Instruction* vec = builder.AddCompositeConstruct(
-            result->packed_vec4_type_id, lane_ids);
+            result->packed_vec2_type_id, lane_ids);
         if (!vec) return false;
         element_ids[MatrixPackedIndex(*result, row, col_pack)] =
             vec->result_id();
@@ -371,7 +371,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAddWithLoop(Instruction* inst) {
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   const uint32_t initial_accumulator = BuildLogicalAggregateLoad(
       &outer_body_builder, c_variable->result_id(), c->component_type_id,
-      c->packed_vec4_type_id, output_index->result_id());
+      c->packed_vec2_type_id, output_index->result_id());
   if (initial_accumulator == 0 ||
       !outer_body_builder.AddStore(accumulator_variable->result_id(),
                                    initial_accumulator) ||
@@ -422,10 +422,10 @@ bool HwLowerToStandardPass::LowerMatrixMulAddWithLoop(Instruction* inst) {
   if (!row || !col || !a_index || !b_index) return false;
   const uint32_t a_value = BuildLogicalAggregateLoad(
       &k_body_builder, a_variable->result_id(), a->component_type_id,
-      a->packed_vec4_type_id, a_index->result_id());
+      a->packed_vec2_type_id, a_index->result_id());
   const uint32_t b_value = BuildLogicalAggregateLoad(
       &k_body_builder, b_variable->result_id(), b->component_type_id,
-      b->packed_vec4_type_id, b_index->result_id());
+      b->packed_vec2_type_id, b_index->result_id());
   Instruction* accumulator = k_body_builder.AddLoad(
       result->component_type_id, accumulator_variable->result_id());
   const uint32_t accumulated =
@@ -461,7 +461,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAddWithLoop(Instruction* inst) {
   if (!final_accumulator ||
       !BuildLogicalAggregateStore(
           &k_merge_builder, result_variable->result_id(),
-          result->component_type_id, result->packed_vec4_type_id,
+          result->component_type_id, result->packed_vec2_type_id,
           output_index->result_id(), final_accumulator->result_id()) ||
       !k_merge_builder.AddBranch(outer_continue_label)) {
     return false;
@@ -770,7 +770,7 @@ bool HwLowerToStandardPass::LowerMatrixReduceWithLoop(Instruction* inst,
       build_source_index(&outer_body_builder, zero_id);
   const uint32_t initial_accumulator = BuildLogicalAggregateLoad(
       &outer_body_builder, source_variable->result_id(),
-      source->component_type_id, source->packed_vec4_type_id,
+      source->component_type_id, source->packed_vec2_type_id,
       first_source_index);
   if (initial_accumulator == 0 ||
       !outer_body_builder.AddStore(accumulator_variable->result_id(),
@@ -807,7 +807,7 @@ bool HwLowerToStandardPass::LowerMatrixReduceWithLoop(Instruction* inst,
       build_source_index(&reduce_body_builder, reduce_index->result_id());
   const uint32_t value = BuildLogicalAggregateLoad(
       &reduce_body_builder, source_variable->result_id(),
-      source->component_type_id, source->packed_vec4_type_id, source_index);
+      source->component_type_id, source->packed_vec2_type_id, source_index);
   Instruction* accumulator = reduce_body_builder.AddLoad(
       result->component_type_id, accumulator_variable->result_id());
   const uint32_t combined =
@@ -885,7 +885,7 @@ bool HwLowerToStandardPass::LowerMatrixReduceWithLoop(Instruction* inst,
   if (!destination_index ||
       !BuildLogicalAggregateStore(
           &broadcast_body_builder, result_variable->result_id(),
-          result->component_type_id, result->packed_vec4_type_id,
+          result->component_type_id, result->packed_vec2_type_id,
           destination_index->result_id(), final_accumulator->result_id()) ||
       !broadcast_body_builder.AddBranch(broadcast_continue_label)) {
     return false;
@@ -957,15 +957,15 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   bool lowered =
       mac_count > max_unrolled_matmul_macs_
           ? LowerVectorMatrixMulWithLoop(inst, has_bias)
-          : (CanUsePackedVec4VectorMatrixMul(*result, *input, *matrix, bias)
-                 ? LowerVectorMatrixMulPackedVec4(inst, has_bias)
+          : (CanUsePackedVec2VectorMatrixMul(*result, *input, *matrix, bias)
+                 ? LowerVectorMatrixMulPackedVec2(inst, has_bias)
                  : LowerVectorMatrixMulScalarFallback(inst, has_bias));
   if (lowered) RemoveFPFastMathMode(inst->result_id());
   active_fp_fast_math_mode_ = saved_fast_math_mode;
   return lowered;
 }
 
-bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
+bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec2(Instruction* inst,
                                                            bool has_bias) {
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
@@ -988,12 +988,12 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec4(Instruction* inst,
   }
 
   bool handled = false;
-  if (!TryLowerDirectVectorMatrixMulPackedVec4(inst, has_bias, &handled)) {
+  if (!TryLowerDirectVectorMatrixMulPackedVec2(inst, has_bias, &handled)) {
     return false;
   }
   if (handled) return true;
 
-  const uint32_t function_id = GetOrCreateVectorMatmulPatternFunctionPackedVec4(
+  const uint32_t function_id = GetOrCreateVectorMatmulPatternFunctionPackedVec2(
       *result, *input, *matrix, bias, has_bias);
   std::vector<uint32_t> argument_ids = {input_inst->result_id(),
                                         matrix_inst->result_id()};
@@ -1074,16 +1074,16 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
     if (id == 0) return false;
   }
 
-  if (IsPackedVec4(*result)) {
+  if (IsPackedVec2(*result)) {
     std::vector<uint32_t> element_ids(result->packed_length, 0);
     for (uint32_t pack = 0; pack < result->packed_length; ++pack) {
       std::vector<uint32_t> lane_ids;
-      lane_ids.reserve(kPackedVec4Width);
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-        lane_ids.push_back(scalar_ids[pack * kPackedVec4Width + lane]);
+      lane_ids.reserve(kPackedVec2Width);
+      for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+        lane_ids.push_back(scalar_ids[pack * kPackedVec2Width + lane]);
       }
       Instruction* vec =
-          builder.AddCompositeConstruct(result->packed_vec4_type_id, lane_ids);
+          builder.AddCompositeConstruct(result->packed_vec2_type_id, lane_ids);
       if (!vec) return false;
       element_ids[pack] = vec->result_id();
     }
@@ -1263,7 +1263,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
   const uint32_t initial_accumulator =
       has_bias ? BuildLogicalAggregateLoad(
                      &outer_body_builder, bias_variable->result_id(),
-                     bias->component_type_id, bias->packed_vec4_type_id,
+                     bias->component_type_id, bias->packed_vec2_type_id,
                      output_index->result_id())
                : accumulator_zero_id;
   if (initial_accumulator == 0 ||
@@ -1304,10 +1304,10 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
   if (!matrix_index) return false;
   const uint32_t input_value = BuildLogicalAggregateLoad(
       &k_body_builder, input_variable->result_id(), input->component_type_id,
-      input->packed_vec4_type_id, k->result_id());
+      input->packed_vec2_type_id, k->result_id());
   const uint32_t matrix_value = BuildLogicalAggregateLoad(
       &k_body_builder, matrix_variable->result_id(), matrix->component_type_id,
-      matrix->packed_vec4_type_id, matrix_index->result_id());
+      matrix->packed_vec2_type_id, matrix_index->result_id());
   Instruction* accumulator = k_body_builder.AddLoad(
       result->component_type_id, accumulator_variable->result_id());
   const uint32_t accumulated =
@@ -1344,7 +1344,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
   if (!final_accumulator ||
       !BuildLogicalAggregateStore(
           &k_merge_builder, result_variable->result_id(),
-          result->component_type_id, result->packed_vec4_type_id,
+          result->component_type_id, result->packed_vec2_type_id,
           output_index->result_id(), final_accumulator->result_id()) ||
       !k_merge_builder.AddBranch(outer_continue_label)) {
     return false;
@@ -1370,22 +1370,22 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
 }
 
 uint32_t HwLowerToStandardPass::BuildVectorTimesScalar(
-    InstructionBuilder* builder, spv::Op scale_opcode, uint32_t vec4_type_id,
+    InstructionBuilder* builder, spv::Op scale_opcode, uint32_t vec2_type_id,
     uint32_t vector_id, uint32_t scalar_id) {
   const uint32_t scalar_vec_id =
-      BuildScalarSplat(builder, vec4_type_id, scalar_id);
+      BuildScalarSplat(builder, vec2_type_id, scalar_id);
   if (scalar_vec_id == 0) return 0;
-  Instruction* mul = builder->AddBinaryOp(vec4_type_id, scale_opcode, vector_id,
+  Instruction* mul = builder->AddBinaryOp(vec2_type_id, scale_opcode, vector_id,
                                           scalar_vec_id);
   return mul ? mul->result_id() : 0;
 }
 
 uint32_t HwLowerToStandardPass::BuildScalarSplat(InstructionBuilder* builder,
-                                                 uint32_t vec4_type_id,
+                                                 uint32_t vec2_type_id,
                                                  uint32_t scalar_id) {
-  std::vector<uint32_t> lane_ids(kPackedVec4Width, scalar_id);
+  std::vector<uint32_t> lane_ids(kPackedVec2Width, scalar_id);
   Instruction* scalar_vec =
-      builder->AddCompositeConstruct(vec4_type_id, lane_ids);
+      builder->AddCompositeConstruct(vec2_type_id, lane_ids);
   return scalar_vec ? scalar_vec->result_id() : 0;
 }
 
@@ -1489,7 +1489,7 @@ uint32_t HwLowerToStandardPass::BuildHorizontalReduce(
   uint32_t sum =
       ExtractCompositeElement(builder, component_type_id, vector_id, 0);
   if (sum == 0) return 0;
-  for (uint32_t lane = 1; lane < kPackedVec4Width; ++lane) {
+  for (uint32_t lane = 1; lane < kPackedVec2Width; ++lane) {
     const uint32_t value =
         ExtractCompositeElement(builder, component_type_id, vector_id, lane);
     if (value == 0) return 0;
@@ -1551,34 +1551,34 @@ uint32_t HwLowerToStandardPass::BuildReduceCombine(InstructionBuilder* builder,
   return added ? added->result_id() : 0;
 }
 
-bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
+bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec2(
     InstructionBuilder* builder, const VectorTypeInfo& result,
     const VectorTypeInfo& input, const MatrixTypeInfo& matrix,
     const VectorTypeInfo* /*bias*/, uint32_t input_id, uint32_t matrix_id,
     uint32_t bias_id, bool has_bias, std::vector<uint32_t>* element_ids) {
   element_ids->assign(result.packed_length, 0);
 
-  const uint32_t vec4_type_id = result.packed_vec4_type_id;
-  const uint32_t zero4_id = has_bias ? 0 : GetOrCreateZero(vec4_type_id);
-  if (!has_bias && zero4_id == 0) return false;
+  const uint32_t vec2_type_id = result.packed_vec2_type_id;
+  const uint32_t zero2_id = has_bias ? 0 : GetOrCreateZero(vec2_type_id);
+  if (!has_bias && zero2_id == 0) return false;
 
   for (uint32_t out_pack = 0; out_pack < result.packed_length; ++out_pack) {
-    uint32_t acc = has_bias ? ExtractCompositeElement(builder, vec4_type_id,
+    uint32_t acc = has_bias ? ExtractCompositeElement(builder, vec2_type_id,
                                                       bias_id, out_pack)
-                            : zero4_id;
+                            : zero2_id;
     if (acc == 0) return false;
 
-    const uint32_t out_col = out_pack * kPackedVec4Width;
+    const uint32_t out_col = out_pack * kPackedVec2Width;
     for (uint32_t k = 0; k < input.length; ++k) {
       const uint32_t scalar = ExtractVectorScalar(builder, input, input_id, k);
-      const uint32_t weight4 = BuildMatrixRowVector(builder, matrix, matrix_id,
-                                                    k, out_col, vec4_type_id);
-      if (scalar == 0 || weight4 == 0) return false;
+      const uint32_t weight2 = BuildMatrixRowVector(builder, matrix, matrix_id,
+                                                    k, out_col, vec2_type_id);
+      if (scalar == 0 || weight2 == 0) return false;
 
       const uint32_t scalar_vec =
-          BuildScalarSplat(builder, vec4_type_id, scalar);
+          BuildScalarSplat(builder, vec2_type_id, scalar);
       if (scalar_vec == 0) return false;
-      acc = BuildFma(builder, vec4_type_id, weight4, scalar_vec, acc);
+      acc = BuildFma(builder, vec2_type_id, weight2, scalar_vec, acc);
       if (acc == 0) return false;
     }
 
@@ -1591,29 +1591,29 @@ bool HwLowerToStandardPass::BuildVectorMatrixMulPatternPackedVec4(
   return true;
 }
 
-bool HwLowerToStandardPass::BuildMatmulPatternPackedVec4(
+bool HwLowerToStandardPass::BuildMatmulPatternPackedVec2(
     InstructionBuilder* builder, const MatrixTypeInfo& result,
     const MatrixTypeInfo& a, const MatrixTypeInfo& b, const MatrixTypeInfo& c,
     uint32_t a_id, uint32_t b_id, uint32_t c_id,
     std::vector<uint32_t>* element_ids) {
   element_ids->assign(result.rows * result.packed_cols, 0);
 
-  const uint32_t vec4_type_id = result.packed_vec4_type_id;
-  if (vec4_type_id == 0) return false;
+  const uint32_t vec2_type_id = result.packed_vec2_type_id;
+  if (vec2_type_id == 0) return false;
   for (uint32_t row = 0; row < result.rows; ++row) {
     for (uint32_t col_pack = 0; col_pack < result.packed_cols; ++col_pack) {
-      const uint32_t col0 = col_pack * kPackedVec4Width;
+      const uint32_t col0 = col_pack * kPackedVec2Width;
       uint32_t acc = ExtractCompositeElement(
-          builder, vec4_type_id, c_id, MatrixPackedIndex(c, row, col_pack));
+          builder, vec2_type_id, c_id, MatrixPackedIndex(c, row, col_pack));
       if (acc == 0) return false;
       for (uint32_t k = 0; k < a.cols; ++k) {
         const uint32_t scalar = ExtractMatrixScalar(builder, a, a_id, row, k);
         const uint32_t weights =
-            BuildMatrixRowVector(builder, b, b_id, k, col0, vec4_type_id);
+            BuildMatrixRowVector(builder, b, b_id, k, col0, vec2_type_id);
         const uint32_t scalar_vec =
-            scalar ? BuildScalarSplat(builder, vec4_type_id, scalar) : 0;
+            scalar ? BuildScalarSplat(builder, vec2_type_id, scalar) : 0;
         if (weights == 0 || scalar_vec == 0) return false;
-        acc = BuildFma(builder, vec4_type_id, scalar_vec, weights, acc);
+        acc = BuildFma(builder, vec2_type_id, scalar_vec, weights, acc);
         if (acc == 0) return false;
       }
       (*element_ids)[MatrixPackedIndex(result, row, col_pack)] = acc;

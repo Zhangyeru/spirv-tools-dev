@@ -33,9 +33,9 @@ void ExpectFailureWithMissingExtInstOperand(HwLowerToStandardTest* test,
                                             const std::string& text);
 void ExpectSingleElementwiseLoop(const std::string& text);
 void ExpectNoHwOrCoopMatrix(const std::string& text);
-void ExpectPackedVec4Math(const std::string& text,
+void ExpectPackedVec2Math(const std::string& text,
                           const std::string& component_name);
-void ExpectPackedVec4MatmulPattern(const std::string& text,
+void ExpectPackedVec2MatmulPattern(const std::string& text,
                                    const std::string& component_name);
 void ExpectScalarFallbackMath(const std::string& text,
                               const std::string& component_name = "%float");

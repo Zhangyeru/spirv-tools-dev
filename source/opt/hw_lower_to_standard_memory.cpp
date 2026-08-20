@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "source/opt/hw_lower_to_standard_pass.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -31,6 +29,7 @@
 #include "source/opt/def_use_manager.h"
 #include "source/opt/function.h"
 #include "source/opt/hw_fuse_two_layer_vector_matmul_pass.h"
+#include "source/opt/hw_lower_to_standard_pass.h"
 #include "source/opt/hw_lower_to_standard_pass_internal.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
@@ -80,7 +79,7 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
     if (!BuildScalarMemoryLoop(
             inst, info->lowered_type_id, info->component_type_id, element_count,
             pointer_id, 0, shape_id, offset_id, info->cols, layout, true,
-            info->packed_vec4_type_id, memory_operands, &result_id)) {
+            info->packed_vec2_type_id, memory_operands, &result_id)) {
       return false;
     }
     inst->SetOpcode(spv::Op::OpCopyObject);
@@ -90,7 +89,7 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
     return true;
   }
 
-  if (IsPackedVec4(*info)) {
+  if (IsPackedVec2(*info)) {
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
         CanCapturePointer(pointer_id) &&
@@ -116,9 +115,9 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
     for (uint32_t row = 0; row < info->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
         std::vector<uint32_t> lane_ids;
-        lane_ids.reserve(kPackedVec4Width);
-        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-          const uint32_t col = col_pack * kPackedVec4Width + lane;
+        lane_ids.reserve(kPackedVec2Width);
+        for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+          const uint32_t col = col_pack * kPackedVec2Width + lane;
           const uint32_t index_id = BuildMatrixElementIndex(
               &builder, inst, *info, shape_id, offset_id, layout, row, col);
           const uint32_t elem_ptr_id = BuildElementAccess(
@@ -130,7 +129,7 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
           lane_ids.push_back(load_id);
         }
         Instruction* vec =
-            builder.AddCompositeConstruct(info->packed_vec4_type_id, lane_ids);
+            builder.AddCompositeConstruct(info->packed_vec2_type_id, lane_ids);
         if (!vec) return false;
         element_ids.push_back(vec->result_id());
       }
@@ -201,14 +200,14 @@ bool HwLowerToStandardPass::LowerMatrixStore(
     if (!BuildScalarMemoryLoop(
             inst, info->lowered_type_id, info->component_type_id, element_count,
             pointer_id, object_id, shape_id, offset_id, info->cols, layout,
-            true, info->packed_vec4_type_id, memory_operands, nullptr)) {
+            true, info->packed_vec2_type_id, memory_operands, nullptr)) {
       return false;
     }
     to_kill->push_back(inst);
     return true;
   }
 
-  if (IsPackedVec4(*info)) {
+  if (IsPackedVec2(*info)) {
     bool fused = false;
     if (!TryLowerFusedMatrixMatmulStore(inst, &fused)) return false;
     if (fused) return true;
@@ -233,11 +232,11 @@ bool HwLowerToStandardPass::LowerMatrixStore(
     for (uint32_t row = 0; row < info->rows; ++row) {
       for (uint32_t col_pack = 0; col_pack < info->packed_cols; ++col_pack) {
         const uint32_t vec_id = ExtractCompositeElement(
-            &builder, info->packed_vec4_type_id, object_id,
+            &builder, info->packed_vec2_type_id, object_id,
             MatrixPackedIndex(*info, row, col_pack));
         if (vec_id == 0) return false;
-        for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
-          const uint32_t col = col_pack * kPackedVec4Width + lane;
+        for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
+          const uint32_t col = col_pack * kPackedVec2Width + lane;
           const uint32_t value_id = ExtractCompositeElement(
               &builder, info->component_type_id, vec_id, lane);
           const uint32_t index_id = BuildMatrixElementIndex(
@@ -303,7 +302,7 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
     uint32_t result_id = 0;
     if (!BuildScalarMemoryLoop(
             inst, info->lowered_type_id, info->component_type_id, info->length,
-            pointer_id, 0, 0, offset_id, 0, 0, false, info->packed_vec4_type_id,
+            pointer_id, 0, 0, offset_id, 0, 0, false, info->packed_vec2_type_id,
             memory_operands, &result_id)) {
       return false;
     }
@@ -314,7 +313,7 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
     return true;
   }
 
-  if (IsPackedVec4(*info)) {
+  if (IsPackedVec2(*info)) {
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
@@ -344,10 +343,10 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
     element_ids.reserve(info->packed_length);
     for (uint32_t pack = 0; pack < info->packed_length; ++pack) {
       std::vector<uint32_t> lane_ids;
-      lane_ids.reserve(kPackedVec4Width);
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      lane_ids.reserve(kPackedVec2Width);
+      for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
         const uint32_t logical_index_id =
-            GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
+            GetOrCreateUIntConstant(pack * kPackedVec2Width + lane);
         const uint32_t index_id = BuildVectorElementIndex(
             &builder, inst, offset_id, logical_index_id);
         const uint32_t elem_ptr_id = BuildElementAccess(
@@ -359,7 +358,7 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
         lane_ids.push_back(load_id);
       }
       Instruction* vec =
-          builder.AddCompositeConstruct(info->packed_vec4_type_id, lane_ids);
+          builder.AddCompositeConstruct(info->packed_vec2_type_id, lane_ids);
       if (!vec) return false;
       element_ids.push_back(vec->result_id());
     }
@@ -417,14 +416,14 @@ bool HwLowerToStandardPass::LowerVectorStore(
     if (!BuildScalarMemoryLoop(
             inst, info->lowered_type_id, info->component_type_id, info->length,
             pointer_id, object_id, 0, offset_id, 0, 0, false,
-            info->packed_vec4_type_id, memory_operands, nullptr)) {
+            info->packed_vec2_type_id, memory_operands, nullptr)) {
       return false;
     }
     to_kill->push_back(inst);
     return true;
   }
 
-  if (IsPackedVec4(*info)) {
+  if (IsPackedVec2(*info)) {
     bool fused = false;
     if (!TryLowerFusedVectorMatmulStore(inst, &fused)) return false;
     if (fused) return true;
@@ -453,13 +452,13 @@ bool HwLowerToStandardPass::LowerVectorStore(
 
     for (uint32_t pack = 0; pack < info->packed_length; ++pack) {
       const uint32_t vec_id = ExtractCompositeElement(
-          &builder, info->packed_vec4_type_id, object_id, pack);
+          &builder, info->packed_vec2_type_id, object_id, pack);
       if (vec_id == 0) return false;
-      for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+      for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
         const uint32_t value_id = ExtractCompositeElement(
             &builder, info->component_type_id, vec_id, lane);
         const uint32_t logical_index_id =
-            GetOrCreateUIntConstant(pack * kPackedVec4Width + lane);
+            GetOrCreateUIntConstant(pack * kPackedVec2Width + lane);
         const uint32_t index_id = BuildVectorElementIndex(
             &builder, inst, offset_id, logical_index_id);
         const uint32_t elem_ptr_id = BuildElementAccess(
@@ -817,7 +816,7 @@ Instruction* HwLowerToStandardPass::AddFunctionVariable(
 
 uint32_t HwLowerToStandardPass::BuildLogicalAggregateLoad(
     InstructionBuilder* builder, uint32_t aggregate_pointer_id,
-    uint32_t component_type_id, uint32_t packed_vec4_type_id,
+    uint32_t component_type_id, uint32_t packed_vec2_type_id,
     uint32_t logical_index_id) {
   if (!builder || aggregate_pointer_id == 0 || component_type_id == 0 ||
       logical_index_id == 0) {
@@ -826,17 +825,17 @@ uint32_t HwLowerToStandardPass::BuildLogicalAggregateLoad(
   uint32_t piece_index_id = logical_index_id;
   uint32_t lane_id = 0;
   uint32_t piece_type_id = component_type_id;
-  if (packed_vec4_type_id != 0) {
+  if (packed_vec2_type_id != 0) {
     const uint32_t uint_type_id = GetOrCreateUIntType();
-    const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+    const uint32_t packed_width_id = GetOrCreateUIntConstant(kPackedVec2Width);
     Instruction* piece_index = builder->AddBinaryOp(
-        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, packed_width_id);
     Instruction* lane = builder->AddBinaryOp(uint_type_id, spv::Op::OpUMod,
-                                             logical_index_id, four_id);
+                                             logical_index_id, packed_width_id);
     if (!piece_index || !lane) return 0;
     piece_index_id = piece_index->result_id();
     lane_id = lane->result_id();
-    piece_type_id = packed_vec4_type_id;
+    piece_type_id = packed_vec2_type_id;
   }
   const uint32_t piece_pointer_type_id =
       GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
@@ -845,7 +844,7 @@ uint32_t HwLowerToStandardPass::BuildLogicalAggregateLoad(
   Instruction* piece =
       pointer ? builder->AddLoad(piece_type_id, pointer->result_id()) : nullptr;
   if (!piece) return 0;
-  if (packed_vec4_type_id == 0) return piece->result_id();
+  if (packed_vec2_type_id == 0) return piece->result_id();
   Instruction* value =
       builder->AddBinaryOp(component_type_id, spv::Op::OpVectorExtractDynamic,
                            piece->result_id(), lane_id);
@@ -854,7 +853,7 @@ uint32_t HwLowerToStandardPass::BuildLogicalAggregateLoad(
 
 bool HwLowerToStandardPass::BuildLogicalAggregateStore(
     InstructionBuilder* builder, uint32_t aggregate_pointer_id,
-    uint32_t component_type_id, uint32_t packed_vec4_type_id,
+    uint32_t component_type_id, uint32_t packed_vec2_type_id,
     uint32_t logical_index_id, uint32_t value_id) {
   if (!builder || aggregate_pointer_id == 0 || component_type_id == 0 ||
       logical_index_id == 0 || value_id == 0) {
@@ -863,17 +862,17 @@ bool HwLowerToStandardPass::BuildLogicalAggregateStore(
   uint32_t piece_index_id = logical_index_id;
   uint32_t lane_id = 0;
   uint32_t piece_type_id = component_type_id;
-  if (packed_vec4_type_id != 0) {
+  if (packed_vec2_type_id != 0) {
     const uint32_t uint_type_id = GetOrCreateUIntType();
-    const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+    const uint32_t packed_width_id = GetOrCreateUIntConstant(kPackedVec2Width);
     Instruction* piece_index = builder->AddBinaryOp(
-        uint_type_id, spv::Op::OpUDiv, logical_index_id, four_id);
+        uint_type_id, spv::Op::OpUDiv, logical_index_id, packed_width_id);
     Instruction* lane = builder->AddBinaryOp(uint_type_id, spv::Op::OpUMod,
-                                             logical_index_id, four_id);
+                                             logical_index_id, packed_width_id);
     if (!piece_index || !lane) return false;
     piece_index_id = piece_index->result_id();
     lane_id = lane->result_id();
-    piece_type_id = packed_vec4_type_id;
+    piece_type_id = packed_vec2_type_id;
   }
   const uint32_t piece_pointer_type_id =
       GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
@@ -881,7 +880,7 @@ bool HwLowerToStandardPass::BuildLogicalAggregateStore(
       piece_pointer_type_id, aggregate_pointer_id, {piece_index_id});
   if (!pointer) return false;
   uint32_t stored_id = value_id;
-  if (packed_vec4_type_id != 0) {
+  if (packed_vec2_type_id != 0) {
     Instruction* old_piece =
         builder->AddLoad(piece_type_id, pointer->result_id());
     Instruction* inserted =
@@ -945,7 +944,7 @@ bool HwLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
     uint32_t pointer_type_id, uint32_t shape_id, uint32_t offset_id,
     uint32_t layout, const std::vector<Operand>& memory_operands,
     uint32_t* result_id) {
-  if (!insert_before || !result_id || !IsPackedVec4(info)) return false;
+  if (!insert_before || !result_id || !IsPackedVec2(info)) return false;
   if (layout !=
       static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
     return false;
@@ -956,23 +955,24 @@ bool HwLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
 
   const uint32_t load_function_id = GetOrCreatePackedLoadChunkFunction(
       pointer_id, pointer_type_id, info.component_type_id,
-      info.packed_vec4_type_id, memory_operands);
+      info.packed_vec2_type_id, memory_operands);
   const uint32_t lowered_function_ptr_type_id =
       GetOrCreatePointerType(info.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
-      info.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id = GetOrCreatePointerType(
+      info.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id =
       GetOrCreateUIntConstant(info.rows * info.cols);
   if (load_function_id == 0 || lowered_function_ptr_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || bool_type_id == 0 ||
-      zero_uint_id == 0 || four_uint_id == 0 || element_count_id == 0) {
+      zero_uint_id == 0 || packed_width_uint_id == 0 || element_count_id == 0) {
     return false;
   }
 
@@ -1046,13 +1046,14 @@ bool HwLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
       base_load->result_id());
   if (memory_base_id == 0) return false;
   Instruction* vec = body_builder.AddFunctionCall(
-      info.packed_vec4_type_id, load_function_id, {memory_base_id});
+      info.packed_vec2_type_id, load_function_id, {memory_base_id});
   if (!vec) return false;
-  Instruction* packed_index = body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpUDiv, base_load->result_id(), four_uint_id);
+  Instruction* packed_index =
+      body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUDiv,
+                               base_load->result_id(), packed_width_uint_id);
   if (!packed_index) return false;
   Instruction* result_elem_ptr = body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, result_var->result_id(),
+      vec2_function_ptr_type_id, result_var->result_id(),
       {packed_index->result_id()});
   if (!result_elem_ptr) return false;
   if (!body_builder.AddStore(result_elem_ptr->result_id(), vec->result_id())) {
@@ -1064,7 +1065,8 @@ bool HwLowerToStandardPass::BuildPackedMatrixLoadOuterLoop(
       context(), continue_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   Instruction* next_i = continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, base_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIAdd, base_load->result_id(),
+      packed_width_uint_id);
   if (!next_i) return false;
   if (!continue_builder.AddStore(base_var->result_id(), next_i->result_id())) {
     return false;
@@ -1086,7 +1088,7 @@ bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
     uint32_t pointer_type_id, uint32_t object_id, uint32_t shape_id,
     uint32_t offset_id, uint32_t layout,
     const std::vector<Operand>& memory_operands) {
-  if (!insert_before || object_id == 0 || !IsPackedVec4(info)) return false;
+  if (!insert_before || object_id == 0 || !IsPackedVec2(info)) return false;
   if (layout !=
       static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR)) {
     return false;
@@ -1097,24 +1099,25 @@ bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
 
   const uint32_t store_function_id = GetOrCreatePackedStoreChunkFunction(
       pointer_id, pointer_type_id, info.component_type_id,
-      info.packed_vec4_type_id, memory_operands);
+      info.packed_vec2_type_id, memory_operands);
   const uint32_t lowered_function_ptr_type_id =
       GetOrCreatePointerType(info.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
-      info.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id = GetOrCreatePointerType(
+      info.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t void_type_id = GetOrCreateVoidType();
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id =
       GetOrCreateUIntConstant(info.rows * info.cols);
   if (store_function_id == 0 || lowered_function_ptr_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || void_type_id == 0 ||
-      bool_type_id == 0 || zero_uint_id == 0 || four_uint_id == 0 ||
+      bool_type_id == 0 || zero_uint_id == 0 || packed_width_uint_id == 0 ||
       element_count_id == 0) {
     return false;
   }
@@ -1187,14 +1190,15 @@ bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
   InstructionBuilder body_builder(
       context(), body_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  Instruction* packed_index = body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpUDiv, base_load->result_id(), four_uint_id);
+  Instruction* packed_index =
+      body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUDiv,
+                               base_load->result_id(), packed_width_uint_id);
   if (!packed_index) return false;
   Instruction* value_elem_ptr = body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, object_var->result_id(),
+      vec2_function_ptr_type_id, object_var->result_id(),
       {packed_index->result_id()});
   if (!value_elem_ptr) return false;
-  Instruction* vec = body_builder.AddLoad(info.packed_vec4_type_id,
+  Instruction* vec = body_builder.AddLoad(info.packed_vec2_type_id,
                                           value_elem_ptr->result_id());
   if (!vec) return false;
   const uint32_t memory_base_id = BuildRowMajorMatrixMemoryIndex(
@@ -1211,7 +1215,8 @@ bool HwLowerToStandardPass::BuildPackedMatrixStoreOuterLoop(
       context(), continue_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   Instruction* next_i = continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, base_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIAdd, base_load->result_id(),
+      packed_width_uint_id);
   if (!next_i) return false;
   if (!continue_builder.AddStore(base_var->result_id(), next_i->result_id())) {
     return false;
@@ -1224,29 +1229,30 @@ bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, uint32_t offset_id,
     const std::vector<Operand>& memory_operands, uint32_t* result_id) {
-  if (!insert_before || !result_id || !IsPackedVec4(info)) return false;
+  if (!insert_before || !result_id || !IsPackedVec2(info)) return false;
   BasicBlock* preheader_block = context()->get_instr_block(insert_before);
   Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
   if (!preheader_block || !function) return false;
 
   const uint32_t load_function_id = GetOrCreatePackedLoadChunkFunction(
       pointer_id, pointer_type_id, info.component_type_id,
-      info.packed_vec4_type_id, memory_operands);
+      info.packed_vec2_type_id, memory_operands);
   const uint32_t lowered_function_ptr_type_id =
       GetOrCreatePointerType(info.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
-      info.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id = GetOrCreatePointerType(
+      info.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id = GetOrCreateUIntConstant(info.length);
   if (load_function_id == 0 || lowered_function_ptr_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || bool_type_id == 0 ||
-      zero_uint_id == 0 || four_uint_id == 0 || element_count_id == 0) {
+      zero_uint_id == 0 || packed_width_uint_id == 0 || element_count_id == 0) {
     return false;
   }
 
@@ -1318,15 +1324,16 @@ bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
   const uint32_t memory_base_id = BuildVectorElementIndex(
       &body_builder, insert_before, offset_id, base_load->result_id());
   Instruction* vec = memory_base_id ? body_builder.AddFunctionCall(
-                                          info.packed_vec4_type_id,
+                                          info.packed_vec2_type_id,
                                           load_function_id, {memory_base_id})
                                     : nullptr;
   if (!vec) return false;
-  Instruction* packed_index = body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpUDiv, base_load->result_id(), four_uint_id);
+  Instruction* packed_index =
+      body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUDiv,
+                               base_load->result_id(), packed_width_uint_id);
   if (!packed_index) return false;
   Instruction* result_elem_ptr = body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, result_var->result_id(),
+      vec2_function_ptr_type_id, result_var->result_id(),
       {packed_index->result_id()});
   if (!result_elem_ptr) return false;
   if (!body_builder.AddStore(result_elem_ptr->result_id(), vec->result_id())) {
@@ -1338,7 +1345,8 @@ bool HwLowerToStandardPass::BuildPackedVectorLoadOuterLoop(
       context(), continue_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   Instruction* next_i = continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, base_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIAdd, base_load->result_id(),
+      packed_width_uint_id);
   if (!next_i) return false;
   if (!continue_builder.AddStore(base_var->result_id(), next_i->result_id())) {
     return false;
@@ -1359,30 +1367,31 @@ bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
     Instruction* insert_before, const VectorTypeInfo& info, uint32_t pointer_id,
     uint32_t pointer_type_id, uint32_t offset_id, uint32_t object_id,
     const std::vector<Operand>& memory_operands) {
-  if (!insert_before || object_id == 0 || !IsPackedVec4(info)) return false;
+  if (!insert_before || object_id == 0 || !IsPackedVec2(info)) return false;
   BasicBlock* preheader_block = context()->get_instr_block(insert_before);
   Function* function = preheader_block ? preheader_block->GetParent() : nullptr;
   if (!preheader_block || !function) return false;
 
   const uint32_t store_function_id = GetOrCreatePackedStoreChunkFunction(
       pointer_id, pointer_type_id, info.component_type_id,
-      info.packed_vec4_type_id, memory_operands);
+      info.packed_vec2_type_id, memory_operands);
   const uint32_t lowered_function_ptr_type_id =
       GetOrCreatePointerType(info.lowered_type_id, spv::StorageClass::Function);
-  const uint32_t vec4_function_ptr_type_id = GetOrCreatePointerType(
-      info.packed_vec4_type_id, spv::StorageClass::Function);
+  const uint32_t vec2_function_ptr_type_id = GetOrCreatePointerType(
+      info.packed_vec2_type_id, spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_function_ptr_type_id =
       GetOrCreatePointerType(uint_type_id, spv::StorageClass::Function);
   const uint32_t void_type_id = GetOrCreateVoidType();
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_uint_id = GetOrCreateUIntConstant(0);
-  const uint32_t four_uint_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_uint_id =
+      GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id = GetOrCreateUIntConstant(info.length);
   if (store_function_id == 0 || lowered_function_ptr_type_id == 0 ||
-      vec4_function_ptr_type_id == 0 || uint_type_id == 0 ||
+      vec2_function_ptr_type_id == 0 || uint_type_id == 0 ||
       uint_function_ptr_type_id == 0 || void_type_id == 0 ||
-      bool_type_id == 0 || zero_uint_id == 0 || four_uint_id == 0 ||
+      bool_type_id == 0 || zero_uint_id == 0 || packed_width_uint_id == 0 ||
       element_count_id == 0) {
     return false;
   }
@@ -1455,14 +1464,15 @@ bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
   InstructionBuilder body_builder(
       context(), body_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  Instruction* packed_index = body_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpUDiv, base_load->result_id(), four_uint_id);
+  Instruction* packed_index =
+      body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUDiv,
+                               base_load->result_id(), packed_width_uint_id);
   if (!packed_index) return false;
   Instruction* value_elem_ptr = body_builder.AddAccessChain(
-      vec4_function_ptr_type_id, object_var->result_id(),
+      vec2_function_ptr_type_id, object_var->result_id(),
       {packed_index->result_id()});
   if (!value_elem_ptr) return false;
-  Instruction* vec = body_builder.AddLoad(info.packed_vec4_type_id,
+  Instruction* vec = body_builder.AddLoad(info.packed_vec2_type_id,
                                           value_elem_ptr->result_id());
   if (!vec) return false;
   const uint32_t memory_base_id = BuildVectorElementIndex(
@@ -1478,7 +1488,8 @@ bool HwLowerToStandardPass::BuildPackedVectorStoreOuterLoop(
       context(), continue_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   Instruction* next_i = continue_builder.AddBinaryOp(
-      uint_type_id, spv::Op::OpIAdd, base_load->result_id(), four_uint_id);
+      uint_type_id, spv::Op::OpIAdd, base_load->result_id(),
+      packed_width_uint_id);
   if (!next_i) return false;
   if (!continue_builder.AddStore(base_var->result_id(), next_i->result_id())) {
     return false;
@@ -1492,7 +1503,7 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
     uint32_t component_type_id, uint32_t element_count, uint32_t pointer_id,
     uint32_t object_id, uint32_t shape_id, uint32_t offset_id,
     uint32_t matrix_cols, uint32_t layout, bool is_matrix,
-    uint32_t packed_vec4_type_id, const std::vector<Operand>& memory_operands,
+    uint32_t packed_vec2_type_id, const std::vector<Operand>& memory_operands,
     uint32_t* result_id) {
   const bool is_load = object_id == 0;
   if (!insert_before || lowered_type_id == 0 || component_type_id == 0 ||
@@ -1508,9 +1519,9 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
   const uint32_t component_pointer_type_id =
       GetOrCreatePointerType(component_type_id, spv::StorageClass::Function);
   const uint32_t piece_pointer_type_id =
-      packed_vec4_type_id == 0
+      packed_vec2_type_id == 0
           ? component_pointer_type_id
-          : GetOrCreatePointerType(packed_vec4_type_id,
+          : GetOrCreatePointerType(packed_vec2_type_id,
                                    spv::StorageClass::Function);
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t uint_pointer_type_id =
@@ -1518,12 +1529,12 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
   const uint32_t bool_type_id = GetOrCreateBoolType();
   const uint32_t zero_id = GetOrCreateUIntConstant(0);
   const uint32_t one_id = GetOrCreateUIntConstant(1);
-  const uint32_t four_id = GetOrCreateUIntConstant(kPackedVec4Width);
+  const uint32_t packed_width_id = GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id = GetOrCreateUIntConstant(element_count);
   if (aggregate_pointer_type_id == 0 || component_pointer_type_id == 0 ||
       piece_pointer_type_id == 0 || uint_type_id == 0 ||
       uint_pointer_type_id == 0 || bool_type_id == 0 || zero_id == 0 ||
-      one_id == 0 || four_id == 0 || element_count_id == 0) {
+      one_id == 0 || packed_width_id == 0 || element_count_id == 0) {
     return false;
   }
 
@@ -1576,9 +1587,9 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
       context(), preheader_block,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
   const uint32_t aggregate_initializer_id =
-      is_load && packed_vec4_type_id != 0 ? GetOrCreateZero(lowered_type_id)
+      is_load && packed_vec2_type_id != 0 ? GetOrCreateZero(lowered_type_id)
                                           : object_id;
-  if (((!is_load || packed_vec4_type_id != 0) &&
+  if (((!is_load || packed_vec2_type_id != 0) &&
        (aggregate_initializer_id == 0 ||
         !preheader_builder.AddStore(aggregate_variable->result_id(),
                                     aggregate_initializer_id))) ||
@@ -1619,11 +1630,11 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
                          component_type_id, memory_index_id);
   uint32_t piece_index_id = index->result_id();
   uint32_t lane_id = 0;
-  if (packed_vec4_type_id != 0) {
+  if (packed_vec2_type_id != 0) {
     Instruction* piece_index = body_builder.AddBinaryOp(
-        uint_type_id, spv::Op::OpUDiv, index->result_id(), four_id);
-    Instruction* lane = body_builder.AddBinaryOp(uint_type_id, spv::Op::OpUMod,
-                                                 index->result_id(), four_id);
+        uint_type_id, spv::Op::OpUDiv, index->result_id(), packed_width_id);
+    Instruction* lane = body_builder.AddBinaryOp(
+        uint_type_id, spv::Op::OpUMod, index->result_id(), packed_width_id);
     if (!piece_index || !lane) return false;
     piece_index_id = piece_index->result_id();
     lane_id = lane->result_id();
@@ -1637,12 +1648,12 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
     const uint32_t value_id = AddLoad(&body_builder, component_type_id,
                                       external_pointer_id, memory_operands);
     uint32_t stored_id = value_id;
-    if (value_id != 0 && packed_vec4_type_id != 0) {
+    if (value_id != 0 && packed_vec2_type_id != 0) {
       Instruction* old_piece = body_builder.AddLoad(
-          packed_vec4_type_id, aggregate_pointer->result_id());
+          packed_vec2_type_id, aggregate_pointer->result_id());
       Instruction* inserted =
           old_piece ? body_builder.AddTernaryOp(
-                          packed_vec4_type_id, spv::Op::OpVectorInsertDynamic,
+                          packed_vec2_type_id, spv::Op::OpVectorInsertDynamic,
                           old_piece->result_id(), value_id, lane_id)
                     : nullptr;
       stored_id = inserted ? inserted->result_id() : 0;
@@ -1653,10 +1664,10 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
     }
   } else {
     Instruction* piece = body_builder.AddLoad(
-        packed_vec4_type_id != 0 ? packed_vec4_type_id : component_type_id,
+        packed_vec2_type_id != 0 ? packed_vec2_type_id : component_type_id,
         aggregate_pointer->result_id());
     uint32_t value_id = piece ? piece->result_id() : 0;
-    if (piece && packed_vec4_type_id != 0) {
+    if (piece && packed_vec2_type_id != 0) {
       Instruction* extracted = body_builder.AddBinaryOp(
           component_type_id, spv::Op::OpVectorExtractDynamic,
           piece->result_id(), lane_id);
@@ -2152,10 +2163,10 @@ uint32_t HwLowerToStandardPass::GetArrayStride(uint32_t array_type_id) const {
 
 uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
     uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
-    uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
+    uint32_t vec2_type_id, const std::vector<Operand>& memory_operands) {
   const std::string key =
       std::to_string(pointer_id) + "|" + std::to_string(pointer_type_id) + "|" +
-      std::to_string(component_type_id) + "|" + std::to_string(vec4_type_id) +
+      std::to_string(component_type_id) + "|" + std::to_string(vec2_type_id) +
       "|" + MemoryOperandsKey(memory_operands);
   auto cached = packed_load_chunk_functions_.find(key);
   if (cached != packed_load_chunk_functions_.end()) return cached->second;
@@ -2163,13 +2174,13 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
 
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(vec4_type_id, {uint_type_id});
+      GetOrCreateFunctionType(vec2_type_id, {uint_type_id});
   if (uint_type_id == 0 || function_type_id == 0) return 0;
 
   const uint32_t function_id = TakeNextId();
   if (function_id == 0) return 0;
   std::unique_ptr<Instruction> function_start =
-      MakeUnique<Instruction>(context(), spv::Op::OpFunction, vec4_type_id,
+      MakeUnique<Instruction>(context(), spv::Op::OpFunction, vec2_type_id,
                               function_id, std::initializer_list<Operand>{});
   function_start->AddOperand({SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}});
   function_start->AddOperand(IdOperand(function_type_id));
@@ -2194,8 +2205,8 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
   if (captured_pointer_id == 0) return 0;
 
   std::vector<uint32_t> lane_ids;
-  lane_ids.reserve(kPackedVec4Width);
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  lane_ids.reserve(kPackedVec2Width);
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     const uint32_t lane_offset_id = GetOrCreateUIntConstant(lane);
     if (lane_offset_id == 0) return 0;
     uint32_t element_index_id = base_param_id;
@@ -2215,7 +2226,7 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
     lane_ids.push_back(load_id);
   }
 
-  Instruction* vec = builder.AddCompositeConstruct(vec4_type_id, lane_ids);
+  Instruction* vec = builder.AddCompositeConstruct(vec2_type_id, lane_ids);
   if (!vec) return 0;
   if (!builder.AddUnaryOp(0, spv::Op::OpReturnValue, vec->result_id())) {
     return 0;
@@ -2234,10 +2245,10 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
 
 uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
     uint32_t pointer_id, uint32_t pointer_type_id, uint32_t component_type_id,
-    uint32_t vec4_type_id, const std::vector<Operand>& memory_operands) {
+    uint32_t vec2_type_id, const std::vector<Operand>& memory_operands) {
   const std::string key =
       std::to_string(pointer_id) + "|" + std::to_string(pointer_type_id) + "|" +
-      std::to_string(component_type_id) + "|" + std::to_string(vec4_type_id) +
+      std::to_string(component_type_id) + "|" + std::to_string(vec2_type_id) +
       "|" + MemoryOperandsKey(memory_operands);
   auto cached = packed_store_chunk_functions_.find(key);
   if (cached != packed_store_chunk_functions_.end()) return cached->second;
@@ -2246,7 +2257,7 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
   const uint32_t void_type_id = GetOrCreateVoidType();
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t function_type_id =
-      GetOrCreateFunctionType(void_type_id, {uint_type_id, vec4_type_id});
+      GetOrCreateFunctionType(void_type_id, {uint_type_id, vec2_type_id});
   if (void_type_id == 0 || uint_type_id == 0 || function_type_id == 0) {
     return 0;
   }
@@ -2268,7 +2279,7 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
       context(), spv::Op::OpFunctionParameter, uint_type_id, base_param_id,
       std::initializer_list<Operand>{}));
   function->AddParameter(MakeUnique<Instruction>(
-      context(), spv::Op::OpFunctionParameter, vec4_type_id, value_param_id,
+      context(), spv::Op::OpFunctionParameter, vec2_type_id, value_param_id,
       std::initializer_list<Operand>{}));
 
   const uint32_t entry_label_id = TakeNextId();
@@ -2282,7 +2293,7 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
       BuildCapturedPointer(&builder, pointer_id);
   if (captured_pointer_id == 0) return 0;
 
-  for (uint32_t lane = 0; lane < kPackedVec4Width; ++lane) {
+  for (uint32_t lane = 0; lane < kPackedVec2Width; ++lane) {
     const uint32_t lane_offset_id = GetOrCreateUIntConstant(lane);
     if (lane_offset_id == 0) return 0;
     uint32_t element_index_id = base_param_id;
