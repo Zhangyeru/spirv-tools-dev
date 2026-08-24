@@ -118,48 +118,6 @@ Pass::Status HwLowerToStandardPass::Process() {
 
 bool HwLowerToStandardPass::LowerHwInstructions(
     std::vector<Instruction*>* to_kill) {
-  std::vector<Instruction*> vector_stores;
-  get_module()->ForEachInst([&vector_stores](Instruction* inst) {
-    if (inst->opcode() == spv::Op::OpCooperativeVectorStoreHW) {
-      vector_stores.push_back(inst);
-    }
-  });
-  for (Instruction* inst : vector_stores) {
-    if (!inst || inst->IsNop()) continue;
-    Instruction* object = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
-    std::vector<Instruction*> chain;
-    Instruction* matmul = TraceFunctionValueSource(object, inst, &chain);
-    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-    active_fp_fast_math_mode_ =
-        matmul ? GetFPFastMathMode(matmul->result_id()) : 0;
-    bool handled = false;
-    const bool ok = TryLowerFusedVectorMatmulStore(inst, &handled);
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
-    if (!ok) return false;
-  }
-
-  std::vector<Instruction*> matrix_stores;
-  get_module()->ForEachInst([&matrix_stores](Instruction* inst) {
-    if (inst->opcode() == spv::Op::OpCooperativeMatrixStoreHW) {
-      matrix_stores.push_back(inst);
-    }
-  });
-  for (Instruction* inst : matrix_stores) {
-    if (!inst || inst->IsNop()) continue;
-    Instruction* object = get_def_use_mgr()->GetDef(
-        inst->GetSingleWordInOperand(kHwMatrixStoreObjectInIdx));
-    std::vector<Instruction*> chain;
-    Instruction* matmul = TraceFunctionValueSource(object, inst, &chain);
-    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-    active_fp_fast_math_mode_ =
-        matmul ? GetFPFastMathMode(matmul->result_id()) : 0;
-    bool handled = false;
-    const bool ok = TryLowerFusedMatrixMatmulStore(inst, &handled);
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
-    if (!ok) return false;
-  }
-
   std::vector<Instruction*> direct_matmuls;
   get_module()->ForEachInst([&direct_matmuls](Instruction* inst) {
     switch (inst->opcode()) {

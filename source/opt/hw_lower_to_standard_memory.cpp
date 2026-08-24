@@ -208,10 +208,6 @@ bool HwLowerToStandardPass::LowerMatrixStore(
   }
 
   if (IsPackedVec2(*info)) {
-    bool fused = false;
-    if (!TryLowerFusedMatrixMatmulStore(inst, &fused)) return false;
-    if (fused) return true;
-
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
         CanCapturePointer(pointer_id) &&
@@ -424,10 +420,6 @@ bool HwLowerToStandardPass::LowerVectorStore(
   }
 
   if (IsPackedVec2(*info)) {
-    bool fused = false;
-    if (!TryLowerFusedVectorMatmulStore(inst, &fused)) return false;
-    if (fused) return true;
-
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
@@ -906,6 +898,63 @@ BasicBlock* HwLowerToStandardPass::MakeBasicBlock(uint32_t label_id) {
 uint32_t HwLowerToStandardPass::BuildRowMajorMatrixMemoryIndex(
     InstructionBuilder* builder, Instruction* user, uint32_t shape_id,
     uint32_t offset_id, uint32_t cols, uint32_t base_id) {
+  auto try_extract_pair_component = [this](uint32_t pair_id, uint32_t index,
+                                           uint32_t* value) -> bool {
+    if (index >= 2) return false;
+    Instruction* pair = get_def_use_mgr()->GetDef(pair_id);
+    if (!pair) return false;
+    if (pair->opcode() == spv::Op::OpConstantNull) {
+      *value = 0;
+      return true;
+    }
+    if (pair->opcode() != spv::Op::OpConstantComposite ||
+        pair->NumInOperands() <= index)
+      return false;
+    Instruction* pair_type = get_def_use_mgr()->GetDef(pair->type_id());
+    if (!pair_type || pair_type->opcode() != spv::Op::OpTypeVector ||
+        pair_type->GetSingleWordInOperand(1) < 2)
+      return false;
+    const uint32_t component_type_id = pair_type->GetSingleWordInOperand(0);
+    Instruction* component_type = get_def_use_mgr()->GetDef(component_type_id);
+    if (!component_type) return false;
+    if (component_type->opcode() == spv::Op::OpTypeInt) {
+      return GetConstantU32(pair->GetSingleWordInOperand(index), value);
+    }
+    if (component_type->opcode() == spv::Op::OpTypeFloat &&
+        component_type->GetSingleWordInOperand(0) == 32) {
+      Instruction* c =
+          get_def_use_mgr()->GetDef(pair->GetSingleWordInOperand(index));
+      if (!c || c->opcode() != spv::Op::OpConstant || c->NumInOperands() != 1)
+        return false;
+      const uint32_t bits = c->GetInOperand(0).words[0];
+      float f = 0.0f;
+      std::memcpy(&f, &bits, sizeof(float));
+      *value = static_cast<uint32_t>(f);
+      return true;
+    }
+    return false;
+  };
+
+  uint32_t base_val = 0;
+  uint32_t shape_cols_val = 0;
+  uint32_t offset_row_val = 0;
+  uint32_t offset_col_val = 0;
+  if (GetConstantU32(base_id, &base_val) &&
+      try_extract_pair_component(shape_id, 1, &shape_cols_val) &&
+      try_extract_pair_component(offset_id, 0, &offset_row_val) &&
+      try_extract_pair_component(offset_id, 1, &offset_col_val)) {
+    const uint32_t row = base_val / cols;
+    const uint32_t col = base_val % cols;
+    const uint64_t folded = static_cast<uint64_t>(offset_row_val + row) *
+                                static_cast<uint64_t>(shape_cols_val) +
+                            static_cast<uint64_t>(offset_col_val + col);
+    if (folded <= std::numeric_limits<uint32_t>::max()) {
+      const uint32_t folded_id =
+          GetOrCreateUIntConstant(static_cast<uint32_t>(folded));
+      if (folded_id != 0) return folded_id;
+    }
+  }
+
   const uint32_t uint_type_id = GetOrCreateUIntType();
   const uint32_t cols_id = GetOrCreateUIntConstant(cols);
   if (uint_type_id == 0 || cols_id == 0) return 0;
