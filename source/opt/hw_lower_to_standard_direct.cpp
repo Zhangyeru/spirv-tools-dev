@@ -810,8 +810,6 @@ bool HwLowerToStandardPass::TryLowerDirectMatrixMulAdd(Instruction* inst,
       inst->opcode() != spv::Op::OpCooperativeMatrixMulAddHW) {
     return false;
   }
-  if (!MatmulAllowsReassociation(inst)) return true;
-
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
@@ -1081,8 +1079,6 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec2(
        inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulAddHW)) {
     return false;
   }
-  if (!MatmulAllowsReassociation(inst)) return true;
-
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));

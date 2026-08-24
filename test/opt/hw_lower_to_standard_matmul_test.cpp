@@ -123,7 +123,7 @@ void ExpectDirectMatrixMatmulUnrolled(const std::string& disassembly,
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2"), 0u);
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd " + component_name), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd " + component_name));
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpReturnValue"), 0u);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
@@ -1190,7 +1190,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -2092,7 +2092,7 @@ OpFunctionEnd
       0u);
   EXPECT_EQ(3u, CountSubstring(rolled_disassembly, "OpLoopMerge"));
   EXPECT_GT(CountSubstring(rolled_disassembly, "OpFConvert %v2float"), 0u);
-  EXPECT_EQ(3u, CountSubstring(rolled_disassembly, " Fma "));
+  EXPECT_EQ(2u, CountSubstring(rolled_disassembly, " Fma "));
 }
 
 TEST_F(HwLowerToStandardTest, DirectVectorMatrixMulAddElidesSeparateLoadLoops) {
@@ -2147,7 +2147,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -2311,7 +2311,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorMatrixMulAddWithConstantBias) {
@@ -2374,7 +2374,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixMulAddWithConstantMatrix) {
@@ -2477,7 +2477,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
-  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_GE(
       CountSubstring(disassembly, "OpTypeFunction %_arr_v2float_uint_128"), 1u);
 }
@@ -2688,7 +2688,7 @@ TEST_F(HwLowerToStandardTest,
 ; CHECK: [[DIRECT_HELPER]] = OpFunction %_arr_float_uint_6
 ; CHECK-NEXT: [[CONVERTED_C_PARAM:%\w+]] = OpFunctionParameter %_arr_float_uint_6
 ; CHECK: OpCompositeExtract %float [[CONVERTED_C_PARAM]]
-; CHECK: OpFAdd %float
+; CHECK-NOT: OpFAdd %float
 ; CHECK: [[RESULT:%\w+]] = OpCompositeConstruct %_arr_float_uint_6
 ; CHECK-NEXT: OpReturnValue [[RESULT]]
 ; CHECK-NOT: OpLoopMerge
@@ -2755,7 +2755,7 @@ OpFunctionEnd
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpFunctionParameter"));
   EXPECT_GT(CountSubstring(disassembly, "OpFConvert %float"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 
   const auto expect_result_decoration = [&disassembly](
                                             const std::string& opcode_and_type,
@@ -2782,7 +2782,7 @@ OpFunctionEnd
     EXPECT_TRUE(found) << opcode_and_type << " result lacks " << decoration;
   };
   expect_result_decoration("OpFConvert %float", "FPFastMathMode NotNaN");
-  expect_result_decoration("OpFAdd %float", "FPFastMathMode Fast");
+  expect_result_decoration("OpExtInst %v2float", "FPFastMathMode Fast");
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -3938,7 +3938,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectPackedVec2Math(disassembly, "%half");
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %half"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %half"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorMatrixMulAdd16x64F16Packed) {
@@ -3980,7 +3980,7 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   ExpectPackedVec2Math(disassembly, "%half");
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %half"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %half"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixMulAdd4x16x8F16Packed) {
@@ -4648,7 +4648,7 @@ OpFunctionEnd
   const std::string& rolled_disassembly = std::get<0>(rolled);
   ExpectNoHwOrCoopMatrix(rolled_disassembly);
   EXPECT_EQ(2u, CountSubstring(rolled_disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(rolled_disassembly, "OpFConvert %float"), 0u);
+  EXPECT_GT(CountSubstring(rolled_disassembly, "OpFConvert %v2float"), 0u);
   EXPECT_GT(CountSubstring(rolled_disassembly, " Fma "), 0u);
   EXPECT_GE(CountSubstring(rolled_disassembly, "FPFastMathMode Fast"), 2u);
 }
@@ -5006,6 +5006,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpLoopMerge"), 0u) << disassembly;
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest,
@@ -5061,6 +5062,7 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpLoopMerge"), 0u) << disassembly;
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 TEST_F(HwLowerToStandardTest, RolledDirectMixedPrecisionInsertsFConvert) {
@@ -5130,7 +5132,9 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpLoopMerge"), 0u) << disassembly;
-  EXPECT_GT(CountSubstring(disassembly, "OpFConvert"), 0u) << disassembly;
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u)
+      << disassembly;
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -5317,6 +5321,62 @@ OpFunctionEnd
 // P1: FPFastMathDefault
 // ──────────────────────────────────────────────────────────────────
 
+TEST_F(HwLowerToStandardTest, VectorDirectDoesNotRequireReassociation) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability FloatControls2
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_float_controls2"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionModeId %main FPFastMathDefault %float %uint_0
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%mat4x4 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%xbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%wbuf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%xbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %xbuf %int_0
+%wbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %wbuf %int_0
+%x = OpCooperativeVectorLoadHW %vec4 %xbase %int_0
+%w = OpCooperativeMatrixLoadHW %mat4x4 %wbase %shape %offset %int_0
+%y = OpCooperativeVectorMatrixMulHW %vec4 %x %w
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
+}
+
 TEST_F(HwLowerToStandardTest, FPFastMathDefaultAllowReassocEnablesDirect) {
   // FPFastMathDefault for %float with AllowReassoc (0x20=32) → direct.
   const std::string text = R"(
@@ -5374,8 +5434,8 @@ OpFunctionEnd
       << "Expected direct path (OpFunctionCall) but got generic";
 }
 
-TEST_F(HwLowerToStandardTest, FPFastMathDefaultWithoutReassocFallsToGeneric) {
-  // FPFastMathDefault for %float with mode=0 (no AllowReassoc) → generic.
+TEST_F(HwLowerToStandardTest, FPFastMathDefaultWithoutReassocStaysDirect) {
+  // N-direction packing preserves K order, so mode=0 can stay direct.
   const std::string text = R"(
 OpCapability Shader
 OpCapability FloatControls2
@@ -5426,14 +5486,14 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  // Generic path inlines the Fma chain rather than generating a
-  // direct-path helper that reads from SSBO pointers.
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u)
+      << "Expected N-packed direct path without reassociation";
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
 }
 
-TEST_F(HwLowerToStandardTest, FPFastMathDefaultForWrongTypeFallsToGeneric) {
-  // f32 matmul, but FPFastMathDefault only declares AllowReassoc for
-  // %half, not %float → direct refuses.
+TEST_F(HwLowerToStandardTest, FPFastMathDefaultForWrongTypeStaysDirect) {
+  // A default for another type does not block strict K-ordered direct.
   const std::string text = R"(
 OpCapability Shader
 OpCapability Float16
@@ -5487,6 +5547,9 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u)
+      << "Expected N-packed direct path without a matching fast-math default";
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
 }
 
