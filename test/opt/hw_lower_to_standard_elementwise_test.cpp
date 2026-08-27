@@ -477,9 +477,44 @@ OpFunctionEnd
       text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(8u, CountSubstring(disassembly, "OpFAdd %float"));
   EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %float 2"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       ForceScalarUnrollsSmallFloatMatrixElementwiseChains) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_5 = OpConstant %uint 5
+%uint_7 = OpConstant %uint 7
+%float = OpTypeFloat 32
+%mat = OpTypeCooperativeMatrixHW %float %uint_5 %uint_7
+%a = OpUndef %mat
+%b = OpUndef %mat
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%sum = OpFAdd %mat %a %b
+%product = OpFMul %mat %sum %b
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar);
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(35u, CountSubstring(disassembly, "OpFAdd %float"));
+  EXPECT_EQ(35u, CountSubstring(disassembly, "OpFMul %float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersScalarToPackedVectorConversionWithLoop) {

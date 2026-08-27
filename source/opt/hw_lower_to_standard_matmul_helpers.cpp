@@ -1729,11 +1729,13 @@ bool HwLowerToStandardPass::CanUseDirectMatrixMulAdd(
                               result.component_type_id == c.component_type_id &&
                               (IsFloat16Type(result.component_type_id) ||
                                IsFloat32Type(result.component_type_id));
-  const bool mixed_f16_f32 = IsFloat32Type(result.component_type_id) &&
-                             IsFloat16Type(a.component_type_id) &&
-                             IsFloat16Type(b.component_type_id) &&
-                             IsFloat32Type(c.component_type_id);
-  return same_component || mixed_f16_f32;
+  const bool mixed_float_to_f32 = IsFloat32Type(result.component_type_id) &&
+                                  (IsFloat16Type(a.component_type_id) ||
+                                   IsFloat32Type(a.component_type_id)) &&
+                                  (IsFloat16Type(b.component_type_id) ||
+                                   IsFloat32Type(b.component_type_id)) &&
+                                  IsFloat32Type(c.component_type_id);
+  return same_component || mixed_float_to_f32;
 }
 
 bool HwLowerToStandardPass::CanUsePackedVec2VectorMatrixMul(
@@ -1765,11 +1767,14 @@ bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
       (!bias || result.component_type_id == bias->component_type_id) &&
       (IsFloat16Type(result.component_type_id) ||
        IsFloat32Type(result.component_type_id));
-  const bool mixed_f16_f32 = IsFloat32Type(result.component_type_id) &&
-                             IsFloat16Type(input.component_type_id) &&
-                             IsFloat16Type(matrix.component_type_id) &&
-                             (!bias || IsFloat32Type(bias->component_type_id));
-  return same_component || mixed_f16_f32;
+  const bool mixed_float_to_f32 =
+      IsFloat32Type(result.component_type_id) &&
+      (IsFloat16Type(input.component_type_id) ||
+       IsFloat32Type(input.component_type_id)) &&
+      (IsFloat16Type(matrix.component_type_id) ||
+       IsFloat32Type(matrix.component_type_id)) &&
+      (!bias || IsFloat32Type(bias->component_type_id));
+  return same_component || mixed_float_to_f32;
 }
 
 bool HwLowerToStandardPass::ShouldUsePackedVec2(uint32_t extent) const {

@@ -1236,21 +1236,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
     bool bias_conversion_has_explicit_fp_fast_math_mode,
     uint32_t bias_constant_id, bool bias_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
-  const bool same_component =
-      result.component_type_id == input.component_type_id &&
-      result.component_type_id == matrix.component_type_id &&
-      (!has_bias ||
-       (bias && result.component_type_id == bias->component_type_id)) &&
-      (IsFloat16Type(result.component_type_id) ||
-       IsFloat32Type(result.component_type_id));
-  const bool mixed_f16_f32 =
-      IsFloat32Type(result.component_type_id) &&
-      IsFloat16Type(input.component_type_id) &&
-      IsFloat16Type(matrix.component_type_id) &&
-      (!has_bias || (bias && IsFloat32Type(bias->component_type_id)));
-  if ((!same_component && !mixed_f16_f32) || input.length != matrix.rows ||
-      result.length != matrix.cols ||
-      (has_bias && (!bias || bias->length != result.length))) {
+  if (!CanUseDirectVectorMatrixMul(result, input, matrix, bias) ||
+      (has_bias && !bias)) {
     return 0;
   }
   if (has_bias && !bias_is_value &&
@@ -1427,16 +1414,19 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
   if (!type_insertion_point) return 0;
   const uint32_t input_vec2_type_id = GetOrCreateVectorType(
       input.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t matrix_vec2_type_id = GetOrCreateVectorType(
+      matrix.component_type_id, kPackedVec2Width, &type_insertion_point);
   const uint32_t result_vec2_type_id = GetOrCreateVectorType(
       result.component_type_id, kPackedVec2Width, &type_insertion_point);
   const uint32_t result_zero_id = GetOrCreateZero(result.component_type_id);
   const uint32_t result_zero2_id = GetOrCreateZero(result_vec2_type_id);
-  if (input_vec2_type_id == 0 || result_vec2_type_id == 0 ||
-      result_zero_id == 0 || result_zero2_id == 0) {
+  if (input_vec2_type_id == 0 || matrix_vec2_type_id == 0 ||
+      result_vec2_type_id == 0 || result_zero_id == 0 || result_zero2_id == 0) {
     return 0;
   }
-  auto widen_vec = [&](uint32_t value_id) -> uint32_t {
-    if (value_id == 0 || input.component_type_id == result.component_type_id) {
+  auto widen_vec = [&](uint32_t value_id,
+                       uint32_t source_component_type_id) -> uint32_t {
+    if (value_id == 0 || source_component_type_id == result.component_type_id) {
       return value_id;
     }
     Instruction* converted =
@@ -1489,18 +1479,21 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
                                        input_vec2_type_id, {input_id, input_id})
                                  : nullptr;
     const uint32_t compute_input_id =
-        input_vec ? widen_vec(input_vec->result_id()) : 0;
+        input_vec ? widen_vec(input_vec->result_id(), input.component_type_id)
+                  : 0;
     if (compute_input_id == 0) return 0;
     for (uint32_t pack = 0; pack < full_packs; ++pack) {
       const uint32_t col = pack * kPackedVec2Width;
       const uint32_t weight0 = matrix_scalar_ids[k * result.length + col];
       const uint32_t weight1 = matrix_scalar_ids[k * result.length + col + 1];
       Instruction* weight_vec =
-          weight0 && weight1 ? builder.AddCompositeConstruct(input_vec2_type_id,
-                                                             {weight0, weight1})
+          weight0 && weight1 ? builder.AddCompositeConstruct(
+                                   matrix_vec2_type_id, {weight0, weight1})
                              : nullptr;
       const uint32_t compute_weight_id =
-          weight_vec ? widen_vec(weight_vec->result_id()) : 0;
+          weight_vec
+              ? widen_vec(weight_vec->result_id(), matrix.component_type_id)
+              : 0;
       if (compute_weight_id == 0) return 0;
       packed_ids[pack] =
           BuildFma(&builder, result_vec2_type_id, compute_input_id,
@@ -1565,8 +1558,7 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec2(
   const uint64_t mac_count = static_cast<uint64_t>(input.length) *
                              static_cast<uint64_t>(result.length);
   const uint64_t unrolled_limit =
-      IsFloat32Type(result.component_type_id) &&
-              IsFloat32Type(input.component_type_id)
+      IsFloat32Type(result.component_type_id)
           ? std::min(max_unrolled_matmul_macs_,
                      kDirectF32VectorUnrolledMacLimit)
           : max_unrolled_matmul_macs_;
@@ -1689,8 +1681,10 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
   Instruction* insertion_point =
       get_def_use_mgr()->GetDef(result.lowered_type_id);
   if (!insertion_point) return 0;
-  const uint32_t operand_vec2_type_id = GetOrCreateVectorType(
+  const uint32_t input_vec2_type_id = GetOrCreateVectorType(
       input.component_type_id, kPackedVec2Width, &insertion_point);
+  const uint32_t matrix_vec2_type_id = GetOrCreateVectorType(
+      matrix.component_type_id, kPackedVec2Width, &insertion_point);
   const uint32_t result_vec2_type_id = GetOrCreateVectorType(
       result.component_type_id, kPackedVec2Width, &insertion_point);
   const uint32_t result_pointer_type_id = GetOrCreatePointerType(
@@ -1731,13 +1725,14 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
           ? GetOrCreatePointerType(bias->lowered_type_id,
                                    spv::StorageClass::Function)
           : 0;
-  if (operand_vec2_type_id == 0 || result_vec2_type_id == 0 ||
-      result_pointer_type_id == 0 || result_vec2_pointer_type_id == 0 ||
-      result_scalar_pointer_type_id == 0 || uint_type_id == 0 ||
-      uint_pointer_type_id == 0 || bool_type_id == 0 || zero_uint_id == 0 ||
-      one_uint_id == 0 || group_width_id == 0 || full_packs_id == 0 ||
-      input_length_id == 0 || matrix_cols_id == 0 || tail_index_id == 0 ||
-      result_zero_id == 0 || result_aggregate_zero_id == 0 ||
+  if (input_vec2_type_id == 0 || matrix_vec2_type_id == 0 ||
+      result_vec2_type_id == 0 || result_pointer_type_id == 0 ||
+      result_vec2_pointer_type_id == 0 || result_scalar_pointer_type_id == 0 ||
+      uint_type_id == 0 || uint_pointer_type_id == 0 || bool_type_id == 0 ||
+      zero_uint_id == 0 || one_uint_id == 0 || group_width_id == 0 ||
+      full_packs_id == 0 || input_length_id == 0 || matrix_cols_id == 0 ||
+      tail_index_id == 0 || result_zero_id == 0 ||
+      result_aggregate_zero_id == 0 ||
       (input_is_value && input_value_pointer_type_id == 0) ||
       (matrix_is_value && matrix_value_pointer_type_id == 0) ||
       (has_bias && bias_is_value && bias_value_pointer_type_id == 0)) {
@@ -1961,8 +1956,9 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
                         bias_conversion_has_explicit_fp_fast_math_mode);
     return converted ? converted->result_id() : 0;
   };
-  auto widen_vec = [&](InstructionBuilder* builder, uint32_t value_id) {
-    if (input.component_type_id == result.component_type_id) return value_id;
+  auto widen_vec = [&](InstructionBuilder* builder, uint32_t value_id,
+                       uint32_t source_component_type_id) {
+    if (source_component_type_id == result.component_type_id) return value_id;
     Instruction* converted =
         builder->AddUnaryOp(result_vec2_type_id, spv::Op::OpFConvert, value_id);
     ApplyActiveFPFastMathMode(converted);
@@ -2021,10 +2017,12 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
   InstructionBuilder k_body_builder(context(), k_body);
   const uint32_t x = load_input(&k_body_builder, k->result_id());
   Instruction* x_vec =
-      x ? k_body_builder.AddCompositeConstruct(operand_vec2_type_id, {x, x})
+      x ? k_body_builder.AddCompositeConstruct(input_vec2_type_id, {x, x})
         : nullptr;
   const uint32_t compute_x =
-      x_vec ? widen_vec(&k_body_builder, x_vec->result_id()) : 0;
+      x_vec ? widen_vec(&k_body_builder, x_vec->result_id(),
+                        input.component_type_id)
+            : 0;
   if (compute_x == 0) return 0;
   for (uint32_t pack = 0; pack < packs_per_group; ++pack) {
     const uint32_t pack_base = add_offset(
@@ -2034,10 +2032,12 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
     const uint32_t w1 =
         load_matrix(&k_body_builder, k->result_id(), pack_lane1);
     Instruction* w_vec = w0 && w1 ? k_body_builder.AddCompositeConstruct(
-                                        operand_vec2_type_id, {w0, w1})
+                                        matrix_vec2_type_id, {w0, w1})
                                   : nullptr;
     const uint32_t compute_w =
-        w_vec ? widen_vec(&k_body_builder, w_vec->result_id()) : 0;
+        w_vec ? widen_vec(&k_body_builder, w_vec->result_id(),
+                          matrix.component_type_id)
+              : 0;
     Instruction* acc = k_body_builder.AddLoad(result_vec2_type_id,
                                               acc_vec_vars[pack]->result_id());
     const uint32_t accumulated =
@@ -2347,15 +2347,18 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionUnrolled(
   Instruction* type_insertion_point =
       get_def_use_mgr()->GetDef(result.lowered_type_id);
   if (!type_insertion_point) return 0;
-  const uint32_t operand_vec2_type_id = GetOrCreateVectorType(
+  const uint32_t a_vec2_type_id = GetOrCreateVectorType(
       a.component_type_id, kPackedVec2Width, &type_insertion_point);
+  const uint32_t b_vec2_type_id = GetOrCreateVectorType(
+      b.component_type_id, kPackedVec2Width, &type_insertion_point);
   const uint32_t result_vec2_type_id = GetOrCreateVectorType(
       result.component_type_id, kPackedVec2Width, &type_insertion_point);
-  if (operand_vec2_type_id == 0 || result_vec2_type_id == 0) {
+  if (a_vec2_type_id == 0 || b_vec2_type_id == 0 || result_vec2_type_id == 0) {
     return 0;
   }
-  auto widen_vec = [&](uint32_t value_id) -> uint32_t {
-    if (value_id == 0 || a.component_type_id == result.component_type_id) {
+  auto widen_vec = [&](uint32_t value_id,
+                       uint32_t source_component_type_id) -> uint32_t {
+    if (value_id == 0 || source_component_type_id == result.component_type_id) {
       return value_id;
     }
     Instruction* converted =
@@ -2418,23 +2421,21 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionUnrolled(
                                : 0;
     for (uint32_t k = 0; k < a.cols; ++k) {
       const uint32_t lhs_id = a_scalar_ids[MatrixFlatIndex(a, row, k)];
-      Instruction* lhs_vec = lhs_id
-                                 ? builder.AddCompositeConstruct(
-                                       operand_vec2_type_id, {lhs_id, lhs_id})
-                                 : nullptr;
+      Instruction* lhs_vec = lhs_id ? builder.AddCompositeConstruct(
+                                          a_vec2_type_id, {lhs_id, lhs_id})
+                                    : nullptr;
       const uint32_t compute_lhs_id =
-          lhs_vec ? widen_vec(lhs_vec->result_id()) : 0;
+          lhs_vec ? widen_vec(lhs_vec->result_id(), a.component_type_id) : 0;
       if (compute_lhs_id == 0) return 0;
       for (uint32_t pack = 0; pack < full_packs; ++pack) {
         const uint32_t col = pack * kPackedVec2Width;
         const uint32_t rhs0 = b_scalar_ids[MatrixFlatIndex(b, k, col)];
         const uint32_t rhs1 = b_scalar_ids[MatrixFlatIndex(b, k, col + 1)];
-        Instruction* rhs_vec = rhs0 && rhs1
-                                   ? builder.AddCompositeConstruct(
-                                         operand_vec2_type_id, {rhs0, rhs1})
-                                   : nullptr;
+        Instruction* rhs_vec = rhs0 && rhs1 ? builder.AddCompositeConstruct(
+                                                  b_vec2_type_id, {rhs0, rhs1})
+                                            : nullptr;
         const uint32_t compute_rhs_id =
-            rhs_vec ? widen_vec(rhs_vec->result_id()) : 0;
+            rhs_vec ? widen_vec(rhs_vec->result_id(), b.component_type_id) : 0;
         if (compute_rhs_id == 0) return 0;
         row_accumulators[pack] =
             BuildFma(&builder, result_vec2_type_id, compute_lhs_id,
@@ -2503,8 +2504,7 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunction(
                              static_cast<uint64_t>(result.cols) *
                              static_cast<uint64_t>(a.cols);
   const uint64_t unrolled_limit =
-      IsFloat32Type(result.component_type_id) &&
-              IsFloat32Type(a.component_type_id)
+      IsFloat32Type(result.component_type_id)
           ? std::min(max_unrolled_matmul_macs_,
                      kDirectF32MatrixUnrolledMacLimit)
           : max_unrolled_matmul_macs_;
@@ -2605,8 +2605,10 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
   Instruction* insertion_point =
       get_def_use_mgr()->GetDef(result.lowered_type_id);
   if (!insertion_point) return 0;
-  const uint32_t operand_vec2_type_id = GetOrCreateVectorType(
+  const uint32_t a_vec2_type_id = GetOrCreateVectorType(
       a.component_type_id, kPackedVec2Width, &insertion_point);
+  const uint32_t b_vec2_type_id = GetOrCreateVectorType(
+      b.component_type_id, kPackedVec2Width, &insertion_point);
   const uint32_t result_vec2_type_id = GetOrCreateVectorType(
       result.component_type_id, kPackedVec2Width, &insertion_point);
   const uint32_t result_pointer_type_id = GetOrCreatePointerType(
@@ -2649,7 +2651,7 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
       c_is_value ? GetOrCreatePointerType(c.lowered_type_id,
                                           spv::StorageClass::Function)
                  : 0;
-  if (operand_vec2_type_id == 0 || result_vec2_type_id == 0 ||
+  if (a_vec2_type_id == 0 || b_vec2_type_id == 0 || result_vec2_type_id == 0 ||
       result_pointer_type_id == 0 || result_vec2_pointer_type_id == 0 ||
       result_scalar_pointer_type_id == 0 || uint_type_id == 0 ||
       uint_pointer_type_id == 0 || bool_type_id == 0 || zero_uint_id == 0 ||
@@ -2857,8 +2859,9 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
                                     memory_index->result_id(), memory_operands)
                : 0;
   };
-  auto widen_vec = [&](InstructionBuilder* builder, uint32_t value_id) {
-    if (a.component_type_id == result.component_type_id) return value_id;
+  auto widen_vec = [&](InstructionBuilder* builder, uint32_t value_id,
+                       uint32_t source_component_type_id) {
+    if (source_component_type_id == result.component_type_id) return value_id;
     Instruction* converted =
         builder->AddUnaryOp(result_vec2_type_id, spv::Op::OpFConvert, value_id);
     ApplyActiveFPFastMathMode(converted);
@@ -2954,12 +2957,13 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
                     captured_a, a_index_components, a_memory_operands,
                     a_index->result_id(), row->result_id(), k->result_id())
               : 0;
-  Instruction* a_vec = a_scalar
-                           ? k_body_builder.AddCompositeConstruct(
-                                 operand_vec2_type_id, {a_scalar, a_scalar})
-                           : nullptr;
+  Instruction* a_vec = a_scalar ? k_body_builder.AddCompositeConstruct(
+                                      a_vec2_type_id, {a_scalar, a_scalar})
+                                : nullptr;
   const uint32_t compute_a =
-      a_vec ? widen_vec(&k_body_builder, a_vec->result_id()) : 0;
+      a_vec
+          ? widen_vec(&k_body_builder, a_vec->result_id(), a.component_type_id)
+          : 0;
   Instruction* b_row_base = k_body_builder.AddBinaryOp(
       uint_type_id, spv::Op::OpIMul, k->result_id(), result_cols_id);
   if (compute_a == 0 || !b_row_base) return 0;
@@ -2984,10 +2988,12 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
                                       b_index1, k->result_id(), pack_col1_id)
                  : 0;
     Instruction* b_vec = b0 && b1 ? k_body_builder.AddCompositeConstruct(
-                                        operand_vec2_type_id, {b0, b1})
+                                        b_vec2_type_id, {b0, b1})
                                   : nullptr;
     const uint32_t compute_b =
-        b_vec ? widen_vec(&k_body_builder, b_vec->result_id()) : 0;
+        b_vec ? widen_vec(&k_body_builder, b_vec->result_id(),
+                          b.component_type_id)
+              : 0;
     Instruction* acc = k_body_builder.AddLoad(result_vec2_type_id,
                                               acc_vec_vars[pack]->result_id());
     const uint32_t accumulated =

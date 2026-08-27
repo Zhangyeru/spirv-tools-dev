@@ -561,6 +561,10 @@ bool HwLowerToStandardPass::ResolveDirectVectorLoad(
 
   Instruction* load = TraceFunctionValueSource(value_inst, use, &source->chain);
   if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
+    source->chain.clear();
+    load = TraceLosslessF16RoundTripSource(value_inst, use, &source->chain);
+  }
+  if (!load || load->opcode() != spv::Op::OpCooperativeVectorLoadHW) {
     return false;
   }
   if (!DirectTransportChainIsMovable(source->chain)) return false;
@@ -654,6 +658,10 @@ bool HwLowerToStandardPass::ResolveDirectMatrixLoad(
   *source = {};
 
   Instruction* load = TraceFunctionValueSource(value_inst, use, &source->chain);
+  if (!load || load->opcode() != spv::Op::OpCooperativeMatrixLoadHW) {
+    source->chain.clear();
+    load = TraceLosslessF16RoundTripSource(value_inst, use, &source->chain);
+  }
   if (!load || load->opcode() != spv::Op::OpCooperativeMatrixLoadHW) {
     return false;
   }
@@ -1445,6 +1453,18 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec2(
       add_dead_forward_copy_chain(seed);
     }
   }
+  auto add_dead_conversion_copies = [&](const DirectLoadSource& source) {
+    for (Instruction* seed : source.chain) {
+      if (kill_set.find(seed) != kill_set.end() &&
+          (seed->opcode() == spv::Op::OpFConvert ||
+           seed->opcode() == spv::Op::OpBitcast)) {
+        add_dead_forward_copy_chain(seed);
+      }
+    }
+  };
+  add_dead_conversion_copies(direct_input);
+  add_dead_conversion_copies(direct_matrix);
+  if (has_bias) add_dead_conversion_copies(direct_bias);
   if (has_bias && !bias_is_value && direct_bias.conversion) {
     add_dead_forward_copy_chain(direct_bias.conversion);
   }
@@ -2124,6 +2144,69 @@ Instruction* HwLowerToStandardPass::TraceFunctionValueSource(
   Instruction* stored_value =
       get_def_use_mgr()->GetDef(store->GetSingleWordInOperand(1));
   return TraceFunctionValueSource(stored_value, store, chain, depth + 1);
+}
+
+Instruction* HwLowerToStandardPass::TraceLosslessF16RoundTripSource(
+    Instruction* value_inst, Instruction* before,
+    std::vector<Instruction*>* chain) const {
+  if (!value_inst || !before || !chain) return nullptr;
+
+  std::vector<Instruction*> outer_chain;
+  Instruction* narrow =
+      TraceFunctionValueSource(value_inst, before, &outer_chain);
+  if (!narrow || narrow->opcode() != spv::Op::OpFConvert ||
+      narrow->NumInOperands() != 1) {
+    return nullptr;
+  }
+
+  Instruction* widened_value =
+      get_def_use_mgr()->GetDef(narrow->GetSingleWordInOperand(0));
+  std::vector<Instruction*> middle_chain;
+  Instruction* widen =
+      TraceFunctionValueSource(widened_value, narrow, &middle_chain);
+  if (!widen || widen->opcode() != spv::Op::OpFConvert ||
+      widen->NumInOperands() != 1) {
+    return nullptr;
+  }
+
+  Instruction* original_value =
+      get_def_use_mgr()->GetDef(widen->GetSingleWordInOperand(0));
+  std::vector<Instruction*> source_chain;
+  Instruction* source =
+      TraceFunctionValueSource(original_value, widen, &source_chain);
+  if (!source) return nullptr;
+
+  const VectorTypeInfo* narrow_vector = GetVectorType(narrow->type_id());
+  const VectorTypeInfo* widen_vector = GetVectorType(widen->type_id());
+  const VectorTypeInfo* source_vector = GetVectorType(source->type_id());
+  const bool vector_round_trip =
+      narrow_vector && widen_vector && source_vector &&
+      IsFloat16Type(narrow_vector->component_type_id) &&
+      IsFloat32Type(widen_vector->component_type_id) &&
+      IsFloat16Type(source_vector->component_type_id) &&
+      narrow_vector->length == widen_vector->length &&
+      narrow_vector->length == source_vector->length;
+
+  const MatrixTypeInfo* narrow_matrix = GetMatrixTypeForValue(narrow);
+  const MatrixTypeInfo* widen_matrix = GetMatrixTypeForValue(widen);
+  const MatrixTypeInfo* source_matrix = GetMatrixTypeForValue(source);
+  const bool matrix_round_trip =
+      narrow_matrix && widen_matrix && source_matrix &&
+      IsFloat16Type(narrow_matrix->component_type_id) &&
+      IsFloat32Type(widen_matrix->component_type_id) &&
+      IsFloat16Type(source_matrix->component_type_id) &&
+      narrow_matrix->rows == widen_matrix->rows &&
+      narrow_matrix->rows == source_matrix->rows &&
+      narrow_matrix->cols == widen_matrix->cols &&
+      narrow_matrix->cols == source_matrix->cols;
+  if (!vector_round_trip && !matrix_round_trip) return nullptr;
+
+  chain->insert(chain->end(), outer_chain.begin(), outer_chain.end());
+  chain->push_back(narrow);
+  chain->insert(chain->end(), middle_chain.begin(), middle_chain.end());
+  chain->push_back(widen);
+  chain->insert(chain->end(), source_chain.begin(), source_chain.end());
+  return source;
 }
 
 Instruction* HwLowerToStandardPass::FindLastStoreToFunctionPointer(

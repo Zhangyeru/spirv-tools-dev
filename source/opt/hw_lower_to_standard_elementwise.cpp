@@ -311,6 +311,139 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     }
   }
 
+  const uint32_t small_scalar_unroll_limit =
+      std::min(max_unrolled_elements_, uint32_t(64));
+  const bool unroll_small_scalar_float =
+      lowering_mode_ == LoweringMode::kForceScalar && !result_packed &&
+      (IsFloat16Type(result_component_type_id) ||
+       IsFloat32Type(result_component_type_id)) &&
+      result_piece_count <= small_scalar_unroll_limit;
+  if (unroll_small_scalar_float) {
+    InstructionBuilder builder(
+        context(), inst,
+        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+    auto extract_scalar = [&](const LoopOperand& operand,
+                              uint32_t index) -> uint32_t {
+      if (!operand.layout.packed_vec2) {
+        Instruction* value = builder.AddCompositeExtract(
+            operand.layout.component_type_id, operand.value_id, {index});
+        return value ? value->result_id() : 0;
+      }
+      Instruction* piece = builder.AddCompositeExtract(
+          operand.layout.piece_type_id, operand.value_id,
+          {index / kPackedVec2Width});
+      Instruction* value =
+          piece ? builder.AddCompositeExtract(operand.layout.component_type_id,
+                                              piece->result_id(),
+                                              {index % kPackedVec2Width})
+                : nullptr;
+      return value ? value->result_id() : 0;
+    };
+    auto convert_arithmetic_operand = [&](const LoopOperand& operand,
+                                          uint32_t value_id) -> uint32_t {
+      if (value_id == 0 || !IsFloatArithmeticOpcode(original_opcode) ||
+          operand.layout.component_type_id == result_component_type_id) {
+        return value_id;
+      }
+      Instruction* converted = builder.AddUnaryOp(
+          result_component_type_id, spv::Op::OpFConvert, value_id);
+      ApplyActiveFPFastMathMode(converted);
+      return converted ? converted->result_id() : 0;
+    };
+
+    std::vector<uint32_t> result_ids;
+    result_ids.reserve(result_piece_count);
+    for (uint32_t index = 0; index < result_piece_count; ++index) {
+      uint32_t lowered_id = 0;
+      if (kind == ElementwiseLoopKind::kConversion) {
+        const uint32_t operand_id = extract_scalar(loop_operands[0], index);
+        Instruction* converted =
+            operand_id ? builder.AddUnaryOp(result_component_type_id,
+                                            original_opcode, operand_id)
+                       : nullptr;
+        ApplyActiveFPFastMathMode(converted);
+        lowered_id = converted ? converted->result_id() : 0;
+      } else if (kind == ElementwiseLoopKind::kArithmetic) {
+        const uint32_t lhs_id = convert_arithmetic_operand(
+            loop_operands[0], extract_scalar(loop_operands[0], index));
+        Instruction* lowered = nullptr;
+        if (lhs_id != 0 && loop_operands.size() == 1) {
+          lowered = builder.AddUnaryOp(result_component_type_id,
+                                       original_opcode, lhs_id);
+        } else if (lhs_id != 0 && loop_operands.size() == 2) {
+          const uint32_t rhs_id = convert_arithmetic_operand(
+              loop_operands[1], extract_scalar(loop_operands[1], index));
+          if (rhs_id != 0) {
+            lowered = builder.AddBinaryOp(result_component_type_id,
+                                          original_opcode, lhs_id, rhs_id);
+          }
+        }
+        ApplyActiveFPFastMathMode(lowered);
+        lowered_id = lowered ? lowered->result_id() : 0;
+      } else if (kind == ElementwiseLoopKind::kScale) {
+        const uint32_t operand_id = extract_scalar(loop_operands[0], index);
+        const spv::Op scale_opcode =
+            GetScaleOpcode(get_def_use_mgr()->GetDef(result_component_type_id));
+        Instruction* scaled =
+            operand_id
+                ? builder.AddBinaryOp(result_component_type_id, scale_opcode,
+                                      operand_id, original_operand_ids[1])
+                : nullptr;
+        ApplyActiveFPFastMathMode(scaled);
+        lowered_id = scaled ? scaled->result_id() : 0;
+      } else if (kind == ElementwiseLoopKind::kSelect) {
+        const uint32_t lhs_id = extract_scalar(loop_operands[0], index);
+        const uint32_t rhs_id = extract_scalar(loop_operands[1], index);
+        Instruction* selected =
+            lhs_id && rhs_id ? builder.AddTernaryOp(
+                                   result_component_type_id, spv::Op::OpSelect,
+                                   original_operand_ids[0], lhs_id, rhs_id)
+                             : nullptr;
+        lowered_id = selected ? selected->result_id() : 0;
+      } else if (kind == ElementwiseLoopKind::kBroadcast) {
+        lowered_id = original_operand_ids[0];
+      } else {
+        std::vector<Operand> operands;
+        operands.push_back(IdOperand(original_operand_ids[0]));
+        operands.push_back(
+            Operand(SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER,
+                    {original_operand_ids[1]}));
+        for (uint32_t i = 2; i < original_operand_ids.size(); ++i) {
+          const int32_t loop_operand_index = operand_to_loop_operand[i];
+          if (loop_operand_index >= 0) {
+            const uint32_t operand_id = extract_scalar(
+                loop_operands[static_cast<size_t>(loop_operand_index)], index);
+            if (operand_id == 0) return false;
+            operands.push_back(IdOperand(operand_id));
+          } else {
+            operands.push_back(IdOperand(original_operand_ids[i]));
+          }
+        }
+        const uint32_t result_id = TakeNextId();
+        if (result_id == 0) return false;
+        std::unique_ptr<Instruction> ext_inst = MakeUnique<Instruction>(
+            context(), spv::Op::OpExtInst, result_component_type_id, result_id,
+            std::move(operands));
+        Instruction* added = builder.AddInstruction(std::move(ext_inst));
+        ApplyActiveFPFastMathMode(added);
+        lowered_id = added ? added->result_id() : 0;
+      }
+      if (lowered_id == 0) return false;
+      result_ids.push_back(lowered_id);
+    }
+
+    std::vector<Operand> result_operands;
+    result_operands.reserve(result_ids.size());
+    for (uint32_t result_id : result_ids) {
+      result_operands.push_back(IdOperand(result_id));
+    }
+    inst->SetOpcode(spv::Op::OpCompositeConstruct);
+    inst->SetResultType(lowered_result_type_id);
+    inst->SetInOperands(std::move(result_operands));
+    context()->UpdateDefUse(inst);
+    return true;
+  }
+
   Instruction* type_insertion_point = &*(--context()->types_values_end());
   for (LoopOperand& operand : loop_operands) {
     if (result_packed && !operand.layout.packed_vec2) {

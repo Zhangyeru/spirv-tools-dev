@@ -1271,7 +1271,7 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u) << disassembly;
-  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge")) << disassembly;
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge")) << disassembly;
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoad %_arr_v2half_uint_320"));
   EXPECT_EQ(0u, CountSubstring(disassembly,
                                "OpFunctionParameter %_arr_v2half_uint_320"));
@@ -1353,7 +1353,7 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u) << disassembly;
-  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge")) << disassembly;
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge")) << disassembly;
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpUDiv %uint"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpUMod %uint"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoad %_arr_v2half_uint_512"));
@@ -5135,6 +5135,198 @@ OpFunctionEnd
   EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u)
       << disassembly;
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
+}
+
+TEST_F(HwLowerToStandardTest, MixedOperandMatrixDirectUsesF32RolledLimit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %HalfBuf 0 Offset 0
+OpMemberDecorate %FloatBuf 0 Offset 0
+OpDecorate %HalfBuf Block
+OpDecorate %FloatBuf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_16 = OpConstant %uint 16
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_16 %uint_16
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%mat_half = OpTypeCooperativeMatrixHW %half %uint_16 %uint_16
+%mat_float = OpTypeCooperativeMatrixHW %float %uint_16 %uint_16
+%_runtimearr_half = OpTypeRuntimeArray %half
+%_runtimearr_float = OpTypeRuntimeArray %float
+%HalfBuf = OpTypeStruct %_runtimearr_half
+%FloatBuf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_HalfBuf = OpTypePointer StorageBuffer %HalfBuf
+%_ptr_StorageBuffer_FloatBuf = OpTypePointer StorageBuffer %FloatBuf
+%abuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%cbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%abase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %abuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %bbuf %int_0
+%cbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %cbuf %int_0
+%a = OpCooperativeMatrixLoadHW %mat_half %abase %shape %offset %int_0
+%b = OpCooperativeMatrixLoadHW %mat_float %bbase %shape %offset %int_0
+%c = OpCooperativeMatrixLoadHW %mat_float %cbase %shape %offset %int_0
+%d = OpCooperativeMatrixMulAddHW %mat_float %a %b %c
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, MixedOperandVectorDirectUsesF32RolledLimit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %HalfBuf 0 Offset 0
+OpMemberDecorate %FloatBuf 0 Offset 0
+OpDecorate %HalfBuf Block
+OpDecorate %FloatBuf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_64 = OpConstant %uint 64
+%uint_128 = OpConstant %uint 128
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_64 %uint_128
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%input_type = OpTypeCooperativeVectorHW %half %uint_64
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_64 %uint_128
+%result_type = OpTypeCooperativeVectorHW %float %uint_128
+%_runtimearr_half = OpTypeRuntimeArray %half
+%_runtimearr_float = OpTypeRuntimeArray %float
+%HalfBuf = OpTypeStruct %_runtimearr_half
+%FloatBuf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_HalfBuf = OpTypePointer StorageBuffer %HalfBuf
+%_ptr_StorageBuffer_FloatBuf = OpTypePointer StorageBuffer %FloatBuf
+%xbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%wbuf = OpVariable %_ptr_StorageBuffer_FloatBuf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%xbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %xbuf %int_0
+%wbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %wbuf %int_0
+%x = OpCooperativeVectorLoadHW %input_type %xbase %uint_0
+%w = OpCooperativeMatrixLoadHW %matrix_type %wbase %shape %offset %int_0
+%y = OpCooperativeVectorMatrixMulHW %result_type %x %w
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u);
+}
+
+TEST_F(HwLowerToStandardTest, DirectF16RoundTripConversionsReuseOriginalLoads) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_half ArrayStride 2
+OpMemberDecorate %HalfBuf 0 Offset 0
+OpDecorate %HalfBuf Block
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%vec_half = OpTypeCooperativeVectorHW %half %uint_4
+%vec_float = OpTypeCooperativeVectorHW %float %uint_4
+%mat_half = OpTypeCooperativeMatrixHW %half %uint_4 %uint_4
+%mat_float = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%_runtimearr_half = OpTypeRuntimeArray %half
+%HalfBuf = OpTypeStruct %_runtimearr_half
+%_ptr_StorageBuffer_HalfBuf = OpTypePointer StorageBuffer %HalfBuf
+%xbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%wbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%bbuf = OpVariable %_ptr_StorageBuffer_HalfBuf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_half = OpTypePointer StorageBuffer %_runtimearr_half
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%xbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %xbuf %int_0
+%wbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %wbuf %int_0
+%bbase = OpAccessChain %_ptr_StorageBuffer__runtimearr_half %bbuf %int_0
+%x = OpCooperativeVectorLoadHW %vec_half %xbase %uint_0
+%x_wide = OpFConvert %vec_float %x
+%x_round_trip = OpFConvert %vec_half %x_wide
+%w = OpCooperativeMatrixLoadHW %mat_half %wbase %shape %offset %int_0
+%w_wide = OpFConvert %mat_float %w
+%w_round_trip = OpFConvert %mat_half %w_wide
+%bias = OpCooperativeVectorLoadHW %vec_half %bbase %uint_0
+%bias_wide = OpFConvert %vec_float %bias
+%bias_round_trip = OpFConvert %vec_half %bias_wide
+%y = OpCooperativeVectorMatrixMulAddHW %vec_half %x_round_trip %w_round_trip %bias_round_trip
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionParameter"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFConvert"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
 }
 
 // ──────────────────────────────────────────────────────────────────

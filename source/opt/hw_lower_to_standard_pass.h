@@ -604,6 +604,9 @@ class HwLowerToStandardPass : public Pass {
                                         Instruction* before,
                                         std::vector<Instruction*>* chain,
                                         uint32_t depth = 0) const;
+  Instruction* TraceLosslessF16RoundTripSource(
+      Instruction* value_inst, Instruction* before,
+      std::vector<Instruction*>* chain) const;
   Instruction* FindLastStoreToFunctionPointer(uint32_t pointer_id,
                                               Instruction* before) const;
   bool IsFunctionPointer(uint32_t pointer_id) const;

@@ -150,8 +150,8 @@ std::string MakeMixedPrecisionMatMulAdd(uint32_t m, uint32_t k, uint32_t n) {
 // ── Unrolled cases (MAC ≤ 4096) ──
 
 TEST_F(HwLowerNonDirectPackedTest,
-       Condition4_UnrolledVecMatMul_F16xF32toF32_4x8) {
-  // K=4, N=8 → MAC=32 ≤ 4096 → generic unrolled packed vec2.
+       Condition4_DirectUnrolledVecMatMul_F16xF32toF32_4x8) {
+  // K=4, N=8 → MAC=32 ≤ 256 → direct unrolled packed vec2.
   auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
       MakeMixedPrecisionVecMatMul(4, 8), true, true,
       HwLowerToStandardPass::LoweringMode::kPreferPackedVec2);
@@ -163,9 +163,9 @@ TEST_F(HwLowerNonDirectPackedTest,
       << disassembly;
   EXPECT_GT(CountSubstring(disassembly, "OpTypeVector %half 2"), 0u)
       << disassembly;
-  // Generic packed vec2 path produces Fma with f16→f32 conversion inline.
+  // Direct packed vec2 path produces Fma with f16→f32 conversion inline.
   EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u) << disassembly;
-  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %float"), 0u)
+  EXPECT_GT(CountSubstring(disassembly, "OpFConvert %v2float"), 0u)
       << disassembly;
   // No structured loops (unrolled).
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge")) << disassembly;
