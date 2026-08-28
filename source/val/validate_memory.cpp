@@ -108,7 +108,8 @@ bool IsScalarOrVectorNumericType(ValidationState_t& _, uint32_t type_id) {
   return _.IsIntScalarOrVectorType(type_id) || _.IsFloatScalarOrVectorType(type_id);
 }
 
-bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
+bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id,
+                                      bool is_outermost = true) {
   const auto* type = _.FindDef(type_id);
   if (!type) {
     return false;
@@ -118,13 +119,17 @@ bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
       type->opcode() != spv::Op::OpTypeRuntimeArray) {
     return false;
   }
+  if (!is_outermost && type->opcode() == spv::Op::OpTypeRuntimeArray) {
+    return false;
+  }
 
   const auto element_type_id = type->word(2);
   if (IsScalarOrVectorNumericType(_, element_type_id)) {
     return true;
   }
 
-  return IsScalarOrVectorNumericArrayType(_, element_type_id);
+  return IsScalarOrVectorNumericArrayType(_, element_type_id,
+                                          /*is_outermost=*/false);
 }
 
 bool IsInt2Type(ValidationState_t& _, uint32_t type_id) {
@@ -2684,6 +2689,17 @@ spv_result_t ValidateCooperativeVectorPointer(ValidationState_t& _,
 
   const auto pointee_id = pointer_type->GetOperandAs<uint32_t>(2);
   const auto pointee_type = _.FindDef(pointee_id);
+  const bool is_hw = inst->opcode() == spv::Op::OpCooperativeVectorLoadHW ||
+                     inst->opcode() == spv::Op::OpCooperativeVectorStoreHW;
+  if (is_hw) {
+    if (!pointee_type || !IsScalarOrVectorNumericArrayType(_, pointee_id)) {
+      return _.diag(SPV_ERROR_INVALID_ID, inst)
+             << opname << " Pointer <id> " << _.getIdName(pointer->id())
+             << "s Type must be a nested array of scalar or vector type.";
+    }
+    return SPV_SUCCESS;
+  }
+
   if (!pointee_type ||
       (pointee_type->opcode() != spv::Op::OpTypeArray &&
        pointee_type->opcode() != spv::Op::OpTypeRuntimeArray)) {

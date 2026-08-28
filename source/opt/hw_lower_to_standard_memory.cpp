@@ -72,6 +72,8 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
       inst->GetSingleWordInOperand(kHwMatrixLoadOffsetInIdx);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwMatrixLoadMemoryOperandsInIdx);
+  const uint32_t element_index_type_id = GetOrCreateUIntType();
+  if (element_index_type_id == 0) return false;
 
   const uint32_t element_count = info->rows * info->cols;
   if (element_count > max_unrolled_elements_) {
@@ -120,12 +122,11 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
           const uint32_t col = col_pack * kPackedVec2Width + lane;
           const uint32_t index_id = BuildMatrixElementIndex(
               &builder, inst, *info, shape_id, offset_id, layout, row, col);
-          const uint32_t elem_ptr_id = BuildElementAccess(
-              &builder, inst, pointer_id, info->component_type_id, index_id);
-          if (index_id == 0 || elem_ptr_id == 0) return false;
-          const uint32_t load_id = AddLoad(&builder, info->component_type_id,
-                                           elem_ptr_id, memory_operands);
-          if (load_id == 0) return false;
+          const uint32_t load_id = AddMemoryElementLoad(
+              &builder, inst, pointer_id, /*pointer_type_id=*/0,
+              info->component_type_id, index_id, memory_operands,
+              element_index_type_id);
+          if (index_id == 0 || load_id == 0) return false;
           lane_ids.push_back(load_id);
         }
         Instruction* vec =
@@ -144,12 +145,11 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
     for (uint32_t col = 0; col < info->cols; ++col) {
       const uint32_t index_id = BuildMatrixElementIndex(
           &builder, inst, *info, shape_id, offset_id, layout, row, col);
-      const uint32_t elem_ptr_id = BuildElementAccess(
-          &builder, inst, pointer_id, info->component_type_id, index_id);
-      if (index_id == 0 || elem_ptr_id == 0) return false;
-      const uint32_t load_id = AddLoad(&builder, info->component_type_id,
-                                       elem_ptr_id, memory_operands);
-      if (load_id == 0) return false;
+      const uint32_t load_id = AddMemoryElementLoad(
+          &builder, inst, pointer_id, /*pointer_type_id=*/0,
+          info->component_type_id, index_id, memory_operands,
+          element_index_type_id);
+      if (index_id == 0 || load_id == 0) return false;
       element_ids.push_back(load_id);
     }
   }
@@ -194,6 +194,8 @@ bool HwLowerToStandardPass::LowerMatrixStore(
       inst->GetSingleWordInOperand(kHwMatrixStoreOffsetInIdx);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwMatrixStoreMemoryOperandsInIdx);
+  const uint32_t element_index_type_id = GetOrCreateUIntType();
+  if (element_index_type_id == 0) return false;
 
   const uint32_t element_count = info->rows * info->cols;
   if (element_count > max_unrolled_elements_) {
@@ -237,13 +239,13 @@ bool HwLowerToStandardPass::LowerMatrixStore(
               &builder, info->component_type_id, vec_id, lane);
           const uint32_t index_id = BuildMatrixElementIndex(
               &builder, inst, *info, shape_id, offset_id, layout, row, col);
-          const uint32_t elem_ptr_id = BuildElementAccess(
-              &builder, inst, pointer_id, info->component_type_id, index_id);
-          if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) {
+          if (value_id == 0 || index_id == 0) {
             return false;
           }
-          if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
-                        info->component_type_id)) {
+          if (!AddMemoryElementStore(
+                  &builder, inst, pointer_id, /*pointer_type_id=*/0,
+                  info->component_type_id, index_id, value_id, memory_operands,
+                  element_index_type_id)) {
             return false;
           }
         }
@@ -261,11 +263,11 @@ bool HwLowerToStandardPass::LowerMatrixStore(
           &builder, info->component_type_id, object_id, flat_index);
       const uint32_t index_id = BuildMatrixElementIndex(
           &builder, inst, *info, shape_id, offset_id, layout, row, col);
-      const uint32_t elem_ptr_id = BuildElementAccess(
-          &builder, inst, pointer_id, info->component_type_id, index_id);
-      if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) return false;
-      if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
-                    info->component_type_id)) {
+      if (value_id == 0 || index_id == 0) return false;
+      if (!AddMemoryElementStore(&builder, inst, pointer_id,
+                                 /*pointer_type_id=*/0, info->component_type_id,
+                                 index_id, value_id, memory_operands,
+                                 element_index_type_id)) {
         return false;
       }
     }
@@ -291,6 +293,15 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
       inst->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   const uint32_t offset_id =
       inst->GetSingleWordInOperand(kHwVectorLoadOffsetInIdx);
+  Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
+  Instruction* offset_type =
+      offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+  const uint32_t element_index_type_id =
+      offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
+              offset_type->NumInOperands() >= 2 &&
+              offset_type->GetSingleWordInOperand(0) == 32
+          ? GetOrCreateUIntType()
+          : (offset ? offset->type_id() : 0);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwVectorLoadMemoryOperandsInIdx);
 
@@ -313,9 +324,6 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
-    Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
-    Instruction* offset_type =
-        offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
     const bool has_32_bit_offset =
         offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
         offset_type->NumInOperands() >= 2 &&
@@ -345,12 +353,11 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
             GetOrCreateUIntConstant(pack * kPackedVec2Width + lane);
         const uint32_t index_id = BuildVectorElementIndex(
             &builder, inst, offset_id, logical_index_id);
-        const uint32_t elem_ptr_id = BuildElementAccess(
-            &builder, inst, pointer_id, info->component_type_id, index_id);
-        if (index_id == 0 || elem_ptr_id == 0) return false;
-        const uint32_t load_id = AddLoad(&builder, info->component_type_id,
-                                         elem_ptr_id, memory_operands);
-        if (load_id == 0) return false;
+        const uint32_t load_id = AddMemoryElementLoad(
+            &builder, inst, pointer_id, /*pointer_type_id=*/0,
+            info->component_type_id, index_id, memory_operands,
+            element_index_type_id);
+        if (index_id == 0 || load_id == 0) return false;
         lane_ids.push_back(load_id);
       }
       Instruction* vec =
@@ -367,11 +374,10 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
     const uint32_t logical_index_id = GetOrCreateUIntConstant(i);
     const uint32_t index_id =
         BuildVectorElementIndex(&builder, inst, offset_id, logical_index_id);
-    const uint32_t elem_ptr_id = BuildElementAccess(
-        &builder, inst, pointer_id, info->component_type_id, index_id);
-    if (elem_ptr_id == 0) return false;
-    const uint32_t load_id = AddLoad(&builder, info->component_type_id,
-                                     elem_ptr_id, memory_operands);
+    const uint32_t load_id =
+        AddMemoryElementLoad(&builder, inst, pointer_id, /*pointer_type_id=*/0,
+                             info->component_type_id, index_id, memory_operands,
+                             element_index_type_id);
     if (load_id == 0) return false;
     element_ids.push_back(load_id);
   }
@@ -405,6 +411,15 @@ bool HwLowerToStandardPass::LowerVectorStore(
       inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx);
   const uint32_t offset_id =
       inst->GetSingleWordInOperand(kHwVectorStoreOffsetInIdx);
+  Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
+  Instruction* offset_type =
+      offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+  const uint32_t element_index_type_id =
+      offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
+              offset_type->NumInOperands() >= 2 &&
+              offset_type->GetSingleWordInOperand(0) == 32
+          ? GetOrCreateUIntType()
+          : (offset ? offset->type_id() : 0);
   const std::vector<Operand> memory_operands =
       CopyMemoryOperands(inst, kHwVectorStoreMemoryOperandsInIdx);
 
@@ -423,9 +438,6 @@ bool HwLowerToStandardPass::LowerVectorStore(
     const uint32_t pointer_type_id = GetPointerTypeId(pointer_id);
     if (pointer_type_id == 0) return false;
 
-    Instruction* offset = get_def_use_mgr()->GetDef(offset_id);
-    Instruction* offset_type =
-        offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
     const bool has_32_bit_offset =
         offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
         offset_type->NumInOperands() >= 2 &&
@@ -453,11 +465,11 @@ bool HwLowerToStandardPass::LowerVectorStore(
             GetOrCreateUIntConstant(pack * kPackedVec2Width + lane);
         const uint32_t index_id = BuildVectorElementIndex(
             &builder, inst, offset_id, logical_index_id);
-        const uint32_t elem_ptr_id = BuildElementAccess(
-            &builder, inst, pointer_id, info->component_type_id, index_id);
-        if (value_id == 0 || index_id == 0 || elem_ptr_id == 0) return false;
-        if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
-                      info->component_type_id)) {
+        if (value_id == 0 || index_id == 0) return false;
+        if (!AddMemoryElementStore(&builder, inst, pointer_id,
+                                   /*pointer_type_id=*/0,
+                                   info->component_type_id, index_id, value_id,
+                                   memory_operands, element_index_type_id)) {
           return false;
         }
       }
@@ -473,11 +485,11 @@ bool HwLowerToStandardPass::LowerVectorStore(
     const uint32_t logical_index_id = GetOrCreateUIntConstant(i);
     const uint32_t index_id =
         BuildVectorElementIndex(&builder, inst, offset_id, logical_index_id);
-    const uint32_t elem_ptr_id = BuildElementAccess(
-        &builder, inst, pointer_id, info->component_type_id, index_id);
-    if (value_id == 0 || elem_ptr_id == 0) return false;
-    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
-                  info->component_type_id)) {
+    if (value_id == 0) return false;
+    if (!AddMemoryElementStore(&builder, inst, pointer_id,
+                               /*pointer_type_id=*/0, info->component_type_id,
+                               index_id, value_id, memory_operands,
+                               element_index_type_id)) {
       return false;
     }
   }
@@ -691,87 +703,263 @@ uint32_t HwLowerToStandardPass::BuildVectorElementIndex(
   return index ? index->result_id() : 0;
 }
 
-uint32_t HwLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
-                                                   Instruction* user,
-                                                   uint32_t pointer_id,
-                                                   uint32_t component_type_id,
-                                                   uint32_t element_index_id) {
+bool HwLowerToStandardPass::DescribeHwMemoryPointerLayout(
+    uint32_t pointer_type_id, uint32_t cooperative_component_type_id,
+    HwMemoryPointerLayout* layout) const {
+  if (!layout) return false;
+  *layout = {};
+
+  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
+  Instruction* cooperative_component =
+      get_def_use_mgr()->GetDef(cooperative_component_type_id);
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+      pointer_type->NumInOperands() < 2 || !cooperative_component ||
+      !IsNumericScalarType(cooperative_component) ||
+      cooperative_component->NumInOperands() < 1) {
+    return false;
+  }
+
+  layout->storage_class =
+      static_cast<spv::StorageClass>(pointer_type->GetSingleWordInOperand(0));
+  uint32_t current_type_id = pointer_type->GetSingleWordInOperand(1);
+  while (true) {
+    Instruction* current_type = get_def_use_mgr()->GetDef(current_type_id);
+    if (!current_type) return false;
+    if (current_type->opcode() != spv::Op::OpTypeArray &&
+        current_type->opcode() != spv::Op::OpTypeRuntimeArray) {
+      if (current_type->opcode() == spv::Op::OpTypeVector &&
+          current_type->NumInOperands() >= 2) {
+        layout->leaf_component_type_id =
+            current_type->GetSingleWordInOperand(0);
+        layout->leaf_vector_width = current_type->GetSingleWordInOperand(1);
+      } else if (IsNumericScalarType(current_type)) {
+        layout->leaf_component_type_id = current_type_id;
+        layout->leaf_vector_width = 1;
+      } else {
+        return false;
+      }
+      break;
+    }
+
+    HwMemoryArrayLevel level;
+    level.runtime = current_type->opcode() == spv::Op::OpTypeRuntimeArray;
+    if (!level.runtime) {
+      if (current_type->NumInOperands() < 2) return false;
+      level.length_id = current_type->GetSingleWordInOperand(1);
+    } else if (!layout->array_levels.empty()) {
+      // Runtime arrays can only be the outermost level of the pointer's
+      // logical scalar sequence.
+      return false;
+    }
+    if (current_type->NumInOperands() < 1) return false;
+    layout->array_levels.push_back(level);
+    current_type_id = current_type->GetSingleWordInOperand(0);
+  }
+
+  Instruction* leaf_component =
+      get_def_use_mgr()->GetDef(layout->leaf_component_type_id);
+  if (layout->array_levels.empty() || layout->leaf_vector_width == 0 ||
+      !leaf_component || !IsNumericScalarType(leaf_component) ||
+      leaf_component->NumInOperands() < 1 ||
+      leaf_component->GetSingleWordInOperand(0) !=
+          cooperative_component->GetSingleWordInOperand(0)) {
+    return false;
+  }
+  return true;
+}
+
+HwLowerToStandardPass::HwMemoryElementAccess
+HwLowerToStandardPass::BuildElementAccess(InstructionBuilder* builder,
+                                          Instruction* user,
+                                          uint32_t pointer_id,
+                                          uint32_t component_type_id,
+                                          uint32_t element_index_id,
+                                          uint32_t element_index_type_id) {
   Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
   if (!pointer || pointer->type_id() == 0) {
     ReportError(user, "HW load/store pointer is invalid");
-    return 0;
+    return {};
   }
-  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer->type_id());
-  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
-    ReportError(user, "HW load/store pointer must be a pointer");
-    return 0;
-  }
-
-  const uint32_t pointee_type_id = pointer_type->GetSingleWordInOperand(1);
-  Instruction* pointee_type = get_def_use_mgr()->GetDef(pointee_type_id);
-  if (!pointee_type) return 0;
-
-  if (pointee_type_id == component_type_id) {
-    uint32_t index_value = 0;
-    if (GetConstantU32(element_index_id, &index_value) && index_value == 0) {
-      return pointer_id;
-    }
-    ReportError(user,
-                "HW scalar pointer load/store only supports element zero");
-    return 0;
-  }
-
-  if ((pointee_type->opcode() == spv::Op::OpTypeRuntimeArray ||
-       pointee_type->opcode() == spv::Op::OpTypeArray) &&
-      pointee_type->GetSingleWordInOperand(0) == component_type_id) {
-    const uint32_t storage_class = pointer_type->GetSingleWordInOperand(0);
-    const uint32_t component_pointer_type_id = GetOrCreatePointerType(
-        component_type_id, static_cast<spv::StorageClass>(storage_class));
-    Instruction* access = builder->AddAccessChain(
-        component_pointer_type_id, pointer_id, {element_index_id});
-    return access ? access->result_id() : 0;
-  }
-
-  ReportError(user,
-              "HW load/store pointer must point to the component or a "
-              "component array");
-  return 0;
+  return BuildElementAccessFromPointerType(
+      builder, pointer->type_id(), pointer_id, component_type_id,
+      element_index_id, element_index_type_id);
 }
 
-uint32_t HwLowerToStandardPass::BuildElementAccessFromPointerType(
+HwLowerToStandardPass::HwMemoryElementAccess
+HwLowerToStandardPass::BuildElementAccessFromPointerType(
     InstructionBuilder* builder, uint32_t pointer_type_id, uint32_t pointer_id,
-    uint32_t component_type_id, uint32_t element_index_id) {
-  Instruction* pointer_type = get_def_use_mgr()->GetDef(pointer_type_id);
-  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
-    ReportError(nullptr, "HW load/store pointer must be a pointer");
-    return 0;
+    uint32_t component_type_id, uint32_t element_index_id,
+    uint32_t element_index_type_id) {
+  HwMemoryPointerLayout layout;
+  Instruction* logical_index_type =
+      get_def_use_mgr()->GetDef(element_index_type_id);
+  if (!builder || pointer_id == 0 || element_index_id == 0 ||
+      !logical_index_type ||
+      logical_index_type->opcode() != spv::Op::OpTypeInt ||
+      logical_index_type->NumInOperands() < 2 ||
+      !DescribeHwMemoryPointerLayout(pointer_type_id, component_type_id,
+                                     &layout)) {
+    return {};
   }
 
-  const uint32_t pointee_type_id = pointer_type->GetSingleWordInOperand(1);
-  Instruction* pointee_type = get_def_use_mgr()->GetDef(pointee_type_id);
-  if (!pointee_type) return 0;
+  const uint32_t index_width = logical_index_type->GetSingleWordInOperand(0);
+  const uint32_t unsigned_index_type_id =
+      GetOrCreateIntegerType(index_width, /*is_signed=*/false);
+  if (unsigned_index_type_id == 0) return {};
 
-  if (pointee_type_id == component_type_id) {
-    ReportError(nullptr,
-                "HW scalar pointer load/store cannot be chunk-lowered");
-    return 0;
-  }
+  auto convert_to_index_type = [&](uint32_t value_id,
+                                   uint32_t known_type_id = 0) -> uint32_t {
+    Instruction* value = get_def_use_mgr()->GetDef(value_id);
+    const uint32_t value_type_id =
+        known_type_id != 0 ? known_type_id : (value ? value->type_id() : 0);
+    Instruction* type =
+        value_type_id ? get_def_use_mgr()->GetDef(value_type_id) : nullptr;
+    if (value_id == 0 || !type || type->opcode() != spv::Op::OpTypeInt ||
+        type->NumInOperands() < 2) {
+      return 0;
+    }
+    const uint32_t width = type->GetSingleWordInOperand(0);
+    const bool is_signed = type->GetSingleWordInOperand(1) != 0;
+    uint32_t unsigned_value_id = value_id;
+    uint32_t unsigned_type_id = value_type_id;
+    if (is_signed) {
+      unsigned_type_id = GetOrCreateIntegerType(width, /*is_signed=*/false);
+      Instruction* bitcast =
+          unsigned_type_id ? builder->AddUnaryOp(unsigned_type_id,
+                                                 spv::Op::OpBitcast, value_id)
+                           : nullptr;
+      if (!bitcast) return 0;
+      unsigned_value_id = bitcast->result_id();
+    }
+    if (unsigned_type_id == unsigned_index_type_id) return unsigned_value_id;
+    Instruction* converted = builder->AddUnaryOp(
+        unsigned_index_type_id, spv::Op::OpUConvert, unsigned_value_id);
+    return converted ? converted->result_id() : 0;
+  };
 
-  if ((pointee_type->opcode() == spv::Op::OpTypeRuntimeArray ||
-       pointee_type->opcode() == spv::Op::OpTypeArray) &&
-      pointee_type->GetSingleWordInOperand(0) == component_type_id) {
-    const uint32_t storage_class = pointer_type->GetSingleWordInOperand(0);
+  const uint32_t unsigned_logical_index_id =
+      convert_to_index_type(element_index_id, element_index_type_id);
+  if (unsigned_logical_index_id == 0) return {};
+
+  auto build_access = [&](const std::vector<uint32_t>& indices) {
     const uint32_t component_pointer_type_id = GetOrCreatePointerType(
-        component_type_id, static_cast<spv::StorageClass>(storage_class));
-    Instruction* access = builder->AddAccessChain(
-        component_pointer_type_id, pointer_id, {element_index_id});
-    return access ? access->result_id() : 0;
+        layout.leaf_component_type_id, layout.storage_class);
+    Instruction* access =
+        component_pointer_type_id
+            ? builder->AddAccessChain(component_pointer_type_id, pointer_id,
+                                      indices)
+            : nullptr;
+    return HwMemoryElementAccess{access ? access->result_id() : 0,
+                                 access ? layout.leaf_component_type_id : 0};
+  };
+
+  if (layout.array_levels.size() == 1 && layout.leaf_vector_width == 1) {
+    return build_access({unsigned_logical_index_id});
   }
 
-  ReportError(nullptr,
-              "HW load/store pointer must point to the component or a "
-              "component array");
-  return 0;
+  const uint32_t leaf_width_id =
+      GetOrCreateConstant(unsigned_index_type_id, layout.leaf_vector_width);
+  if (leaf_width_id == 0) return {};
+
+  std::vector<uint32_t> inner_span_ids(layout.array_levels.size(), 0);
+  uint32_t span_id = leaf_width_id;
+  for (size_t reverse = layout.array_levels.size(); reverse > 0; --reverse) {
+    const size_t i = reverse - 1;
+    inner_span_ids[i] = span_id;
+    const HwMemoryArrayLevel& level = layout.array_levels[i];
+    if (i == 0 || level.runtime) continue;
+    const uint32_t length_id = convert_to_index_type(level.length_id);
+    Instruction* next_span =
+        length_id ? builder->AddBinaryOp(unsigned_index_type_id,
+                                         spv::Op::OpIMul, span_id, length_id)
+                  : nullptr;
+    if (!next_span) return {};
+    span_id = next_span->result_id();
+  }
+
+  std::vector<uint32_t> indices;
+  indices.reserve(layout.array_levels.size() +
+                  (layout.leaf_vector_width > 1 ? 1 : 0));
+  for (size_t i = 0; i < layout.array_levels.size(); ++i) {
+    Instruction* divided =
+        builder->AddBinaryOp(unsigned_index_type_id, spv::Op::OpUDiv,
+                             unsigned_logical_index_id, inner_span_ids[i]);
+    if (!divided) return {};
+    uint32_t array_index_id = divided->result_id();
+    // The outermost coordinate stays unbounded.  Modulo is only required to
+    // extract inner coordinates; applying it at level zero would silently
+    // wrap an out-of-range logical index into the pointee array.
+    if (i != 0 && !layout.array_levels[i].runtime) {
+      const uint32_t length_id =
+          convert_to_index_type(layout.array_levels[i].length_id);
+      Instruction* reduced =
+          length_id
+              ? builder->AddBinaryOp(unsigned_index_type_id, spv::Op::OpUMod,
+                                     array_index_id, length_id)
+              : nullptr;
+      if (!reduced) return {};
+      array_index_id = reduced->result_id();
+    }
+    indices.push_back(array_index_id);
+  }
+  if (layout.leaf_vector_width > 1) {
+    Instruction* lane =
+        builder->AddBinaryOp(unsigned_index_type_id, spv::Op::OpUMod,
+                             unsigned_logical_index_id, leaf_width_id);
+    if (!lane) return {};
+    indices.push_back(lane->result_id());
+  }
+
+  return build_access(indices);
+}
+
+uint32_t HwLowerToStandardPass::AddMemoryElementLoad(
+    InstructionBuilder* builder, Instruction* user, uint32_t pointer_id,
+    uint32_t pointer_type_id, uint32_t component_type_id,
+    uint32_t element_index_id, const std::vector<Operand>& memory_operands,
+    uint32_t element_index_type_id) {
+  const HwMemoryElementAccess access =
+      pointer_type_id
+          ? BuildElementAccessFromPointerType(
+                builder, pointer_type_id, pointer_id, component_type_id,
+                element_index_id, element_index_type_id)
+          : BuildElementAccess(builder, user, pointer_id, component_type_id,
+                               element_index_id, element_index_type_id);
+  uint32_t loaded_id = access.pointer_id
+                           ? AddLoad(builder, access.component_type_id,
+                                     access.pointer_id, memory_operands)
+                           : 0;
+  if (loaded_id == 0 || access.component_type_id == component_type_id) {
+    return loaded_id;
+  }
+  Instruction* converted =
+      builder->AddUnaryOp(component_type_id, spv::Op::OpBitcast, loaded_id);
+  return converted ? converted->result_id() : 0;
+}
+
+bool HwLowerToStandardPass::AddMemoryElementStore(
+    InstructionBuilder* builder, Instruction* user, uint32_t pointer_id,
+    uint32_t pointer_type_id, uint32_t component_type_id,
+    uint32_t element_index_id, uint32_t object_id,
+    const std::vector<Operand>& memory_operands,
+    uint32_t element_index_type_id) {
+  const HwMemoryElementAccess access =
+      pointer_type_id
+          ? BuildElementAccessFromPointerType(
+                builder, pointer_type_id, pointer_id, component_type_id,
+                element_index_id, element_index_type_id)
+          : BuildElementAccess(builder, user, pointer_id, component_type_id,
+                               element_index_id, element_index_type_id);
+  if (access.pointer_id == 0) return false;
+  uint32_t stored_id = object_id;
+  if (access.component_type_id != component_type_id) {
+    Instruction* converted = builder->AddUnaryOp(access.component_type_id,
+                                                 spv::Op::OpBitcast, object_id);
+    if (!converted) return false;
+    stored_id = converted->result_id();
+  }
+  return AddStore(builder, access.pointer_id, stored_id, memory_operands,
+                  access.component_type_id);
 }
 
 Instruction* HwLowerToStandardPass::AddFunctionVariable(
@@ -1580,10 +1768,22 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
   const uint32_t one_id = GetOrCreateUIntConstant(1);
   const uint32_t packed_width_id = GetOrCreateUIntConstant(kPackedVec2Width);
   const uint32_t element_count_id = GetOrCreateUIntConstant(element_count);
+  Instruction* offset =
+      is_matrix ? nullptr : get_def_use_mgr()->GetDef(offset_id);
+  Instruction* offset_type =
+      offset ? get_def_use_mgr()->GetDef(offset->type_id()) : nullptr;
+  const uint32_t memory_index_type_id =
+      is_matrix ||
+              (offset_type && offset_type->opcode() == spv::Op::OpTypeInt &&
+               offset_type->NumInOperands() >= 2 &&
+               offset_type->GetSingleWordInOperand(0) == 32)
+          ? uint_type_id
+          : (offset ? offset->type_id() : 0);
   if (aggregate_pointer_type_id == 0 || component_pointer_type_id == 0 ||
       piece_pointer_type_id == 0 || uint_type_id == 0 ||
       uint_pointer_type_id == 0 || bool_type_id == 0 || zero_id == 0 ||
-      one_id == 0 || packed_width_id == 0 || element_count_id == 0) {
+      one_id == 0 || packed_width_id == 0 || element_count_id == 0 ||
+      memory_index_type_id == 0) {
     return false;
   }
 
@@ -1674,9 +1874,10 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
                       matrix_cols, index->result_id())
                 : BuildVectorElementIndex(&body_builder, insert_before,
                                           offset_id, index->result_id());
-  const uint32_t external_pointer_id =
-      BuildElementAccess(&body_builder, insert_before, pointer_id,
-                         component_type_id, memory_index_id);
+  const HwMemoryElementAccess memory_access = BuildElementAccess(
+      &body_builder, insert_before, pointer_id, component_type_id,
+      memory_index_id, memory_index_type_id);
+  if (memory_access.pointer_id == 0) return false;
   uint32_t piece_index_id = index->result_id();
   uint32_t lane_id = 0;
   if (packed_vec2_type_id != 0) {
@@ -1690,12 +1891,15 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
   }
   Instruction* aggregate_pointer = body_builder.AddAccessChain(
       piece_pointer_type_id, aggregate_variable->result_id(), {piece_index_id});
-  if (memory_index_id == 0 || external_pointer_id == 0 || !aggregate_pointer) {
-    return false;
-  }
+  if (!aggregate_pointer) return false;
   if (is_load) {
-    const uint32_t value_id = AddLoad(&body_builder, component_type_id,
-                                      external_pointer_id, memory_operands);
+    uint32_t value_id = AddLoad(&body_builder, memory_access.component_type_id,
+                                memory_access.pointer_id, memory_operands);
+    if (value_id != 0 && memory_access.component_type_id != component_type_id) {
+      Instruction* converted = body_builder.AddUnaryOp(
+          component_type_id, spv::Op::OpBitcast, value_id);
+      value_id = converted ? converted->result_id() : 0;
+    }
     uint32_t stored_id = value_id;
     if (value_id != 0 && packed_vec2_type_id != 0) {
       Instruction* old_piece = body_builder.AddLoad(
@@ -1722,8 +1926,16 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
           piece->result_id(), lane_id);
       value_id = extracted ? extracted->result_id() : 0;
     }
-    if (value_id == 0 || !AddStore(&body_builder, external_pointer_id, value_id,
-                                   memory_operands, component_type_id)) {
+    if (value_id == 0) return false;
+    uint32_t stored_id = value_id;
+    if (memory_access.component_type_id != component_type_id) {
+      Instruction* converted = body_builder.AddUnaryOp(
+          memory_access.component_type_id, spv::Op::OpBitcast, value_id);
+      if (!converted) return false;
+      stored_id = converted->result_id();
+    }
+    if (!AddStore(&body_builder, memory_access.pointer_id, stored_id,
+                  memory_operands, memory_access.component_type_id)) {
       return false;
     }
   }
@@ -2005,7 +2217,7 @@ bool HwLowerToStandardPass::GetKnownAccessByteOffset(
       pointer->opcode() != spv::Op::OpInBoundsAccessChain) {
     return true;
   }
-  if (pointer->NumInOperands() != 2) return true;
+  if (pointer->NumInOperands() < 2) return false;
 
   Instruction* base =
       get_def_use_mgr()->GetDef(pointer->GetSingleWordInOperand(0));
@@ -2016,29 +2228,49 @@ bool HwLowerToStandardPass::GetKnownAccessByteOffset(
       base_pointer_type->NumInOperands() < 2) {
     return false;
   }
-  Instruction* pointee =
+  Instruction* current_type =
       get_def_use_mgr()->GetDef(base_pointer_type->GetSingleWordInOperand(1));
-  if (!pointee ||
-      (pointee->opcode() != spv::Op::OpTypeArray &&
-       pointee->opcode() != spv::Op::OpTypeRuntimeArray) ||
-      pointee->NumInOperands() == 0 ||
-      pointee->GetSingleWordInOperand(0) != accessed_type_id) {
-    // The access chain produced the pointer passed to the original HW
-    // operation.  Its Aligned promise is relative to that pointer, not to the
-    // module variable at the root of the chain.
-    return true;
+  if (!current_type) return false;
+
+  for (uint32_t operand_index = 1; operand_index < pointer->NumInOperands();
+       ++operand_index) {
+    uint32_t index = 0;
+    if (!TryEvaluateConstantU32Expression(
+            pointer->GetSingleWordInOperand(operand_index), &index)) {
+      return false;
+    }
+
+    uint32_t stride = 0;
+    uint32_t next_type_id = 0;
+    switch (current_type->opcode()) {
+      case spv::Op::OpTypeArray:
+      case spv::Op::OpTypeRuntimeArray:
+        if (current_type->NumInOperands() < 1) return false;
+        next_type_id = current_type->GetSingleWordInOperand(0);
+        stride = GetArrayStride(current_type->result_id());
+        if (stride == 0 && next_type_id == accessed_type_id) {
+          stride = GetTypeNaturalAlignment(next_type_id);
+        }
+        break;
+      case spv::Op::OpTypeVector:
+        if (current_type->NumInOperands() < 2) return false;
+        next_type_id = current_type->GetSingleWordInOperand(0);
+        stride = GetTypeNaturalAlignment(next_type_id);
+        break;
+      default:
+        return false;
+    }
+    if (stride == 0 ||
+        uint64_t(index) >
+            (std::numeric_limits<uint64_t>::max() - *byte_offset) / stride) {
+      return false;
+    }
+    *byte_offset += uint64_t(index) * stride;
+    current_type = get_def_use_mgr()->GetDef(next_type_id);
+    if (!current_type) return false;
   }
 
-  uint32_t element_index = 0;
-  if (!TryEvaluateConstantU32Expression(pointer->GetSingleWordInOperand(1),
-                                        &element_index)) {
-    return false;
-  }
-  uint32_t stride = GetArrayStride(pointee->result_id());
-  if (stride == 0) stride = GetTypeNaturalAlignment(accessed_type_id);
-  if (stride == 0) return false;
-  *byte_offset = uint64_t(element_index) * uint64_t(stride);
-  return true;
+  return current_type->result_id() == accessed_type_id;
 }
 
 bool HwLowerToStandardPass::TryEvaluateConstantFloat32(uint32_t id,
@@ -2265,12 +2497,9 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedLoadChunkFunction(
       if (!element_index) return 0;
       element_index_id = element_index->result_id();
     }
-    const uint32_t elem_ptr_id = BuildElementAccessFromPointerType(
-        &builder, pointer_type_id, captured_pointer_id, component_type_id,
-        element_index_id);
-    if (elem_ptr_id == 0) return 0;
-    const uint32_t load_id =
-        AddLoad(&builder, component_type_id, elem_ptr_id, memory_operands);
+    const uint32_t load_id = AddMemoryElementLoad(
+        &builder, nullptr, captured_pointer_id, pointer_type_id,
+        component_type_id, element_index_id, memory_operands, uint_type_id);
     if (load_id == 0) return 0;
     lane_ids.push_back(load_id);
   }
@@ -2352,14 +2581,21 @@ uint32_t HwLowerToStandardPass::GetOrCreatePackedStoreChunkFunction(
       if (!element_index) return 0;
       element_index_id = element_index->result_id();
     }
-    const uint32_t elem_ptr_id = BuildElementAccessFromPointerType(
+    const HwMemoryElementAccess access = BuildElementAccessFromPointerType(
         &builder, pointer_type_id, captured_pointer_id, component_type_id,
-        element_index_id);
+        element_index_id, uint_type_id);
     const uint32_t value_id = ExtractCompositeElement(
         &builder, component_type_id, value_param_id, lane);
-    if (elem_ptr_id == 0 || value_id == 0) return 0;
-    if (!AddStore(&builder, elem_ptr_id, value_id, memory_operands,
-                  component_type_id)) {
+    if (access.pointer_id == 0 || value_id == 0) return 0;
+    uint32_t stored_id = value_id;
+    if (access.component_type_id != component_type_id) {
+      Instruction* converted = builder.AddUnaryOp(access.component_type_id,
+                                                  spv::Op::OpBitcast, value_id);
+      if (!converted) return 0;
+      stored_id = converted->result_id();
+    }
+    if (!AddStore(&builder, access.pointer_id, stored_id, memory_operands,
+                  access.component_type_id)) {
       return 0;
     }
   }

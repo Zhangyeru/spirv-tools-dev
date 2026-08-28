@@ -97,6 +97,23 @@ class HwLowerToStandardPass : public Pass {
     bool packed_vec2 = false;
   };
 
+  struct HwMemoryArrayLevel {
+    uint32_t length_id = 0;
+    bool runtime = false;
+  };
+
+  struct HwMemoryPointerLayout {
+    spv::StorageClass storage_class = spv::StorageClass::Max;
+    std::vector<HwMemoryArrayLevel> array_levels;
+    uint32_t leaf_component_type_id = 0;
+    uint32_t leaf_vector_width = 1;
+  };
+
+  struct HwMemoryElementAccess {
+    uint32_t pointer_id = 0;
+    uint32_t component_type_id = 0;
+  };
+
   // Describes a cooperative load that can be folded into a generated direct
   // matmul helper. Matrix-only fields remain zero for vector loads.
   struct DirectLoadSource {
@@ -220,14 +237,31 @@ class HwLowerToStandardPass : public Pass {
   uint32_t BuildVectorElementIndex(InstructionBuilder* builder,
                                    Instruction* user, uint32_t offset_id,
                                    uint32_t logical_index_id);
-  uint32_t BuildElementAccess(InstructionBuilder* builder, Instruction* user,
-                              uint32_t pointer_id, uint32_t component_type_id,
-                              uint32_t element_index_id);
-  uint32_t BuildElementAccessFromPointerType(InstructionBuilder* builder,
-                                             uint32_t pointer_type_id,
-                                             uint32_t pointer_id,
-                                             uint32_t component_type_id,
-                                             uint32_t element_index_id);
+  bool DescribeHwMemoryPointerLayout(uint32_t pointer_type_id,
+                                     uint32_t cooperative_component_type_id,
+                                     HwMemoryPointerLayout* layout) const;
+  HwMemoryElementAccess BuildElementAccess(InstructionBuilder* builder,
+                                           Instruction* user,
+                                           uint32_t pointer_id,
+                                           uint32_t component_type_id,
+                                           uint32_t element_index_id,
+                                           uint32_t element_index_type_id);
+  HwMemoryElementAccess BuildElementAccessFromPointerType(
+      InstructionBuilder* builder, uint32_t pointer_type_id,
+      uint32_t pointer_id, uint32_t component_type_id,
+      uint32_t element_index_id, uint32_t element_index_type_id);
+  uint32_t AddMemoryElementLoad(InstructionBuilder* builder, Instruction* user,
+                                uint32_t pointer_id, uint32_t pointer_type_id,
+                                uint32_t component_type_id,
+                                uint32_t element_index_id,
+                                const std::vector<Operand>& memory_operands,
+                                uint32_t element_index_type_id);
+  bool AddMemoryElementStore(InstructionBuilder* builder, Instruction* user,
+                             uint32_t pointer_id, uint32_t pointer_type_id,
+                             uint32_t component_type_id,
+                             uint32_t element_index_id, uint32_t object_id,
+                             const std::vector<Operand>& memory_operands,
+                             uint32_t element_index_type_id);
   Instruction* AddFunctionVariable(Function* function, uint32_t pointer_type_id,
                                    uint32_t initializer_id = 0);
   uint32_t BuildLogicalAggregateLoad(InstructionBuilder* builder,

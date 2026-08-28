@@ -74,6 +74,119 @@ OpFunctionEnd
   EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpFunctionCall"));
 }
 
+TEST_F(HwLowerToStandardTest, LowersMatrixSubregionThroughNestedFixedArrays) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+; CHECK-NOT: CooperativeMatrixKHR
+; CHECK: OpUDiv %uint
+; CHECK: OpUMod %uint
+; CHECK: OpAccessChain %_ptr_StorageBuffer_uint {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpLoad %uint
+; CHECK: OpBitcast %float
+; CHECK: OpBitcast %uint
+; CHECK: OpStore {{%\w+}} {{%\w+}}
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %inner ArrayStride 16
+OpDecorate %outer ArrayStride 32
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%uint_6 = OpConstant %uint 6
+%uint_8 = OpConstant %uint 8
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v4uint = OpTypeVector %uint 4
+%shape_type = OpTypeVector %uint 2
+%shape = OpConstantComposite %shape_type %uint_6 %uint_8
+%offset = OpConstantComposite %shape_type %uint_2 %uint_3
+%mat = OpTypeCooperativeMatrixHW %float %uint_2 %uint_3
+%inner = OpTypeArray %v4uint %uint_2
+%outer = OpTypeArray %inner %uint_6
+%Buf = OpTypeStruct %outer
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_outer = OpTypePointer StorageBuffer %outer
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_outer %buf %int_0
+%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %int_0
+OpCooperativeMatrixStoreHW %base %value %shape %offset %int_0
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
+  ExpectNoHwOrCoopMatrix(std::get<0>(result));
+  EXPECT_GE(CountSubstring(std::get<0>(result), "OpUDiv %uint"), 2u);
+  EXPECT_GE(CountSubstring(std::get<0>(result), "OpUMod %uint"), 2u);
+}
+
+TEST_F(HwLowerToStandardTest,
+       LowersDynamicPackedVectorThroughNestedArrayVectorLeafBitcasts) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+; CHECK-NOT: CooperativeMatrixKHR
+; CHECK: OpUDiv %uint
+; CHECK: OpUMod %uint
+; CHECK: OpAccessChain %_ptr_StorageBuffer_uint {{%\w+}} {{%\w+}} {{%\w+}} {{%\w+}}
+; CHECK: OpLoad %uint
+; CHECK: OpBitcast %float
+; CHECK: OpBitcast %uint
+; CHECK: OpStore {{%\w+}} {{%\w+}}
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %inner ArrayStride 16
+OpDecorate %outer ArrayStride 32
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_2 = OpConstant %uint 2
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%v4uint = OpTypeVector %uint 4
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%inner = OpTypeArray %v4uint %uint_2
+%outer = OpTypeRuntimeArray %inner
+%Buf = OpTypeStruct %outer
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_outer = OpTypePointer StorageBuffer %outer
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_outer %buf %int_0
+%dynamic_offset = OpIAdd %uint %uint_4 %uint_1
+%value = OpCooperativeVectorLoadHW %vec4 %base %dynamic_offset
+OpCooperativeVectorStoreHW %base %dynamic_offset %value
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
+  ExpectNoHwOrCoopMatrix(std::get<0>(result));
+  EXPECT_GE(CountSubstring(std::get<0>(result), "OpBitcast %float"), 2u);
+  EXPECT_GE(CountSubstring(std::get<0>(result), "OpBitcast %uint"), 2u);
+}
+
 TEST_F(HwLowerToStandardTest, MatrixLoadPreservesAlignedMemoryAccess) {
   const std::string text = R"(
 ; CHECK-NOT: HW

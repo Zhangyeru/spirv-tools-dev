@@ -701,17 +701,13 @@ HwLowerToStandardPass::BuildFusedVectorMatmulAddStoreFunctionPackedVec2(
               : BuildRowMajorMatrixMemoryIndex(
                     &k_body_builder, nullptr, matrix_shape_id, matrix_offset_id,
                     matrix.cols, matrix_local_index->result_id());
-      const uint32_t matrix_element_pointer_id =
-          matrix_memory_index_id
-              ? BuildElementAccessFromPointerType(
-                    &k_body_builder, matrix_pointer_type_id,
-                    captured_matrix_pointer_id, matrix.component_type_id,
-                    matrix_memory_index_id)
-              : 0;
       const uint32_t weight_scalar_id =
-          matrix_element_pointer_id
-              ? AddLoad(&k_body_builder, matrix.component_type_id,
-                        matrix_element_pointer_id, matrix_memory_operands)
+          matrix_memory_index_id
+              ? AddMemoryElementLoad(
+                    &k_body_builder, nullptr, captured_matrix_pointer_id,
+                    matrix_pointer_type_id, matrix.component_type_id,
+                    matrix_memory_index_id, matrix_memory_operands,
+                    uint_type_id)
               : 0;
       if (weight_scalar_id == 0) return 0;
       weight_column_ids.push_back(weight_scalar_id);
@@ -1323,6 +1319,8 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
       std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
   if (!block) return 0;
   InstructionBuilder builder(context(), block.get());
+  const uint32_t element_index_type_id = GetOrCreateUIntType();
+  if (element_index_type_id == 0) return 0;
 
   const uint32_t captured_input_pointer_id =
       input_is_value ? 0 : BuildCapturedPointer(&builder, input_pointer_id);
@@ -1342,14 +1340,11 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionUnrolled(
       [&](uint32_t pointer_type_id, uint32_t pointer_id,
           uint32_t component_type_id, uint32_t index_id,
           const std::vector<Operand>& memory_operands) -> uint32_t {
-    const uint32_t element_pointer_id =
-        index_id ? BuildElementAccessFromPointerType(
-                       &builder, pointer_type_id, pointer_id, component_type_id,
-                       index_id)
-                 : 0;
-    return element_pointer_id ? AddLoad(&builder, component_type_id,
-                                        element_pointer_id, memory_operands)
-                              : 0;
+    return index_id ? AddMemoryElementLoad(&builder, nullptr, pointer_id,
+                                           pointer_type_id, component_type_id,
+                                           index_id, memory_operands,
+                                           element_index_type_id)
+                    : 0;
   };
   auto load_buffer_scalar =
       [&](uint32_t pointer_type_id, uint32_t pointer_id,
@@ -1881,11 +1876,9 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedNLoop(
       [&](InstructionBuilder* builder, uint32_t pointer_type_id,
           uint32_t pointer_id, uint32_t component_type_id, uint32_t index_id,
           const std::vector<Operand>& memory_operands) -> uint32_t {
-    const uint32_t element_pointer = BuildElementAccessFromPointerType(
-        builder, pointer_type_id, pointer_id, component_type_id, index_id);
-    return element_pointer ? AddLoad(builder, component_type_id,
-                                     element_pointer, memory_operands)
-                           : 0;
+    return AddMemoryElementLoad(builder, nullptr, pointer_id, pointer_type_id,
+                                component_type_id, index_id, memory_operands,
+                                uint_type_id);
   };
   auto load_input = [&](InstructionBuilder* builder, uint32_t index_id) {
     return input_is_value
@@ -2295,6 +2288,8 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionUnrolled(
       std::unique_ptr<BasicBlock>(MakeBasicBlock(label_id));
   if (!block) return 0;
   InstructionBuilder builder(context(), block.get());
+  const uint32_t element_index_type_id = GetOrCreateUIntType();
+  if (element_index_type_id == 0) return 0;
 
   const uint32_t captured_a_pointer_id =
       a_is_value ? 0 : BuildCapturedPointer(&builder, a_pointer_id);
@@ -2312,14 +2307,11 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionUnrolled(
       [&](uint32_t pointer_type_id, uint32_t pointer_id,
           uint32_t component_type_id, uint32_t index_id,
           const std::vector<Operand>& memory_operands) -> uint32_t {
-    const uint32_t element_pointer_id =
-        index_id ? BuildElementAccessFromPointerType(
-                       &builder, pointer_type_id, pointer_id, component_type_id,
-                       index_id)
-                 : 0;
-    return element_pointer_id ? AddLoad(&builder, component_type_id,
-                                        element_pointer_id, memory_operands)
-                              : 0;
+    return index_id ? AddMemoryElementLoad(&builder, nullptr, pointer_id,
+                                           pointer_type_id, component_type_id,
+                                           index_id, memory_operands,
+                                           element_index_type_id)
+                    : 0;
   };
   auto load_matrix_scalar =
       [&](const MatrixTypeInfo& info, bool is_value, uint32_t value_id,
@@ -2821,11 +2813,9 @@ uint32_t HwLowerToStandardPass::BuildDirectMatrixMatmulFunctionPackedNLoop(
       [&](InstructionBuilder* builder, uint32_t pointer_type_id,
           uint32_t pointer_id, uint32_t component_type_id, uint32_t index_id,
           const std::vector<Operand>& memory_operands) -> uint32_t {
-    const uint32_t element_pointer = BuildElementAccessFromPointerType(
-        builder, pointer_type_id, pointer_id, component_type_id, index_id);
-    return element_pointer ? AddLoad(builder, component_type_id,
-                                     element_pointer, memory_operands)
-                           : 0;
+    return AddMemoryElementLoad(builder, nullptr, pointer_id, pointer_type_id,
+                                component_type_id, index_id, memory_operands,
+                                uint_type_id);
   };
   auto load_matrix_scalar =
       [&](InstructionBuilder* builder, const MatrixTypeInfo& info,

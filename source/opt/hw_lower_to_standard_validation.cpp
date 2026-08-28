@@ -785,26 +785,22 @@ bool HwLowerToStandardPass::LegalizeModule() {
   };
   auto pointer_legal = [this](uint32_t pointer_id, uint32_t component_type_id) {
     Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
-    Instruction* pointer_type =
-        pointer ? get_def_use_mgr()->GetDef(pointer->type_id()) : nullptr;
-    if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
-        pointer_type->NumInOperands() < 2) {
-      return false;
-    }
-    Instruction* pointee =
-        get_def_use_mgr()->GetDef(pointer_type->GetSingleWordInOperand(1));
-    return pointee &&
-           (pointee->opcode() == spv::Op::OpTypeArray ||
-            pointee->opcode() == spv::Op::OpTypeRuntimeArray) &&
-           pointee->NumInOperands() >= 1 &&
-           pointee->GetSingleWordInOperand(0) == component_type_id;
+    HwMemoryPointerLayout layout;
+    return pointer && DescribeHwMemoryPointerLayout(pointer->type_id(),
+                                                    component_type_id, &layout);
   };
   auto memory_access_legal =
       [this](Instruction* inst, uint32_t first_memory_operand,
              uint32_t pointer_id, uint32_t component_type_id) {
+        Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+        HwMemoryPointerLayout layout;
+        if (!pointer || !DescribeHwMemoryPointerLayout(
+                            pointer->type_id(), component_type_id, &layout)) {
+          return false;
+        }
         std::vector<Operand> normalized;
         return NormalizeMemoryOperandsForAccess(
-            pointer_id, component_type_id,
+            pointer_id, layout.leaf_component_type_id,
             CopyMemoryOperands(inst, first_memory_operand), &normalized);
       };
   auto matmul_types_legal = [this](uint32_t result_type_id, uint32_t a_type_id,

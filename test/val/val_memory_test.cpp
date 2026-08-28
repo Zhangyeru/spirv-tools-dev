@@ -8888,6 +8888,177 @@ OpFunctionEnd
   EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
+TEST_F(ValidateMemory,
+       CoopVecHWNestedArrayVectorLeafSameWidthLoadStoreSuccess) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %inner ArrayStride 16
+OpDecorate %outer ArrayStride 32
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_2 = OpConstant %u32 2
+%u32_3 = OpConstant %u32 3
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%f32 = OpTypeFloat 32
+%v4u32 = OpTypeVector %u32 4
+%vec = OpTypeCooperativeVectorHW %f32 %u32_3
+%inner = OpTypeArray %v4u32 %u32_2
+%outer = OpTypeRuntimeArray %inner
+%Buf = OpTypeStruct %outer
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_outer = OpTypePointer StorageBuffer %outer
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_outer %buf %i32_0
+%value = OpCooperativeVectorLoadHW %vec %base %u32_0
+OpCooperativeVectorStoreHW %base %u32_0 %value
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory,
+       CoopMatHWNestedArrayVectorLeafSameWidthLoadStoreSuccess) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %inner ArrayStride 16
+OpDecorate %outer ArrayStride 32
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_2 = OpConstant %u32 2
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%f32 = OpTypeFloat 32
+%v4u32 = OpTypeVector %u32 4
+%shape_type = OpTypeVector %u32 2
+%shape = OpConstantComposite %shape_type %u32_4 %u32_4
+%offset = OpConstantComposite %shape_type %u32_0 %u32_0
+%mat = OpTypeCooperativeMatrixHW %f32 %u32_2 %u32_2
+%inner = OpTypeArray %v4u32 %u32_2
+%outer = OpTypeRuntimeArray %inner
+%Buf = OpTypeStruct %outer
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_outer = OpTypePointer StorageBuffer %outer
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_outer %buf %i32_0
+%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %i32_0
+OpCooperativeMatrixStoreHW %base %value %shape %offset %i32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopVecHWPointerLeafWidthMismatchRemainsValid) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability Int64
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 8
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%u64 = OpTypeInt 64 0
+%f32 = OpTypeFloat 32
+%vec = OpTypeCooperativeVectorHW %f32 %u32_4
+%arr = OpTypeArray %u64 %u32_4
+%Buf = OpTypeStruct %arr
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_arr = OpTypePointer StorageBuffer %arr
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_arr %buf %i32_0
+%value = OpCooperativeVectorLoadHW %vec %base %u32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopMatHWPointerLeafWidthMismatchRemainsValid) {
+  const std::string spirv = R"(
+OpCapability Shader
+OpCapability Int64
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 8
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_2 = OpConstant %u32 2
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%u64 = OpTypeInt 64 0
+%f32 = OpTypeFloat 32
+%shape_type = OpTypeVector %u32 2
+%shape = OpConstantComposite %shape_type %u32_4 %u32_4
+%offset = OpConstantComposite %shape_type %u32_0 %u32_0
+%mat = OpTypeCooperativeMatrixHW %f32 %u32_2 %u32_2
+%arr = OpTypeArray %u64 %u32_4
+%Buf = OpTypeStruct %arr
+%ptr_buffer = OpTypePointer StorageBuffer %Buf
+%ptr_arr = OpTypePointer StorageBuffer %arr
+%buf = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %func
+%entry = OpLabel
+%base = OpAccessChain %ptr_arr %buf %i32_0
+%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %i32_0
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
 TEST_F(ValidateMemory, CoopMatHWStoreToUniformStillFails) {
   const std::string spirv = R"(
 OpCapability Shader
