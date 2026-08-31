@@ -23,6 +23,7 @@ add_spvtools_unittest(TARGET opt
        hw_fuse_two_layer_vector_matmul_test.cpp
        hw_lower_non_direct_packed_test.cpp
        hw_lower_to_standard_aggregate_test.cpp
+       hw_lower_to_standard_composition_test.cpp
        hw_lower_to_standard_elementwise_test.cpp
        hw_lower_to_standard_matmul_test.cpp
        hw_lower_to_standard_memory_test.cpp

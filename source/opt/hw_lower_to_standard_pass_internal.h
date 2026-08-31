@@ -255,6 +255,7 @@ inline bool IsCoreOpcodeAllowedOnHwValue(spv::Op opcode) {
     case spv::Op::OpFunctionParameter:
     case spv::Op::OpFunctionCall:
     case spv::Op::OpReturnValue:
+    case spv::Op::OpEntryPoint:
     case spv::Op::OpAccessChain:
     case spv::Op::OpInBoundsAccessChain:
     case spv::Op::OpPtrAccessChain:
