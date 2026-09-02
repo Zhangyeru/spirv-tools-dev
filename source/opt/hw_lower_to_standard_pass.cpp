@@ -72,6 +72,7 @@ Pass::Status HwLowerToStandardPass::Process() {
   matmul_pattern_function_ids_.clear();
   generated_function_ids_.clear();
   read_only_generated_function_ids_.clear();
+  loop_carried_packed_memory_roots_.clear();
   pending_fp_fast_math_modes_.clear();
   active_fp_fast_math_mode_ = 0;
 
@@ -91,6 +92,10 @@ Pass::Status HwLowerToStandardPass::Process() {
   }
 
   if (!PreflightNoContractionVectorMatmul()) return Status::Failure;
+
+  if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
+    RecordLoopCarriedPackedMemoryRoots();
+  }
 
   if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
     HwFuseTwoLayerVectorMatmulPass fusion(max_unrolled_matmul_macs_);
@@ -114,6 +119,50 @@ Pass::Status HwLowerToStandardPass::Process() {
   context()->InvalidateAnalyses(IRContext::kAnalysisTypes |
                                 IRContext::kAnalysisConstants);
   return Status::SuccessWithChange;
+}
+
+void HwLowerToStandardPass::RecordLoopCarriedPackedMemoryRoots() {
+  // Packed memory helpers introduce their own loops and may sit behind user
+  // function calls.  Conservatively strengthen accesses when an existing
+  // structured loop can carry a RAW dependency through the same module
+  // pointer.  Volatile preserves that dependency without abandoning packed
+  // compute or expanding the whole module through scalar fallback.
+  bool has_loop = false;
+  std::unordered_set<uint32_t> load_roots;
+  std::unordered_set<uint32_t> store_roots;
+
+  get_module()->ForEachInst(
+      [this, &has_loop, &load_roots, &store_roots](Instruction* inst) {
+        if (inst->opcode() == spv::Op::OpLoopMerge) {
+          has_loop = true;
+          return;
+        }
+
+        bool is_load = false;
+        switch (inst->opcode()) {
+          case spv::Op::OpCooperativeMatrixLoadHW:
+          case spv::Op::OpCooperativeVectorLoadHW:
+            is_load = true;
+            break;
+          case spv::Op::OpCooperativeMatrixStoreHW:
+          case spv::Op::OpCooperativeVectorStoreHW:
+            break;
+          default:
+            return;
+        }
+
+        const uint32_t root =
+            GetRootModulePointerId(GetMemoryPointerOperandId(inst));
+        if (root == 0) return;
+        (is_load ? load_roots : store_roots).insert(root);
+      });
+
+  if (!has_loop) return;
+  for (uint32_t root : load_roots) {
+    if (store_roots.count(root) != 0) {
+      loop_carried_packed_memory_roots_.insert(root);
+    }
+  }
 }
 
 bool HwLowerToStandardPass::LowerHwInstructions(

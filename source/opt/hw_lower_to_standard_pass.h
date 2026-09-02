@@ -154,6 +154,7 @@ class HwLowerToStandardPass : public Pass {
                                 uint32_t first_index_in_operand) const;
   bool ValidateAccessChain(const Instruction* inst) const;
   bool PrepareMatmulPatternFunctions();
+  void RecordLoopCarriedPackedMemoryRoots();
   bool LowerHwInstructions(std::vector<Instruction*>* to_kill);
   bool ReplaceHwTypeUses();
   bool CleanupHwDeclarations(const std::vector<Instruction*>& to_kill);
@@ -739,6 +740,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> matmul_pattern_function_ids_;
   std::unordered_set<uint32_t> generated_function_ids_;
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
+  std::unordered_set<uint32_t> loop_carried_packed_memory_roots_;
   std::vector<std::pair<uint32_t, uint32_t>> pending_fp_fast_math_modes_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec2;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;

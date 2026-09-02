@@ -72,6 +72,67 @@ OpFunctionEnd
   auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
   EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpLoopMerge"));
   EXPECT_EQ(2u, CountSubstring(std::get<0>(result), "OpFunctionCall"));
+  EXPECT_EQ(0u, CountSubstring(std::get<0>(result), " Volatile"));
+}
+
+TEST_F(HwLowerToStandardTest, LoopCarriedSameRootPackedMemoryUsesVolatile) {
+  const std::string text = R"(
+; CHECK-NOT: HW
+; CHECK-NOT: CooperativeMatrixKHR
+; CHECK: OpLoad %float {{%\w+}} Volatile
+; CHECK: OpStore {{%\w+}} {{%\w+}} Volatile
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %_runtimearr_float ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+OpDecorate %Buf Block
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_1 = OpConstant %uint 1
+%uint_2 = OpConstant %uint 2
+%uint_4 = OpConstant %uint 4
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%float = OpTypeFloat 32
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%_runtimearr_float = OpTypeRuntimeArray %float
+%Buf = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_Buf = OpTypePointer StorageBuffer %Buf
+%buf = OpVariable %_ptr_StorageBuffer_Buf StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %buf %int_0
+%initial = OpCooperativeVectorLoadHW %vec4 %base %uint_0
+OpCooperativeVectorStoreHW %base %uint_0 %initial
+OpBranch %loop
+%loop = OpLabel
+%index = OpPhi %uint %uint_0 %entry %next %continue
+%condition = OpULessThan %bool %index %uint_2
+OpLoopMerge %merge %continue None
+OpBranchConditional %condition %body %merge
+%body = OpLabel
+%value = OpCooperativeVectorLoadHW %vec4 %base %uint_0
+OpCooperativeVectorStoreHW %base %uint_0 %value
+OpBranch %continue
+%continue = OpLabel
+%next = OpIAdd %uint %index %uint_1
+OpBranch %loop
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result = SinglePassRunAndMatch<HwLowerToStandardPass>(text, true);
+  ExpectNoHwOrCoopMatrix(std::get<0>(result));
+  EXPECT_EQ(4u, CountSubstring(std::get<0>(result), " Volatile"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixSubregionThroughNestedFixedArrays) {

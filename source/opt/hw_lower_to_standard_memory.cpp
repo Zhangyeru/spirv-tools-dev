@@ -2102,11 +2102,23 @@ std::vector<Operand> HwLowerToStandardPass::CopyMemoryOperands(
       return {{SPV_OPERAND_TYPE_MEMORY_ACCESS,
                {std::numeric_limits<uint32_t>::max()}}};
     }
+    const uint32_t root = GetRootModulePointerId(pointer_id);
+    if (loop_carried_packed_memory_roots_.count(root) != 0) {
+      operands.push_back({SPV_OPERAND_TYPE_MEMORY_ACCESS,
+                          {uint32_t(spv::MemoryAccessMask::Volatile)}});
+    }
     return operands;
   }
   operands.reserve(inst->NumInOperands() - first_in_operand);
   for (uint32_t i = first_in_operand; i < inst->NumInOperands(); ++i) {
     operands.push_back(inst->GetInOperand(i));
+  }
+  const uint32_t root = GetRootModulePointerId(
+      inst->NumInOperands() == 0 ? 0 : inst->GetSingleWordInOperand(0));
+  if (loop_carried_packed_memory_roots_.count(root) != 0 && !operands.empty() &&
+      operands.front().type == SPV_OPERAND_TYPE_MEMORY_ACCESS &&
+      operands.front().words.size() == 1) {
+    operands.front().words[0] |= uint32_t(spv::MemoryAccessMask::Volatile);
   }
   return operands;
 }
