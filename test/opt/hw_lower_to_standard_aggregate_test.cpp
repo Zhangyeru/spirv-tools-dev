@@ -18,6 +18,15 @@ namespace spvtools {
 namespace opt {
 namespace {
 
+void ExpectNoReplicatedComposites(const std::string& text) {
+  EXPECT_EQ(0u, CountSubstring(text, "ReplicatedCompositesEXT"));
+  EXPECT_EQ(0u, CountSubstring(text, "SPV_EXT_replicated_composites"));
+  EXPECT_EQ(0u, CountSubstring(text, "GL_EXT_replicated_composites"));
+  EXPECT_EQ(0u, CountSubstring(text, "OpConstantCompositeReplicateEXT"));
+  EXPECT_EQ(0u, CountSubstring(text, "OpSpecConstantCompositeReplicateEXT"));
+  EXPECT_EQ(0u, CountSubstring(text, "OpCompositeConstructReplicateEXT"));
+}
+
 TEST_F(HwLowerToStandardTest,
        PreservesCopyLogicalBetweenDistinctNestedCooperativeTypes) {
   const std::string text = R"(
@@ -1896,6 +1905,184 @@ OpFunctionEnd
   EXPECT_NE(std::string::npos, disassembly.find("OpSpecConstant %uint 6"));
   EXPECT_NE(std::string::npos, disassembly.find("OpConstant %uint 6"));
   EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %float %uint_6"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeLowersAllOrdinaryReplicatedCompositeKinds) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_3 = OpConstant %uint 3
+%float = OpTypeFloat 32
+%one = OpConstant %float 1065353216
+%spec_one = OpSpecConstant %float 1065353216
+%v2float = OpTypeVector %float 2
+%v4float = OpTypeVector %float 4
+%mat2 = OpTypeMatrix %v2float 2
+%array3 = OpTypeArray %v4float %uint_3
+%homogeneous = OpTypeStruct %v4float %v4float
+%v2one = OpConstantCompositeReplicateEXT %v2float %one
+%constant_vector = OpConstantCompositeReplicateEXT %v4float %one
+%spec_vector = OpSpecConstantCompositeReplicateEXT %v4float %spec_one
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%runtime_vector = OpCompositeConstructReplicateEXT %v4float %one
+%runtime_matrix = OpCompositeConstructReplicateEXT %mat2 %v2one
+%runtime_array = OpCompositeConstructReplicateEXT %array3 %runtime_vector
+%runtime_struct = OpCompositeConstructReplicateEXT %homogeneous %runtime_vector
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoReplicatedComposites(disassembly);
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly,
+                           "OpConstantComposite %v4float %float_1_06535322e_09 "
+                           "%float_1_06535322e_09 %float_1_06535322e_09 "
+                           "%float_1_06535322e_09"));
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly, "OpSpecConstantComposite %v4float"));
+  EXPECT_EQ(1u,
+            CountSubstring(disassembly, "OpCompositeConstruct %mat2v2float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly,
+                               "OpCompositeConstruct %_arr_v4float_uint_3"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpCompositeConstruct %_struct_"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeLowersOrdinaryReplicateContainingHwLeaf) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeVectorHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%one = OpConstant %float 1065353216
+%vec4 = OpTypeCooperativeVectorHW %float %uint_4
+%pair = OpTypeStruct %vec4 %vec4
+%vector_value = OpConstantCompositeReplicateEXT %vec4 %one
+%pair_value = OpConstantCompositeReplicateEXT %pair %vector_value
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoHwOrCoopMatrix(disassembly);
+  ExpectNoReplicatedComposites(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConstantComposite %_struct_"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeRemovesReplicatedCompositeDeclarationsOnly) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpSourceExtension "GL_EXT_replicated_composites"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoReplicatedComposites(std::get<0>(result));
+}
+
+TEST_F(HwLowerToStandardTest,
+       CooperativeOnlyLeavesOrdinaryReplicatedCompositeUntouched) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%one = OpConstant %float 1065353216
+%v4float = OpTypeVector %float 4
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%value = OpCompositeConstructReplicateEXT %v4float %one
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(1u, CountSubstring(std::get<0>(result),
+                               "OpCompositeConstructReplicateEXT"));
+  EXPECT_EQ(1u, CountSubstring(std::get<0>(result), "ReplicatedCompositesEXT"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeLowersOrdinaryReplicateAtConstituentLimit) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_65532 = OpConstant %uint 65532
+%float = OpTypeFloat 32
+%one = OpConstant %float 1065353216
+%array = OpTypeArray %float %uint_65532
+%value = OpConstantCompositeReplicateEXT %array %one
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectNoReplicatedComposites(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly,
+                               "OpConstantComposite %_arr_float_uint_65532"));
 }
 
 }  // namespace

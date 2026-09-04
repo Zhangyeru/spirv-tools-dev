@@ -69,6 +69,42 @@ bool HwLowerToStandardPass::PreflightExtensionFreeMode() const {
   return ok;
 }
 
+bool HwLowerToStandardPass::PreflightReplicatedComposites() const {
+  bool ok = true;
+  get_module()->ForEachInst([this, &ok](Instruction* inst) {
+    if (!ok || !IsReplicatedCompositeOpcode(inst->opcode())) return;
+
+    Instruction* result_type = get_def_use_mgr()->GetDef(inst->type_id());
+    if (result_type &&
+        (result_type->opcode() == spv::Op::OpTypeCooperativeMatrixHW ||
+         result_type->opcode() == spv::Op::OpTypeCooperativeVectorHW)) {
+      if (result_type->opcode() == spv::Op::OpTypeCooperativeVectorHW &&
+          result_type->NumInOperands() >= 2) {
+        Instruction* length =
+            get_def_use_mgr()->GetDef(result_type->GetSingleWordInOperand(1));
+        if (length && IsSpecConstantInst(length->opcode())) {
+          ReportError(
+              inst,
+              "extension-free HW lowering cannot expand a replicated "
+              "composite with specialization-dependent constituent count");
+          ok = false;
+        }
+      }
+      // Direct HW values use the existing scalar broadcast lowering, which
+      // can use a structured loop rather than serializing every constituent.
+      return;
+    }
+
+    uint32_t constituent_type_id = 0;
+    uint32_t constituent_count = 0;
+    if (!GetReplicatedCompositeInfo(inst, &constituent_type_id,
+                                    &constituent_count)) {
+      ok = false;
+    }
+  });
+  return ok;
+}
+
 bool HwLowerToStandardPass::PreflightNoContractionVectorMatmul() const {
   bool ok = true;
   get_module()->ForEachInst([this, &ok](Instruction* inst) {
@@ -1104,6 +1140,159 @@ bool HwLowerToStandardPass::IsAnyHwOpcode(spv::Op opcode) const {
   const std::string opcode_name(name);
   return opcode_name.size() >= 2 &&
          opcode_name.compare(opcode_name.size() - 2, 2, "HW") == 0;
+}
+
+bool HwLowerToStandardPass::IsReplicatedCompositeOpcode(spv::Op opcode) const {
+  return opcode == spv::Op::OpConstantCompositeReplicateEXT ||
+         opcode == spv::Op::OpSpecConstantCompositeReplicateEXT ||
+         opcode == spv::Op::OpCompositeConstructReplicateEXT;
+}
+
+bool HwLowerToStandardPass::IsReplicatedCompositeDeclaration(
+    const Instruction* inst) const {
+  if (!inst) return false;
+  if (inst->opcode() == spv::Op::OpCapability) {
+    return static_cast<spv::Capability>(inst->GetSingleWordInOperand(0)) ==
+           spv::Capability::ReplicatedCompositesEXT;
+  }
+  if (inst->opcode() == spv::Op::OpExtension) {
+    return inst->GetInOperand(0).AsString() == "SPV_EXT_replicated_composites";
+  }
+  if (inst->opcode() == spv::Op::OpSourceExtension) {
+    return inst->GetInOperand(0).AsString() == "GL_EXT_replicated_composites";
+  }
+  return false;
+}
+
+bool HwLowerToStandardPass::GetReplicatedCompositeInfo(
+    const Instruction* inst, uint32_t* constituent_type_id,
+    uint32_t* constituent_count) const {
+  if (!inst || !constituent_type_id || !constituent_count ||
+      !IsReplicatedCompositeOpcode(inst->opcode()) ||
+      inst->NumInOperands() != 1) {
+    ReportError(inst, "invalid replicated composite instruction");
+    return false;
+  }
+
+  Instruction* result_type = get_def_use_mgr()->GetDef(inst->type_id());
+  Instruction* value =
+      get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
+  if (!result_type || !value) {
+    ReportError(inst, "invalid replicated composite type or value");
+    return false;
+  }
+
+  uint32_t type_id = 0;
+  uint32_t count = 0;
+  switch (result_type->opcode()) {
+    case spv::Op::OpTypeVector:
+    case spv::Op::OpTypeMatrix:
+      if (result_type->NumInOperands() < 2) break;
+      type_id = result_type->GetSingleWordInOperand(0);
+      count = result_type->GetSingleWordInOperand(1);
+      break;
+    case spv::Op::OpTypeArray: {
+      if (result_type->NumInOperands() < 2) break;
+      type_id = result_type->GetSingleWordInOperand(0);
+      Instruction* length =
+          get_def_use_mgr()->GetDef(result_type->GetSingleWordInOperand(1));
+      if (length && IsSpecConstantInst(length->opcode())) {
+        ReportError(
+            inst,
+            "extension-free HW lowering cannot expand a replicated "
+            "composite with specialization-dependent constituent count");
+        return false;
+      }
+      if (!GetConstantU32(result_type->GetSingleWordInOperand(1), &count)) {
+        ReportError(inst,
+                    "replicated composite constituent count is not a "
+                    "supported constant");
+        return false;
+      }
+      break;
+    }
+    case spv::Op::OpTypeStruct:
+      count = result_type->NumInOperands();
+      if (count == 0) break;
+      type_id = result_type->GetSingleWordInOperand(0);
+      for (uint32_t i = 1; i < count; ++i) {
+        if (result_type->GetSingleWordInOperand(i) != type_id) {
+          ReportError(inst,
+                      "replicated composite result type is not homogeneous");
+          return false;
+        }
+      }
+      break;
+    case spv::Op::OpTypeCooperativeVectorNV:
+    case spv::Op::OpTypeCooperativeVectorHW: {
+      if (result_type->NumInOperands() < 2) break;
+      type_id = result_type->GetSingleWordInOperand(0);
+      Instruction* length =
+          get_def_use_mgr()->GetDef(result_type->GetSingleWordInOperand(1));
+      if (length && IsSpecConstantInst(length->opcode())) {
+        ReportError(
+            inst,
+            "extension-free HW lowering cannot expand a replicated "
+            "composite with specialization-dependent constituent count");
+        return false;
+      }
+      if (!GetConstantU32(result_type->GetSingleWordInOperand(1), &count)) {
+        ReportError(inst,
+                    "replicated composite constituent count is not a "
+                    "supported constant");
+        return false;
+      }
+      break;
+    }
+    case spv::Op::OpTypeCooperativeMatrixKHR:
+    case spv::Op::OpTypeCooperativeMatrixNV:
+    case spv::Op::OpTypeCooperativeMatrixHW:
+      if (result_type->NumInOperands() < 1) break;
+      type_id = result_type->GetSingleWordInOperand(0);
+      count = 1;
+      break;
+    default:
+      break;
+  }
+
+  if (type_id == 0 || count == 0) {
+    ReportError(inst,
+                "replicated composite result type is not a supported "
+                "homogeneous composite");
+    return false;
+  }
+  if (count > kMaxCompositeConstituents) {
+    ReportError(inst,
+                "replicated composite exceeds the SPIR-V composite operand "
+                "limit");
+    return false;
+  }
+  if (value->type_id() != type_id) {
+    ReportError(inst,
+                "replicated composite value type does not match its "
+                "constituent type");
+    return false;
+  }
+
+  if (inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT &&
+      (!spvOpcodeIsConstantOrUndef(value->opcode()) ||
+       IsSpecConstantInst(value->opcode()))) {
+    ReportError(inst,
+                "replicated constant value must be a non-specialization "
+                "constant or undef");
+    return false;
+  }
+  if (inst->opcode() == spv::Op::OpSpecConstantCompositeReplicateEXT &&
+      !spvOpcodeIsConstantOrUndef(value->opcode())) {
+    ReportError(inst,
+                "replicated specialization constant value must be a "
+                "constant or undef");
+    return false;
+  }
+
+  *constituent_type_id = type_id;
+  *constituent_count = count;
+  return true;
 }
 
 bool HwLowerToStandardPass::IsHwCapabilityOrExtension(

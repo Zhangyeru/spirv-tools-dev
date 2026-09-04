@@ -1128,6 +1128,66 @@ OpFunctionEnd
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeRejectsSpecializationSizedReplicatedComposite) {
+  const std::string text = R"(
+; CHECK: extension-free HW lowering cannot expand a replicated composite with specialization-dependent constituent count
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %length SpecId 0
+OpDecorate %one SpecId 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%length = OpSpecConstant %uint 4
+%float = OpTypeFloat 32
+%one = OpSpecConstant %float 1065353216
+%array = OpTypeArray %float %length
+%value = OpSpecConstantCompositeReplicateEXT %array %one
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(
+      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExtensionFreeRejectsOversizedOrdinaryReplicatedComposite) {
+  const std::string text = R"(
+; CHECK: replicated composite exceeds the SPIR-V composite operand limit
+OpCapability Shader
+OpCapability ReplicatedCompositesEXT
+OpExtension "SPV_EXT_replicated_composites"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_65533 = OpConstant %uint 65533
+%float = OpTypeFloat 32
+%one = OpConstant %float 1065353216
+%array = OpTypeArray %float %uint_65533
+%value = OpConstantCompositeReplicateEXT %array %one
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  SinglePassRunAndFail<HwLowerToStandardPass>(
+      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kExtensionFree, 70000u);
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools

@@ -452,6 +452,44 @@ bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   return true;
 }
 
+bool HwLowerToStandardPass::LowerRemainingReplicatedComposites() {
+  std::vector<Instruction*> worklist;
+  get_module()->ForEachInst([this, &worklist](Instruction* inst) {
+    if (IsReplicatedCompositeOpcode(inst->opcode())) worklist.push_back(inst);
+  });
+
+  for (Instruction* inst : worklist) {
+    uint32_t constituent_type_id = 0;
+    uint32_t constituent_count = 0;
+    if (!GetReplicatedCompositeInfo(inst, &constituent_type_id,
+                                    &constituent_count)) {
+      return false;
+    }
+
+    spv::Op replacement = spv::Op::OpNop;
+    switch (inst->opcode()) {
+      case spv::Op::OpConstantCompositeReplicateEXT:
+        replacement = spv::Op::OpConstantComposite;
+        break;
+      case spv::Op::OpSpecConstantCompositeReplicateEXT:
+        replacement = spv::Op::OpSpecConstantComposite;
+        break;
+      case spv::Op::OpCompositeConstructReplicateEXT:
+        replacement = spv::Op::OpCompositeConstruct;
+        break;
+      default:
+        return false;
+    }
+
+    const uint32_t value_id = inst->GetSingleWordInOperand(0);
+    std::vector<Operand> operands(constituent_count, IdOperand(value_id));
+    inst->SetOpcode(replacement);
+    inst->SetInOperands(std::move(operands));
+    context()->UpdateDefUse(inst);
+  }
+  return true;
+}
+
 bool HwLowerToStandardPass::LowerCompositeExtract(Instruction* inst) {
   return RemapCompositeIndices(inst, 0, 1);
 }

@@ -144,6 +144,7 @@ class HwLowerToStandardPass : public Pass {
   bool CollectHwTypes();
   bool MaterializeLoweredTypes();
   bool PreflightExtensionFreeMode() const;
+  bool PreflightReplicatedComposites() const;
   bool PreflightNoContractionVectorMatmul() const;
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
@@ -157,6 +158,7 @@ class HwLowerToStandardPass : public Pass {
   void RecordLoopCarriedPackedMemoryRoots();
   bool LowerHwInstructions(std::vector<Instruction*>* to_kill);
   bool ReplaceHwTypeUses();
+  bool LowerRemainingReplicatedComposites();
   bool CleanupHwDeclarations(const std::vector<Instruction*>& to_kill);
   bool FinalHwCheck() const;
 
@@ -711,6 +713,11 @@ class HwLowerToStandardPass : public Pass {
   bool HasHwTypeReference(const Instruction* inst) const;
   bool IsHwOpcode(spv::Op opcode) const;
   bool IsAnyHwOpcode(spv::Op opcode) const;
+  bool IsReplicatedCompositeOpcode(spv::Op opcode) const;
+  bool IsReplicatedCompositeDeclaration(const Instruction* inst) const;
+  bool GetReplicatedCompositeInfo(const Instruction* inst,
+                                  uint32_t* constituent_type_id,
+                                  uint32_t* constituent_count) const;
   bool IsHwCapabilityOrExtension(const Instruction* inst) const;
   bool IsAnyHwCapabilityOrExtension(const Instruction* inst) const;
   bool HasHwOperand(const Instruction* inst) const;

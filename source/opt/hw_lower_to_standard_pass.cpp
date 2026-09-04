@@ -81,13 +81,19 @@ Pass::Status HwLowerToStandardPass::Process() {
     has_hw |=
         completeness_mode_ == CompletenessMode::kExtensionFree
             ? (IsAnyHwOpcode(inst->opcode()) ||
-               IsAnyHwCapabilityOrExtension(inst) || HasHwOperand(inst))
+               IsAnyHwCapabilityOrExtension(inst) || HasHwOperand(inst) ||
+               IsReplicatedCompositeOpcode(inst->opcode()) ||
+               IsReplicatedCompositeDeclaration(inst))
             : (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst));
   });
   if (!has_hw) return Status::SuccessWithoutChange;
 
   if (completeness_mode_ == CompletenessMode::kExtensionFree &&
       !PreflightExtensionFreeMode()) {
+    return Status::Failure;
+  }
+  if (completeness_mode_ == CompletenessMode::kExtensionFree &&
+      !PreflightReplicatedComposites()) {
     return Status::Failure;
   }
 
@@ -113,6 +119,10 @@ Pass::Status HwLowerToStandardPass::Process() {
   std::vector<Instruction*> to_kill;
   if (!LowerHwInstructions(&to_kill)) return Status::Failure;
   if (!ReplaceHwTypeUses()) return Status::Failure;
+  if (completeness_mode_ == CompletenessMode::kExtensionFree &&
+      !LowerRemainingReplicatedComposites()) {
+    return Status::Failure;
+  }
   if (!CleanupHwDeclarations(to_kill)) return Status::Failure;
   if (!FinalHwCheck()) return Status::Failure;
 
@@ -468,6 +478,12 @@ bool HwLowerToStandardPass::CleanupHwDeclarations(
     modified |= RemoveExtensionByName("SPV_HW_neural_shader");
     modified |= RemoveSourceExtensionByName("GL_HW_neural_shader");
   }
+  if (completeness_mode_ == CompletenessMode::kExtensionFree) {
+    modified |=
+        context()->RemoveCapability(spv::Capability::ReplicatedCompositesEXT);
+    modified |= RemoveExtensionByName("SPV_EXT_replicated_composites");
+    modified |= RemoveSourceExtensionByName("GL_EXT_replicated_composites");
+  }
   (void)modified;
   return true;
 }
@@ -481,8 +497,16 @@ bool HwLowerToStandardPass::FinalHwCheck() const {
             ? (IsAnyHwOpcode(inst->opcode()) ||
                IsAnyHwCapabilityOrExtension(inst) || HasHwOperand(inst))
             : (IsHwOpcode(inst->opcode()) || IsHwCapabilityOrExtension(inst));
-    if (has_forbidden_hw || HasHwTypeReference(inst)) {
-      ReportError(inst, "HW lowering left HW op/type/capability/extension");
+    const bool has_forbidden_replicated_composite =
+        completeness_mode_ == CompletenessMode::kExtensionFree &&
+        (IsReplicatedCompositeOpcode(inst->opcode()) ||
+         IsReplicatedCompositeDeclaration(inst));
+    if (has_forbidden_hw || has_forbidden_replicated_composite ||
+        HasHwTypeReference(inst)) {
+      ReportError(inst, has_forbidden_replicated_composite
+                            ? "extension-free HW lowering left replicated "
+                              "composite residue"
+                            : "HW lowering left HW op/type/declaration");
       ok = false;
     }
   });
