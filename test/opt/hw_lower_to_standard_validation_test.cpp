@@ -1117,13 +1117,12 @@ OpReturn
 OpFunctionEnd
 )";
 
-  // The current validator deliberately accepts this HW form even though a
-  // standard OpUDiv requires matching operand/result types.  Refuse to guess
-  // whether narrowing occurs before or after division.
+  // Invalid input may reach the pass without prior validation. Keep the
+  // defensive failure rather than guessing when a width conversion occurs.
   SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
   std::vector<uint32_t> original_binary;
   ASSERT_TRUE(tools.Assemble(text, &original_binary));
-  ASSERT_TRUE(tools.Validate(original_binary));
+  ASSERT_FALSE(tools.Validate(original_binary));
 
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }

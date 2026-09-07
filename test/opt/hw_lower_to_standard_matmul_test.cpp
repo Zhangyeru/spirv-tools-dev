@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <sstream>
+#include <unordered_set>
 
 #include "test/opt/hw_lower_to_standard_test_utils.h"
 
@@ -127,6 +128,213 @@ void ExpectDirectMatrixMatmulUnrolled(const std::string& disassembly,
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u);
   EXPECT_GT(CountSubstring(disassembly, "OpReturnValue"), 0u);
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
+}
+
+// Each bit selects an f32 buffer for an otherwise entirely f16 computation.
+// Single-layer roles are input/A, matrix/B, bias/C, output; the two-layer
+// vector form adds matrix1 and bias1 before the output bit.
+std::string MakeCrossWidthMatmulMemoryModule(bool matrix, bool two_layers,
+                                             uint32_t float_buffer_mask) {
+  const uint32_t buffer_count = two_layers ? 6 : 4;
+  std::ostringstream text;
+  text << R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability StorageBuffer16BitAccess
+OpCapability FloatControls2
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_16bit_storage"
+OpExtension "SPV_KHR_float_controls2"
+OpExtension "SPV_HW_neural_shader"
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result FPFastMathMode Fast
+OpDecorate %half_array ArrayStride 2
+OpDecorate %float_array ArrayStride 4
+OpMemberDecorate %HalfBuffer 0 Offset 0
+OpMemberDecorate %FloatBuffer 0 Offset 0
+OpDecorate %HalfBuffer Block
+OpDecorate %FloatBuffer Block
+)";
+  if (two_layers) text << "OpDecorate %hidden FPFastMathMode Fast\n";
+  text << R"(
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_0 = OpConstant %uint 0
+%uint_4 = OpConstant %uint 4
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%v2uint = OpTypeVector %uint 2
+%shape = OpConstantComposite %v2uint %uint_4 %uint_4
+%offset = OpConstantComposite %v2uint %uint_0 %uint_0
+%vec = OpTypeCooperativeVectorHW %half %uint_4
+%mat = OpTypeCooperativeMatrixHW %half %uint_4 %uint_4
+%zero = OpConstantNull %vec
+%half_array = OpTypeRuntimeArray %half
+%float_array = OpTypeRuntimeArray %float
+%HalfBuffer = OpTypeStruct %half_array
+%FloatBuffer = OpTypeStruct %float_array
+%half_buffer_ptr = OpTypePointer StorageBuffer %HalfBuffer
+%float_buffer_ptr = OpTypePointer StorageBuffer %FloatBuffer
+%half_array_ptr = OpTypePointer StorageBuffer %half_array
+%float_array_ptr = OpTypePointer StorageBuffer %float_array
+)";
+  for (uint32_t i = 0; i < buffer_count; ++i) {
+    const char* component = (float_buffer_mask & (1u << i)) ? "float" : "half";
+    text << "%buffer" << i << " = OpVariable %" << component
+         << "_buffer_ptr StorageBuffer\n";
+  }
+  text << "%main = OpFunction %void None %fn\n%entry = OpLabel\n";
+  for (uint32_t i = 0; i < buffer_count; ++i) {
+    const char* component = (float_buffer_mask & (1u << i)) ? "float" : "half";
+    text << "%base" << i << " = OpAccessChain %" << component
+         << "_array_ptr %buffer" << i << " %uint_0\n";
+  }
+  for (uint32_t i = 0; i + 1 < buffer_count; ++i) {
+    text << "%value" << i << " = ";
+    if (matrix || i == 1 || i == 3) {
+      text << "OpCooperativeMatrixLoadHW %mat %base" << i
+           << " %shape %offset %uint_0\n";
+    } else {
+      text << "OpCooperativeVectorLoadHW %vec %base" << i << " %uint_0\n";
+    }
+  }
+  if (two_layers) {
+    text << R"(
+%hidden = OpCooperativeVectorMatrixMulAddHW %vec %value0 %value1 %value2
+%relu = OpExtInst %vec %glsl FMax %hidden %zero
+%result = OpCooperativeVectorMatrixMulAddHW %vec %relu %value3 %value4
+)";
+  } else {
+    text << "%result = "
+         << (matrix ? "OpCooperativeMatrixMulAddHW %mat"
+                    : "OpCooperativeVectorMatrixMulAddHW %vec")
+         << " %value0 %value1 %value2\n";
+  }
+  if (matrix) {
+    text
+        << "OpCooperativeMatrixStoreHW %base3 %result %shape %offset %uint_0\n";
+  } else {
+    text << "OpCooperativeVectorStoreHW %base" << buffer_count - 1
+         << " %uint_0 %result\n";
+  }
+  text << "OpReturn\nOpFunctionEnd\n";
+  return text.str();
+}
+
+void ExpectCrossWidthMemoryConversionsAtOriginalSite(
+    const std::string& disassembly, uint32_t float_buffer_mask,
+    uint32_t buffer_count) {
+  ExpectNoHwOrCoopMatrix(disassembly);
+  const size_t entry_point = disassembly.find("OpEntryPoint GLCompute ");
+  ASSERT_NE(std::string::npos, entry_point);
+  const size_t main_id_begin = disassembly.find('%', entry_point);
+  const size_t main_id_end = disassembly.find(' ', main_id_begin);
+  ASSERT_NE(std::string::npos, main_id_begin);
+  ASSERT_NE(std::string::npos, main_id_end);
+  const std::string main_id =
+      disassembly.substr(main_id_begin, main_id_end - main_id_begin);
+  const size_t main_begin = disassembly.find(main_id + " = OpFunction");
+  ASSERT_NE(std::string::npos, main_begin);
+  const size_t main_end = disassembly.find("OpFunctionEnd", main_begin);
+  ASSERT_NE(std::string::npos, main_end);
+  const std::string main =
+      disassembly.substr(main_begin, main_end - main_begin);
+  const std::string helpers =
+      disassembly.substr(0, main_begin) + disassembly.substr(main_end);
+  // Helpers may compute packed values, but they must never capture a cross-
+  // width pointer and replace the conversion with a load of its raw bits.
+  EXPECT_EQ(0u, CountSubstring(helpers, "OpLoad %float "));
+  EXPECT_EQ(0u, CountSubstring(helpers, "OpLoad %v2float "));
+  EXPECT_EQ(0u, CountSubstring(
+                    helpers, "OpFunctionParameter %_ptr_StorageBuffer_float"));
+  EXPECT_EQ(0u,
+            CountSubstring(
+                helpers,
+                "OpFunctionParameter %_ptr_StorageBuffer__runtimearr_float"));
+
+  std::unordered_set<std::string> float_loads;
+  std::unordered_set<std::string> narrowed_loads;
+  std::unordered_set<std::string> widened_values;
+  uint32_t widened_stores = 0;
+  std::istringstream lines(main);
+  for (std::string line; std::getline(lines, line);) {
+    std::istringstream words(line);
+    std::string result, equals, opcode, type, operand;
+    words >> result;
+    if (result == "OpStore") {
+      words >> operand >> result;
+      widened_stores += widened_values.count(result);
+      continue;
+    }
+    words >> equals >> opcode >> type >> operand;
+    if (opcode == "OpLoad" && type == "%float") {
+      float_loads.insert(result);
+    } else if (opcode == "OpFConvert" && type == "%half" &&
+               float_loads.count(operand)) {
+      narrowed_loads.insert(operand);
+    } else if (opcode == "OpFConvert" && type == "%float") {
+      widened_values.insert(result);
+    }
+  }
+  uint32_t cross_width_sources = 0;
+  for (uint32_t i = 0; i + 1 < buffer_count; ++i) {
+    cross_width_sources += (float_buffer_mask >> i) & 1u;
+  }
+  EXPECT_GE(float_loads.size(), cross_width_sources);
+  EXPECT_EQ(float_loads, narrowed_loads)
+      << "Every f32 source load must be converted to f16 before computation";
+  if (float_buffer_mask & (1u << (buffer_count - 1))) {
+    EXPECT_GT(widened_stores, 0u)
+        << "The f32 output store must consume the converted f16 result";
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       CrossWidthMatmulSourcesAndStoresRecoverWithoutPointerCapture) {
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  for (bool matrix : {false, true}) {
+    for (uint32_t mask : {1u, 2u, 4u, 8u, 15u}) {
+      SCOPED_TRACE("matrix=" + std::to_string(matrix) +
+                   " float_buffer_mask=" + std::to_string(mask));
+      const std::string text =
+          MakeCrossWidthMatmulMemoryModule(matrix, false, mask);
+      std::vector<uint32_t> binary;
+      ASSERT_TRUE(tools.Assemble(text, &binary));
+      ASSERT_TRUE(tools.Validate(binary));
+      for (auto mode : {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                        HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+        SCOPED_TRACE("mode=" + std::to_string(static_cast<int>(mode)));
+        const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+            text, true, true, mode);
+        ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+        ExpectCrossWidthMemoryConversionsAtOriginalSite(std::get<0>(result),
+                                                        mask, 4);
+      }
+    }
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       CrossWidthTwoLayerMlpSourcesAndStoresKeepMemoryConversions) {
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  for (uint32_t mask : {1u, 2u, 4u, 8u, 16u, 32u, 63u}) {
+    SCOPED_TRACE("float_buffer_mask=" + std::to_string(mask));
+    const std::string text =
+        MakeCrossWidthMatmulMemoryModule(false, true, mask);
+    std::vector<uint32_t> binary;
+    ASSERT_TRUE(tools.Assemble(text, &binary));
+    ASSERT_TRUE(tools.Validate(binary));
+    const auto result =
+        SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+    ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectCrossWidthMemoryConversionsAtOriginalSite(std::get<0>(result), mask,
+                                                    6);
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatmulWithCollidingLoweredMatrixTypes) {

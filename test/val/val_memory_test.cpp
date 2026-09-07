@@ -2170,7 +2170,8 @@ OpStore %111 %115
 %116 = OpLoad %71 %111
 %121 = OpLoad %6 %60
 %122 = OpAccessChain %82 %120 %79 %121
-OpCooperativeMatrixStoreNV %122 %116 %84 %86 )" + storeMemoryAccess + R"( %81
+OpCooperativeMatrixStoreNV %122 %116 %84 %86 )" +
+                  storeMemoryAccess + R"( %81
 OpReturn
 OpFunctionEnd
 )";
@@ -8106,7 +8107,8 @@ OpDecorate %48 DescriptorSet 0
 %56 = OpCooperativeVectorLoadNV %42 %52 %50 )" +
                   loadMemoryAccess + R"( %82
 %77 = OpLoad %42 %73
-OpCooperativeVectorStoreNV %52 %50 %77 )" + storeMemoryAccess + R"( %82
+OpCooperativeVectorStoreNV %52 %50 %77 )" +
+                  storeMemoryAccess + R"( %82
 OpReturn
 OpFunctionEnd
 )";
@@ -8643,9 +8645,10 @@ TEST_F(ValidateMemory, CoopVecHWMatMulResultColumnMismatchFail) {
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("CooperativeVectorMatrixMulHW result number of "
-                        "components 100 does not match matrix column count 20"));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("CooperativeVectorMatrixMulHW result number of "
+                "components 100 does not match matrix column count 20"));
 }
 
 std::string GenCoopVecHWMatMulTypeShader(const std::string& main_body) {
@@ -8698,7 +8701,23 @@ OpFunctionEnd
 }
 
 std::string GenUnsupported64BitCoopVecHWMatMulTypeShader(
-    const std::string& main_body) {
+    const std::string& main_body, bool integer) {
+  const std::string types = integer ? R"(
+%s64_input = OpTypeCooperativeVectorHW %s64 %c3
+%u64_matrix = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseAHW
+%u64_result = OpTypeCooperativeVectorHW %u64 %c4
+%s64_input_value = OpUndef %s64_input
+%u64_matrix_value = OpUndef %u64_matrix
+%u64_bias_value = OpUndef %u64_result
+)"
+                                    : R"(
+%f64_input = OpTypeCooperativeVectorHW %f64 %c3
+%f64_matrix = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseAHW
+%f64_result = OpTypeCooperativeVectorHW %f64 %c4
+%f64_input_value = OpUndef %f64_input
+%f64_matrix_value = OpUndef %f64_matrix
+%f64_bias_value = OpUndef %f64_result
+)";
   return R"(
 OpCapability Shader
 OpCapability Float64
@@ -8717,18 +8736,8 @@ OpExecutionMode %main LocalSize 1 1 1
 %u64 = OpTypeInt 64 0
 %c3 = OpConstant %u32 3
 %c4 = OpConstant %u32 4
-%f64_input = OpTypeCooperativeVectorHW %f64 %c3
-%f64_matrix = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseAHW
-%f64_result = OpTypeCooperativeVectorHW %f64 %c4
-%s64_input = OpTypeCooperativeVectorHW %s64 %c3
-%u64_matrix = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseAHW
-%u64_result = OpTypeCooperativeVectorHW %u64 %c4
-%f64_input_value = OpUndef %f64_input
-%f64_matrix_value = OpUndef %f64_matrix
-%f64_bias_value = OpUndef %f64_result
-%s64_input_value = OpUndef %s64_input
-%u64_matrix_value = OpUndef %u64_matrix
-%u64_bias_value = OpUndef %u64_result
+)" + types +
+         R"(
 %main = OpFunction %void None %func
 %entry = OpLabel
 )" + main_body +
@@ -8741,23 +8750,25 @@ OpFunctionEnd
 TEST_F(ValidateMemory, CoopVecHWMatMulRejectsFloat64Components) {
   const std::string spirv = GenUnsupported64BitCoopVecHWMatMulTypeShader(R"(
 %result = OpCooperativeVectorMatrixMulAddHW %f64_result %f64_input_value %f64_matrix_value %f64_bias_value
-)");
+)",
+                                                                         false);
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("component types must be 16/32-bit floating-point"));
+              HasSubstr("must be a 16/32-bit floating-point"));
 }
 
 TEST_F(ValidateMemory, CoopVecHWMatMulRejectsInt64Components) {
   const std::string spirv = GenUnsupported64BitCoopVecHWMatMulTypeShader(R"(
 %result = OpCooperativeVectorMatrixMulAddHW %u64_result %s64_input_value %u64_matrix_value %u64_bias_value
-)");
+)",
+                                                                         true);
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("8/16/32-bit integer scalar types"));
+              HasSubstr("8/16/32-bit integer scalar type"));
 }
 
 TEST_F(ValidateMemory, CoopVecHWMatMulAllowsMixedFloatWidening) {
@@ -8981,6 +8992,7 @@ TEST_F(ValidateMemory, CoopVecHWPointerLeafWidthMismatchRemainsValid) {
   const std::string spirv = R"(
 OpCapability Shader
 OpCapability Int64
+OpCapability Float64
 OpCapability CooperativeVectorHW
 OpExtension "SPV_HW_neural_shader"
 OpMemoryModel Logical GLSL450
@@ -9008,18 +9020,28 @@ OpDecorate %Buf Block
 %entry = OpLabel
 %base = OpAccessChain %ptr_arr %buf %i32_0
 %value = OpCooperativeVectorLoadHW %vec %base %u32_0
+OpCooperativeVectorStoreHW %base %u32_0 %value
 OpReturn
 OpFunctionEnd
 )";
 
-  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  for (const char* leaf_type :
+       {"OpTypeInt 64 0", "OpTypeInt 64 1", "OpTypeFloat 64"}) {
+    SCOPED_TRACE(leaf_type);
+    std::string typed_spirv = spirv;
+    const std::string original_type = "OpTypeInt 64 0";
+    typed_spirv.replace(typed_spirv.find(original_type), original_type.size(),
+                        leaf_type);
+    CompileSuccessfully(typed_spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  }
 }
 
 TEST_F(ValidateMemory, CoopMatHWPointerLeafWidthMismatchRemainsValid) {
   const std::string spirv = R"(
 OpCapability Shader
 OpCapability Int64
+OpCapability Float64
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
 OpMemoryModel Logical GLSL450
@@ -9051,12 +9073,21 @@ OpDecorate %Buf Block
 %entry = OpLabel
 %base = OpAccessChain %ptr_arr %buf %i32_0
 %value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %i32_0
+OpCooperativeMatrixStoreHW %base %value %shape %offset %i32_0
 OpReturn
 OpFunctionEnd
 )";
 
-  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  for (const char* leaf_type :
+       {"OpTypeInt 64 0", "OpTypeInt 64 1", "OpTypeFloat 64"}) {
+    SCOPED_TRACE(leaf_type);
+    std::string typed_spirv = spirv;
+    const std::string original_type = "OpTypeInt 64 0";
+    typed_spirv.replace(typed_spirv.find(original_type), original_type.size(),
+                        leaf_type);
+    CompileSuccessfully(typed_spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  }
 }
 
 TEST_F(ValidateMemory, CoopMatHWStoreToUniformStillFails) {
@@ -9102,11 +9133,11 @@ OpFunctionEnd
               HasSubstr("is not Workgroup or StorageBuffer"));
 }
 
-std::string GenTensorMapShader(bool with_extension, const std::string& main_body) {
+std::string GenTensorMapShader(bool with_extension,
+                               const std::string& main_body) {
   return std::string(R"(
 OpCapability Shader
-)") +
-         (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
+)") + (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
          R"(OpMemoryModel Logical GLSL450
 OpEntryPoint GLCompute %main "main" %dst %tm
 OpExecutionMode %main LocalSize 1 1 1
@@ -9126,7 +9157,8 @@ OpExecutionMode %main LocalSize 1 1 1
 
 %main = OpFunction %void None %func
 %entry = OpLabel
-)" + main_body + R"(
+)" + main_body +
+         R"(
 OpReturn
 OpFunctionEnd
 )";
@@ -9136,8 +9168,7 @@ std::string GenCpAsyncBarrierShader(bool with_extension,
                                     const std::string& main_body) {
   return std::string(R"(
 OpCapability Shader
-)") +
-         (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
+)") + (with_extension ? "OpExtension \"SPV_HW_neural_shader\"\n" : "") +
          R"(OpMemoryModel Logical GLSL450
 OpEntryPoint GLCompute %main "main"
 OpExecutionMode %main LocalSize 1 1 1
@@ -9150,7 +9181,8 @@ OpExecutionMode %main LocalSize 1 1 1
 
 %main = OpFunction %void None %func
 %entry = OpLabel
-)" + main_body + R"(
+)" + main_body +
+         R"(
 OpReturn
 OpFunctionEnd
 )";
@@ -9213,8 +9245,7 @@ OpFunctionEnd
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("CpAsyncWaitGroupHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("CpAsyncWaitGroupHW N <id>"));
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("must be a 32-bit integer compile-time constant"));
 }
@@ -9241,8 +9272,7 @@ OpFunctionEnd
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("CpAsyncWaitGroupHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("CpAsyncWaitGroupHW N <id>"));
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("must be a 32-bit integer compile-time constant"));
 }
@@ -9285,8 +9315,7 @@ OpFunctionEnd
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("BarrierArriveHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("BarrierArriveHW N <id>"));
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("must be a 32-bit integer compile-time constant"));
 }
@@ -9317,8 +9346,7 @@ OpFunctionEnd
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
   EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("BarrierWaitHW N <id>"));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("BarrierWaitHW N <id>"));
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("must be a 32-bit integer compile-time constant"));
 }

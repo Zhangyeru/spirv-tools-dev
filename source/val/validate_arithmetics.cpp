@@ -124,7 +124,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeVectorDimensionsMatch(inst, type_id, result_type);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (supportsCoopVec && _.IsCooperativeVectorHWType(result_type)) {
+        } else if (supportsCoopVec &&
+                   _.IsCooperativeVectorHWType(result_type)) {
           const uint32_t type_id = _.GetOperandTypeId(inst, operand_index);
           if (!_.IsCooperativeVectorHWType(type_id) ||
               !_.IsFloatCooperativeVectorHWType(type_id)) {
@@ -149,7 +150,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (supportsCoopMat && _.IsCooperativeMatrixHWType(result_type)) {
+        } else if (supportsCoopMat &&
+                   _.IsCooperativeMatrixHWType(result_type)) {
           const uint32_t type_id = _.GetOperandTypeId(inst, operand_index);
           if (!_.IsCooperativeMatrixHWType(type_id) ||
               !_.IsFloatCooperativeMatrixHWType(type_id)) {
@@ -201,7 +203,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeVectorDimensionsMatch(inst, type_id, result_type);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (supportsCoopVec && _.IsCooperativeVectorHWType(result_type)) {
+        } else if (supportsCoopVec &&
+                   _.IsCooperativeVectorHWType(result_type)) {
           const uint32_t type_id = _.GetOperandTypeId(inst, operand_index);
           if (!_.IsCooperativeVectorHWType(type_id) ||
               !_.IsUnsignedIntCooperativeVectorHWType(type_id)) {
@@ -213,6 +216,13 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeVectorDimensionsMatch(inst, type_id, result_type);
           if (ret != SPV_SUCCESS) return ret;
+          if (_.GetBitWidth(type_id) != _.GetBitWidth(result_type)) {
+            return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                   << "Expected arithmetic operands to have the same bit "
+                      "width as Result Type: "
+                   << spvOpcodeString(opcode) << " operand index "
+                   << operand_index;
+          }
         } else if (supportsCoopMat &&
                    _.IsCooperativeMatrixKHRType(result_type)) {
           const uint32_t type_id = _.GetOperandTypeId(inst, operand_index);
@@ -226,7 +236,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (supportsCoopMat && _.IsCooperativeMatrixHWType(result_type)) {
+        } else if (supportsCoopMat &&
+                   _.IsCooperativeMatrixHWType(result_type)) {
           const uint32_t type_id = _.GetOperandTypeId(inst, operand_index);
           if (!_.IsCooperativeMatrixHWType(type_id) ||
               !_.IsUnsignedIntCooperativeMatrixHWType(type_id)) {
@@ -238,6 +249,13 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeMatrixShapesMatch(inst, result_type, type_id, false);
           if (ret != SPV_SUCCESS) return ret;
+          if (_.GetBitWidth(type_id) != _.GetBitWidth(result_type)) {
+            return _.diag(SPV_ERROR_INVALID_DATA, inst)
+                   << "Expected arithmetic operands to have the same bit "
+                      "width as Result Type: "
+                   << spvOpcodeString(opcode) << " operand index "
+                   << operand_index;
+          }
         } else if (_.GetOperandTypeId(inst, operand_index) != result_type)
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
                  << "Expected arithmetic operands to be of Result Type: "
@@ -290,7 +308,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
           spv_result_t ret =
               _.CooperativeVectorDimensionsMatch(inst, type_id, result_type);
           if (ret != SPV_SUCCESS) return ret;
-        } else if (supportsCoopVec && _.IsCooperativeVectorHWType(result_type)) {
+        } else if (supportsCoopVec &&
+                   _.IsCooperativeVectorHWType(result_type)) {
           if (!_.IsCooperativeVectorHWType(type_id) ||
               !_.IsIntCooperativeVectorHWType(type_id)) {
             return _.diag(SPV_ERROR_INVALID_DATA, inst)
@@ -335,7 +354,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
              !(opcode == spv::Op::OpIMul &&
                _.IsCooperativeMatrixKHRType(type_id) &&
                _.IsIntCooperativeMatrixType(type_id)) &&
-             !(opcode == spv::Op::OpIMul && _.IsIntCooperativeMatrixHWType(type_id)) &&
+             !(opcode == spv::Op::OpIMul &&
+               _.IsIntCooperativeMatrixHWType(type_id)) &&
              !(supportsCoopVec && _.IsIntCooperativeVectorNVType(type_id)) &&
              !(supportsCoopVec && _.IsIntCooperativeVectorHWType(type_id))))
           return _.diag(SPV_ERROR_INVALID_DATA, inst)
@@ -1080,7 +1100,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       }
 
       const auto result_type_inst = _.FindDef(result_type);
-      const auto result_comp_type_id = result_type_inst->GetOperandAs<uint32_t>(1);
+      const auto result_comp_type_id =
+          result_type_inst->GetOperandAs<uint32_t>(1);
 
       const auto matrix_id = inst->GetOperandAs<uint32_t>(2);
       const auto matrix = _.FindDef(matrix_id);
@@ -1095,7 +1116,8 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       const auto matrix_comp_type_id = matrix_type->GetOperandAs<uint32_t>(1);
       if (matrix_comp_type_id != result_comp_type_id) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
-               << "Result Type and Matrix type must have the same component type: "
+               << "Result Type and Matrix type must have the same component "
+                  "type: "
                << spvOpcodeString(opcode);
       }
 
@@ -1123,8 +1145,10 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
                << spvOpcodeString(opcode);
       }
 
-      const auto result_rows = _.FindDef(result_type)->GetOperandAs<uint32_t>(2);
-      const auto result_cols = _.FindDef(result_type)->GetOperandAs<uint32_t>(3);
+      const auto result_rows =
+          _.FindDef(result_type)->GetOperandAs<uint32_t>(2);
+      const auto result_cols =
+          _.FindDef(result_type)->GetOperandAs<uint32_t>(3);
       const auto matrix_rows = matrix_type->GetOperandAs<uint32_t>(2);
       const auto matrix_cols = matrix_type->GetOperandAs<uint32_t>(3);
 

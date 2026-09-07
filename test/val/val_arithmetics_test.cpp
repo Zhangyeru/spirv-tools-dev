@@ -2014,6 +2014,135 @@ TEST_F(ValidateArithmetics, CoopVecDimNotConstantInt) {
                         "'19[%float_1]' is not a constant integer type"));
 }
 
+std::string GenerateHwCoopComponentCode(const std::string& types,
+                                        const std::string& body = "") {
+  return R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability Float64
+OpCapability Int8
+OpCapability Int16
+OpCapability Int64
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%bool = OpTypeBool
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%f64 = OpTypeFloat 64
+%s8 = OpTypeInt 8 1
+%u8 = OpTypeInt 8 0
+%s16 = OpTypeInt 16 1
+%u16 = OpTypeInt 16 0
+%s32 = OpTypeInt 32 1
+%u32 = OpTypeInt 32 0
+%s64 = OpTypeInt 64 1
+%u64 = OpTypeInt 64 0
+%c3 = OpConstant %u32 3
+)" + types +
+         R"(
+%main = OpFunction %void None %func
+%entry = OpLabel
+)" + body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateArithmetics, HwCoopComponentTypeWhitelist) {
+  for (bool matrix : {false, true}) {
+    const std::string opcode =
+        matrix ? "OpTypeCooperativeMatrixHW" : "OpTypeCooperativeVectorHW";
+    for (const char* component : {"f16", "f32", "s8", "u8", "s16", "u16", "s32",
+                                  "u32", "bool", "f64", "s64", "u64"}) {
+      SCOPED_TRACE(opcode + " " + component);
+      const std::string type = "%coop = " + opcode + " %" + component +
+                               (matrix ? " %c3 %c3\n" : " %c3\n");
+      CompileSuccessfully(GenerateHwCoopComponentCode(type).c_str(),
+                          SPV_ENV_UNIVERSAL_1_6);
+      const std::string component_name = component;
+      const bool invalid = component_name == "bool" ||
+                           component_name == "f64" || component_name == "s64" ||
+                           component_name == "u64";
+      EXPECT_EQ(invalid ? SPV_ERROR_INVALID_ID : SPV_SUCCESS,
+                ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+      if (invalid) {
+        EXPECT_THAT(getDiagnosticString(),
+                    HasSubstr(opcode + " Component Type"));
+        EXPECT_THAT(getDiagnosticString(),
+                    HasSubstr(component_name == "bool"
+                                  ? "is not a scalar numerical type"
+                                  : "must be a 16/32-bit floating-point or "
+                                    "8/16/32-bit integer scalar type"));
+      }
+    }
+  }
+}
+
+TEST_F(ValidateArithmetics, HwCoopUnsignedDivisionRequiresMatchingWidth) {
+  for (bool matrix : {false, true}) {
+    const std::string opcode =
+        matrix ? "OpTypeCooperativeMatrixHW" : "OpTypeCooperativeVectorHW";
+    const std::string shape = matrix ? " %c3 %c3\n" : " %c3\n";
+    for (const char* result : {"u8", "u16", "u32"}) {
+      for (const char* operand : {"u8", "u16", "u32", "s16", "f16"}) {
+        for (bool first_operand : {false, true}) {
+          SCOPED_TRACE(opcode + " " + result + " " + operand +
+                       (first_operand ? " lhs" : " rhs"));
+          // Reuse an identical type instead of declaring a duplicate.
+          const bool same_type = std::string(result) == operand;
+          std::string types =
+              "%result_type = " + opcode + " %" + result + shape;
+          if (!same_type) {
+            types += "%operand_type = " + opcode + " %" + operand + shape;
+          }
+          types +=
+              "%a = OpUndef %result_type\n%b = OpUndef " +
+              std::string(same_type ? "%result_type\n" : "%operand_type\n");
+          const std::string body =
+              "%value = OpUDiv %result_type " +
+              std::string(first_operand ? "%b %a\n" : "%a %b\n");
+          CompileSuccessfully(GenerateHwCoopComponentCode(types, body).c_str(),
+                              SPV_ENV_UNIVERSAL_1_6);
+          EXPECT_EQ(same_type ? SPV_SUCCESS : SPV_ERROR_INVALID_DATA,
+                    ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+          if (!same_type) {
+            EXPECT_THAT(
+                getDiagnosticString(),
+                HasSubstr(operand[0] == 'u' ? "same bit width as Result Type"
+                                            : "operands to be of Result Type"));
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(ValidateArithmetics, HwCoopFloatArithmeticAllowsMixedWidth) {
+  for (bool matrix : {false, true}) {
+    const std::string opcode =
+        matrix ? "OpTypeCooperativeMatrixHW" : "OpTypeCooperativeVectorHW";
+    const std::string shape = matrix ? " %c3 %c3\n" : " %c3\n";
+    const std::string types = "%half_coop = " + opcode + " %f16" + shape +
+                              "%float_coop = " + opcode + " %f32" + shape +
+                              "%a = OpUndef %half_coop\n"
+                              "%b = OpUndef %float_coop\n";
+    CompileSuccessfully(GenerateHwCoopComponentCode(types, R"(
+%wide = OpFAdd %float_coop %a %b
+%narrow = OpFAdd %half_coop %b %a
+)")
+                            .c_str(),
+                        SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  }
+}
+
 std::string GenerateHwCoopMatArithmeticCode(const std::string& main_body) {
   return R"(
 OpCapability Shader
@@ -2153,7 +2282,23 @@ OpFunctionEnd
 }
 
 std::string GenerateUnsupported64BitHwCoopMatMulTypeCode(
-    const std::string& main_body) {
+    const std::string& main_body, bool integer) {
+  const std::string types = integer ? R"(
+%s64_a = OpTypeCooperativeMatrixHW %s64 %c2 %c3 MatrixUseAHW
+%u64_b = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseBHW
+%u64_acc = OpTypeCooperativeMatrixHW %u64 %c2 %c4 MatrixAccumulatorHW
+%s64_a_value = OpUndef %s64_a
+%u64_b_value = OpUndef %u64_b
+%u64_acc_value = OpUndef %u64_acc
+)"
+                                    : R"(
+%f64_a = OpTypeCooperativeMatrixHW %f64 %c2 %c3 MatrixUseAHW
+%f64_b = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseBHW
+%f64_acc = OpTypeCooperativeMatrixHW %f64 %c2 %c4 MatrixAccumulatorHW
+%f64_a_value = OpUndef %f64_a
+%f64_b_value = OpUndef %f64_b
+%f64_acc_value = OpUndef %f64_acc
+)";
   return R"(
 OpCapability Shader
 OpCapability Float64
@@ -2172,18 +2317,8 @@ OpExecutionMode %main LocalSize 1 1 1
 %c2 = OpConstant %u32 2
 %c3 = OpConstant %u32 3
 %c4 = OpConstant %u32 4
-%f64_a = OpTypeCooperativeMatrixHW %f64 %c2 %c3 MatrixUseAHW
-%f64_b = OpTypeCooperativeMatrixHW %f64 %c3 %c4 MatrixUseBHW
-%f64_acc = OpTypeCooperativeMatrixHW %f64 %c2 %c4 MatrixAccumulatorHW
-%s64_a = OpTypeCooperativeMatrixHW %s64 %c2 %c3 MatrixUseAHW
-%u64_b = OpTypeCooperativeMatrixHW %u64 %c3 %c4 MatrixUseBHW
-%u64_acc = OpTypeCooperativeMatrixHW %u64 %c2 %c4 MatrixAccumulatorHW
-%f64_a_value = OpUndef %f64_a
-%f64_b_value = OpUndef %f64_b
-%f64_acc_value = OpUndef %f64_acc
-%s64_a_value = OpUndef %s64_a
-%u64_b_value = OpUndef %u64_b
-%u64_acc_value = OpUndef %u64_acc
+)" + types +
+         R"(
 %main = OpFunction %void None %func
 %entry = OpLabel
 )" + main_body +
@@ -2199,12 +2334,11 @@ TEST_F(ValidateArithmetics, HwCoopMatMulRejectsFloat64Components) {
 )";
 
   CompileSuccessfully(
-      GenerateUnsupported64BitHwCoopMatMulTypeCode(body).c_str(),
+      GenerateUnsupported64BitHwCoopMatMulTypeCode(body, false).c_str(),
       SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
-            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("component types must be 16/32-bit floating-point"));
+              HasSubstr("must be a 16/32-bit floating-point"));
 }
 
 TEST_F(ValidateArithmetics, HwCoopMatMulRejectsInt64Components) {
@@ -2213,12 +2347,11 @@ TEST_F(ValidateArithmetics, HwCoopMatMulRejectsInt64Components) {
 )";
 
   CompileSuccessfully(
-      GenerateUnsupported64BitHwCoopMatMulTypeCode(body).c_str(),
+      GenerateUnsupported64BitHwCoopMatMulTypeCode(body, true).c_str(),
       SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_DATA,
-            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
   EXPECT_THAT(getDiagnosticString(),
-              HasSubstr("8/16/32-bit integer scalar types"));
+              HasSubstr("8/16/32-bit integer scalar type"));
 }
 
 TEST_F(ValidateArithmetics, HwCoopMatMulAllowsMixedFloatWidening) {

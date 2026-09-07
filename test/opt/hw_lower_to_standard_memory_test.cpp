@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <array>
+#include <set>
+#include <sstream>
+#include <vector>
+
 #include "test/opt/hw_lower_to_standard_test_utils.h"
 
 namespace spvtools {
@@ -1148,6 +1153,476 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpLoad %_arr_v2float_uint_2"));
   EXPECT_EQ(1u, CountSubstring(disassembly, " Volatile"));
+}
+
+// A memory lane and a cooperative component have independent types. In
+// particular, changing the component width must not change pointer arithmetic
+// or cause a native-vector memory access to bypass the scalar conversion.
+struct MemoryScalarType {
+  const char* name;
+  uint32_t width;
+  bool floating;
+  bool signed_integer;
+  const char* capability;
+};
+
+const MemoryScalarType kMemoryF16 = {"f16", 16, true, false, "Float16"};
+const MemoryScalarType kMemoryF32 = {"f32", 32, true, false, ""};
+const MemoryScalarType kMemoryF64 = {"f64", 64, true, false, "Float64"};
+const MemoryScalarType kMemoryI8 = {"i8", 8, false, true, "Int8"};
+const MemoryScalarType kMemoryU8 = {"u8", 8, false, false, "Int8"};
+const MemoryScalarType kMemoryI16 = {"i16", 16, false, true, "Int16"};
+const MemoryScalarType kMemoryU16 = {"u16", 16, false, false, "Int16"};
+const MemoryScalarType kMemoryI32 = {"i32", 32, false, true, ""};
+const MemoryScalarType kMemoryU32 = {"u32", 32, false, false, ""};
+const MemoryScalarType kMemoryI64 = {"i64", 64, false, true, "Int64"};
+const MemoryScalarType kMemoryU64 = {"u64", 64, false, false, "Int64"};
+
+struct MemoryConversionStep {
+  spv::Op opcode;
+  const MemoryScalarType* result_type;
+};
+
+struct MemoryConversionCase {
+  const char* name;
+  const MemoryScalarType* memory_type;
+  const MemoryScalarType* cooperative_type;
+  std::vector<MemoryConversionStep> load_steps;
+  std::vector<MemoryConversionStep> store_steps;
+};
+
+// Expected instruction chains are explicit: widening signed input followed by
+// an unsigned destination must sign-extend first, whereas the reverse store
+// must zero-extend/truncate its unsigned source before changing signedness.
+const MemoryConversionCase kMemoryConversionCases[] = {
+    {"F32_F16",
+     &kMemoryF32,
+     &kMemoryF16,
+     {{spv::Op::OpFConvert, &kMemoryF16}},
+     {{spv::Op::OpFConvert, &kMemoryF32}}},
+    {"F16_F32",
+     &kMemoryF16,
+     &kMemoryF32,
+     {{spv::Op::OpFConvert, &kMemoryF32}},
+     {{spv::Op::OpFConvert, &kMemoryF16}}},
+    {"F64_F32",
+     &kMemoryF64,
+     &kMemoryF32,
+     {{spv::Op::OpFConvert, &kMemoryF32}},
+     {{spv::Op::OpFConvert, &kMemoryF64}}},
+    {"I8_I16",
+     &kMemoryI8,
+     &kMemoryI16,
+     {{spv::Op::OpSConvert, &kMemoryI16}},
+     {{spv::Op::OpSConvert, &kMemoryI8}}},
+    {"U8_U16",
+     &kMemoryU8,
+     &kMemoryU16,
+     {{spv::Op::OpUConvert, &kMemoryU16}},
+     {{spv::Op::OpUConvert, &kMemoryU8}}},
+    {"I16_I32",
+     &kMemoryI16,
+     &kMemoryI32,
+     {{spv::Op::OpSConvert, &kMemoryI32}},
+     {{spv::Op::OpSConvert, &kMemoryI16}}},
+    {"U16_U32",
+     &kMemoryU16,
+     &kMemoryU32,
+     {{spv::Op::OpUConvert, &kMemoryU32}},
+     {{spv::Op::OpUConvert, &kMemoryU16}}},
+    {"I64_I32",
+     &kMemoryI64,
+     &kMemoryI32,
+     {{spv::Op::OpSConvert, &kMemoryI32}},
+     {{spv::Op::OpSConvert, &kMemoryI64}}},
+    {"U64_U32",
+     &kMemoryU64,
+     &kMemoryU32,
+     {{spv::Op::OpUConvert, &kMemoryU32}},
+     {{spv::Op::OpUConvert, &kMemoryU64}}},
+    {"I8_U16",
+     &kMemoryI8,
+     &kMemoryU16,
+     {{spv::Op::OpSConvert, &kMemoryI16}, {spv::Op::OpBitcast, &kMemoryU16}},
+     {{spv::Op::OpUConvert, &kMemoryU8}, {spv::Op::OpBitcast, &kMemoryI8}}},
+    {"U8_I16",
+     &kMemoryU8,
+     &kMemoryI16,
+     {{spv::Op::OpUConvert, &kMemoryU16}, {spv::Op::OpBitcast, &kMemoryI16}},
+     {{spv::Op::OpSConvert, &kMemoryI8}, {spv::Op::OpBitcast, &kMemoryU8}}},
+    {"I16_U8",
+     &kMemoryI16,
+     &kMemoryU8,
+     {{spv::Op::OpSConvert, &kMemoryI8}, {spv::Op::OpBitcast, &kMemoryU8}},
+     {{spv::Op::OpUConvert, &kMemoryU16}, {spv::Op::OpBitcast, &kMemoryI16}}},
+    {"U16_I8",
+     &kMemoryU16,
+     &kMemoryI8,
+     {{spv::Op::OpUConvert, &kMemoryU8}, {spv::Op::OpBitcast, &kMemoryI8}},
+     {{spv::Op::OpSConvert, &kMemoryI16}, {spv::Op::OpBitcast, &kMemoryU16}}},
+    {"I64_U32",
+     &kMemoryI64,
+     &kMemoryU32,
+     {{spv::Op::OpSConvert, &kMemoryI32}, {spv::Op::OpBitcast, &kMemoryU32}},
+     {{spv::Op::OpUConvert, &kMemoryU64}, {spv::Op::OpBitcast, &kMemoryI64}}},
+    {"U64_I32",
+     &kMemoryU64,
+     &kMemoryI32,
+     {{spv::Op::OpUConvert, &kMemoryU32}, {spv::Op::OpBitcast, &kMemoryI32}},
+     {{spv::Op::OpSConvert, &kMemoryI64}, {spv::Op::OpBitcast, &kMemoryU64}}},
+    {"I16_F32",
+     &kMemoryI16,
+     &kMemoryF32,
+     {{spv::Op::OpConvertSToF, &kMemoryF32}},
+     {{spv::Op::OpConvertFToS, &kMemoryI16}}},
+    {"U16_F32",
+     &kMemoryU16,
+     &kMemoryF32,
+     {{spv::Op::OpConvertUToF, &kMemoryF32}},
+     {{spv::Op::OpConvertFToU, &kMemoryU16}}},
+    {"I64_F32",
+     &kMemoryI64,
+     &kMemoryF32,
+     {{spv::Op::OpConvertSToF, &kMemoryF32}},
+     {{spv::Op::OpConvertFToS, &kMemoryI64}}},
+    {"U64_F32",
+     &kMemoryU64,
+     &kMemoryF32,
+     {{spv::Op::OpConvertUToF, &kMemoryF32}},
+     {{spv::Op::OpConvertFToU, &kMemoryU64}}},
+    {"F64_I32",
+     &kMemoryF64,
+     &kMemoryI32,
+     {{spv::Op::OpConvertFToS, &kMemoryI32}},
+     {{spv::Op::OpConvertSToF, &kMemoryF64}}},
+    {"F64_U32",
+     &kMemoryF64,
+     &kMemoryU32,
+     {{spv::Op::OpConvertFToU, &kMemoryU32}},
+     {{spv::Op::OpConvertUToF, &kMemoryF64}}},
+    {"F32_I16",
+     &kMemoryF32,
+     &kMemoryI16,
+     {{spv::Op::OpConvertFToS, &kMemoryI16}},
+     {{spv::Op::OpConvertSToF, &kMemoryF32}}},
+    {"F32_U16",
+     &kMemoryF32,
+     &kMemoryU16,
+     {{spv::Op::OpConvertFToU, &kMemoryU16}},
+     {{spv::Op::OpConvertUToF, &kMemoryF32}}},
+    {"U32_F32Bitcast",
+     &kMemoryU32,
+     &kMemoryF32,
+     {{spv::Op::OpBitcast, &kMemoryF32}},
+     {{spv::Op::OpBitcast, &kMemoryU32}}},
+    {"I16_F16Bitcast",
+     &kMemoryI16,
+     &kMemoryF16,
+     {{spv::Op::OpBitcast, &kMemoryF16}},
+     {{spv::Op::OpBitcast, &kMemoryI16}}},
+    {"I8_U8Bitcast",
+     &kMemoryI8,
+     &kMemoryU8,
+     {{spv::Op::OpBitcast, &kMemoryU8}},
+     {{spv::Op::OpBitcast, &kMemoryI8}}},
+    {"F32Identity", &kMemoryF32, &kMemoryF32, {}, {}},
+    {"I16Identity", &kMemoryI16, &kMemoryI16, {}, {}},
+};
+
+std::string MakeMemoryConversionModule(const MemoryConversionCase& test,
+                                       bool matrix, bool nested = false,
+                                       bool column_major = false,
+                                       bool storage_only = false) {
+  std::ostringstream text;
+  std::set<std::string> capabilities = {"Shader"};
+  std::set<std::string> extensions = {"SPV_HW_neural_shader"};
+  const std::array<const MemoryScalarType*, 3> types = {
+      &kMemoryU32, test.memory_type, test.cooperative_type};
+  for (const auto* type : types) {
+    if (type->capability[0] && !(storage_only && type == test.memory_type)) {
+      capabilities.insert(type->capability);
+    }
+  }
+  capabilities.insert(matrix ? "CooperativeMatrixHW" : "CooperativeVectorHW");
+  if (test.memory_type->width == 8) {
+    capabilities.insert("StorageBuffer8BitAccess");
+    extensions.insert("SPV_KHR_8bit_storage");
+  } else if (test.memory_type->width == 16) {
+    capabilities.insert("StorageBuffer16BitAccess");
+    extensions.insert("SPV_KHR_16bit_storage");
+  }
+  for (const auto& capability : capabilities)
+    text << "OpCapability " << capability << '\n';
+  for (const auto& extension : extensions)
+    text << "OpExtension \"" << extension << "\"\n";
+  text << R"(OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+)";
+  const uint32_t bytes = test.memory_type->width / 8;
+  if (nested) {
+    text << "OpDecorate %inner ArrayStride " << 4 * bytes << '\n';
+    text << "OpDecorate %outer ArrayStride " << 8 * bytes << '\n';
+  } else {
+    text << "OpDecorate %outer ArrayStride " << bytes << '\n';
+  }
+  text << R"(OpMemberDecorate %Buffer 0 Offset 0
+OpDecorate %Buffer Block
+OpDecorate %buffer DescriptorSet 0
+OpDecorate %buffer Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+)";
+  std::set<const MemoryScalarType*> emitted;
+  for (const auto* type : types) {
+    if (!emitted.insert(type).second) continue;
+    text << '%' << type->name << " = OpType"
+         << (type->floating ? "Float " : "Int ") << type->width;
+    if (!type->floating) text << ' ' << (type->signed_integer ? 1 : 0);
+    text << '\n';
+  }
+  text << R"(%zero = OpConstant %u32 0
+%one = OpConstant %u32 1
+%two = OpConstant %u32 2
+%four = OpConstant %u32 4
+%eight = OpConstant %u32 8
+%v2uint = OpTypeVector %u32 2
+%shape = OpConstantComposite %v2uint %eight %eight
+)";
+  text << "%cooperative = OpTypeCooperative" << (matrix ? "Matrix" : "Vector")
+       << "HW %" << test.cooperative_type->name
+       << (matrix ? " %two %two\n" : " %four\n");
+  if (nested) {
+    text << "%leaf_vector = OpTypeVector %" << test.memory_type->name << " 4\n";
+    text << "%inner = OpTypeArray %leaf_vector %two\n";
+    text << "%outer = OpTypeRuntimeArray %inner\n";
+  } else {
+    text << "%outer = OpTypeRuntimeArray %" << test.memory_type->name << '\n';
+  }
+  text << R"(%Buffer = OpTypeStruct %outer
+%ptr_buffer = OpTypePointer StorageBuffer %Buffer
+%ptr_outer = OpTypePointer StorageBuffer %outer
+%buffer = OpVariable %ptr_buffer StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%base = OpAccessChain %ptr_outer %buffer %zero
+%dynamic_offset = OpIAdd %u32 %one %one
+%offset = OpCompositeConstruct %v2uint %dynamic_offset %one
+)";
+  if (matrix) {
+    const char* layout = column_major ? "%one" : "%zero";
+    text << "%value = OpCooperativeMatrixLoadHW %cooperative %base %shape "
+            "%offset "
+         << layout << '\n';
+    text << "OpCooperativeMatrixStoreHW %base %value %shape %offset " << layout
+         << '\n';
+  } else {
+    text << "%value = OpCooperativeVectorLoadHW %cooperative %base "
+            "%dynamic_offset\n";
+    text << "OpCooperativeVectorStoreHW %base %dynamic_offset %value\n";
+  }
+  text << "OpReturn\nOpFunctionEnd\n";
+  return text.str();
+}
+
+class HwLowerToStandardMemoryConversionTest
+    : public PassTest<::testing::TestWithParam<MemoryConversionCase>> {
+ protected:
+  bool IsScalarType(uint32_t type_id, const MemoryScalarType& expected) {
+    const auto* type = context()->get_def_use_mgr()->GetDef(type_id);
+    if (!type ||
+        type->opcode() !=
+            (expected.floating ? spv::Op::OpTypeFloat : spv::Op::OpTypeInt) ||
+        type->GetSingleWordInOperand(0) != expected.width) {
+      return false;
+    }
+    return expected.floating || type->GetSingleWordInOperand(1) ==
+                                    (expected.signed_integer ? 1u : 0u);
+  }
+
+  bool HasConversionUsers(uint32_t value,
+                          const std::vector<MemoryConversionStep>& steps,
+                          size_t index = 0) {
+    if (index == steps.size()) return true;
+    bool found = false;
+    context()->get_def_use_mgr()->ForEachUser(value, [&](Instruction* user) {
+      if (user->opcode() == steps[index].opcode &&
+          IsScalarType(user->type_id(), *steps[index].result_type) &&
+          user->GetSingleWordInOperand(0) == value) {
+        found |= HasConversionUsers(user->result_id(), steps, index + 1);
+      }
+    });
+    return found;
+  }
+
+  bool HasConversionDefinitions(uint32_t value,
+                                const std::vector<MemoryConversionStep>& steps,
+                                const MemoryScalarType& source_type) {
+    auto* def_use = context()->get_def_use_mgr();
+    for (auto step = steps.rbegin(); step != steps.rend(); ++step) {
+      const auto* definition = def_use->GetDef(value);
+      if (!definition || definition->opcode() != step->opcode ||
+          !IsScalarType(definition->type_id(), *step->result_type)) {
+        return false;
+      }
+      value = definition->GetSingleWordInOperand(0);
+    }
+    const auto* source = def_use->GetDef(value);
+    return source && IsScalarType(source->type_id(), source_type);
+  }
+
+  void CheckMemoryConversionChains(const MemoryConversionCase& test) {
+    size_t load_count = 0;
+    size_t store_count = 0;
+    auto* def_use = context()->get_def_use_mgr();
+    context()->module()->ForEachInst([&](Instruction* inst) {
+      if (inst->opcode() != spv::Op::OpLoad &&
+          inst->opcode() != spv::Op::OpStore) {
+        return;
+      }
+      const auto* pointer = def_use->GetDef(inst->GetSingleWordInOperand(0));
+      if (!pointer) return;
+      const auto* pointer_type = def_use->GetDef(pointer->type_id());
+      if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer ||
+          pointer_type->GetSingleWordInOperand(0) !=
+              static_cast<uint32_t>(spv::StorageClass::StorageBuffer)) {
+        return;
+      }
+      // Even packed cooperative values must access one original buffer lane at
+      // a time. This also catches a conversion skipped by a pointer helper.
+      EXPECT_TRUE(IsScalarType(pointer_type->GetSingleWordInOperand(1),
+                               *test.memory_type));
+      if (inst->opcode() == spv::Op::OpLoad) {
+        ++load_count;
+        EXPECT_TRUE(IsScalarType(inst->type_id(), *test.memory_type));
+        EXPECT_TRUE(HasConversionUsers(inst->result_id(), test.load_steps));
+      } else {
+        ++store_count;
+        EXPECT_TRUE(HasConversionDefinitions(inst->GetSingleWordInOperand(1),
+                                             test.store_steps,
+                                             *test.cooperative_type));
+      }
+    });
+    EXPECT_GT(load_count, 0u);
+    EXPECT_GT(store_count, 0u);
+  }
+
+  std::string RunMemoryConversionCase(const MemoryConversionCase& test,
+                                      const std::string& text,
+                                      HwLowerToStandardPass::LoweringMode mode,
+                                      uint32_t max_unrolled_elements = 4096) {
+    constexpr auto env = SPV_ENV_UNIVERSAL_1_3;
+    SpirvTools tools(env);
+    tools.SetMessageConsumer(consumer());
+    std::vector<uint32_t> binary;
+    if (!tools.Assemble(text, &binary) || !tools.Validate(binary)) {
+      ADD_FAILURE() << "Invalid original HW memory module:\n" << text;
+      return {};
+    }
+    SetTargetEnv(env);
+    const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, mode,
+        HwLowerToStandardPass::CompletenessMode::kExtensionFree, 1048576u,
+        16777216ull, max_unrolled_elements, 4096ull);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    if (std::get<1>(result) == Pass::Status::Failure) return {};
+    const auto& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(std::string::npos, disassembly.find("ReplicateEXT"));
+    CheckMemoryConversionChains(test);
+    return disassembly;
+  }
+};
+
+TEST_P(HwLowerToStandardMemoryConversionTest,
+       LoadAndStoreUseScalarConversionInBothLoweringModes) {
+  for (const bool matrix : {false, true}) {
+    for (const auto mode :
+         {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+          HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+      SCOPED_TRACE(matrix ? "matrix" : "vector");
+      SCOPED_TRACE(static_cast<int>(mode));
+      RunMemoryConversionCase(
+          GetParam(), MakeMemoryConversionModule(GetParam(), matrix), mode);
+    }
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ScalarPairs, HwLowerToStandardMemoryConversionTest,
+    ::testing::ValuesIn(kMemoryConversionCases),
+    [](const ::testing::TestParamInfo<MemoryConversionCase>& info) {
+      return info.param.name;
+    });
+
+TEST_F(HwLowerToStandardMemoryConversionTest,
+       CrossWidthNestedVectorLeafPreservesMatrixSubregionAndDynamicOffset) {
+  const auto& test = kMemoryConversionCases[0];  // f32 memory, f16 values.
+  for (const bool matrix : {false, true}) {
+    for (const bool column_major : {false, true}) {
+      for (const auto mode :
+           {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+            HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+        SCOPED_TRACE(matrix ? "matrix" : "vector");
+        SCOPED_TRACE(column_major ? "column major" : "row major");
+        SCOPED_TRACE(static_cast<int>(mode));
+        const auto text =
+            MakeMemoryConversionModule(test, matrix, true, column_major);
+        const auto disassembly = RunMemoryConversionCase(test, text, mode);
+        EXPECT_NE(
+            std::string::npos,
+            disassembly.find("OpDecorate %_arr_v4float_uint_2 ArrayStride 16"));
+        EXPECT_GT(CountSubstring(disassembly, "OpUDiv %uint"), 0u);
+        EXPECT_GT(CountSubstring(disassembly, "OpUMod %uint"), 0u);
+        EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+      }
+    }
+  }
+}
+
+TEST_F(HwLowerToStandardMemoryConversionTest,
+       CrossWidthStructuredLoopsConvertEachMemoryLane) {
+  for (const auto* test :
+       {&kMemoryConversionCases[0], &kMemoryConversionCases[9]}) {
+    for (const bool matrix : {false, true}) {
+      for (const auto mode :
+           {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+            HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+        SCOPED_TRACE(test->name);
+        SCOPED_TRACE(matrix ? "matrix" : "vector");
+        SCOPED_TRACE(static_cast<int>(mode));
+        const auto disassembly = RunMemoryConversionCase(
+            *test, MakeMemoryConversionModule(*test, matrix, true), mode,
+            /*max_unrolled_elements=*/2u);
+        EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
+        EXPECT_EQ(0u, CountSubstring(disassembly, "OpFunctionCall"));
+      }
+    }
+  }
+}
+
+TEST_F(HwLowerToStandardMemoryConversionTest,
+       CrossWidthStorageOnlyLeafPromotesRequiredArithmeticCapability) {
+  for (const auto* test :
+       {&kMemoryConversionCases[1], &kMemoryConversionCases[5],
+        &kMemoryConversionCases[3]}) {
+    for (const bool matrix : {false, true}) {
+      for (const auto mode :
+           {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+            HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+        SCOPED_TRACE(test->name);
+        SCOPED_TRACE(matrix ? "matrix" : "vector");
+        SCOPED_TRACE(static_cast<int>(mode));
+        const std::string capability =
+            std::string("OpCapability ") + test->memory_type->capability + "\n";
+        const auto text =
+            MakeMemoryConversionModule(*test, matrix, false, false, true);
+        ASSERT_EQ(0u, CountSubstring(text, capability));
+        const auto disassembly = RunMemoryConversionCase(*test, text, mode);
+        EXPECT_EQ(1u, CountSubstring(disassembly, capability));
+      }
+    }
+  }
 }
 
 }  // namespace

@@ -243,6 +243,8 @@ class HwLowerToStandardPass : public Pass {
   bool DescribeHwMemoryPointerLayout(uint32_t pointer_type_id,
                                      uint32_t cooperative_component_type_id,
                                      HwMemoryPointerLayout* layout) const;
+  bool HasSameWidthHwMemoryPointer(uint32_t pointer_id,
+                                   uint32_t component_type_id) const;
   HwMemoryElementAccess BuildElementAccess(InstructionBuilder* builder,
                                            Instruction* user,
                                            uint32_t pointer_id,
@@ -265,6 +267,10 @@ class HwLowerToStandardPass : public Pass {
                              uint32_t element_index_id, uint32_t object_id,
                              const std::vector<Operand>& memory_operands,
                              uint32_t element_index_type_id);
+  uint32_t ConvertMemoryComponent(InstructionBuilder* builder,
+                                  uint32_t source_type_id,
+                                  uint32_t target_type_id, uint32_t value_id);
+  void EnsureMemoryConversionCapability(uint32_t type_id);
   Instruction* AddFunctionVariable(Function* function, uint32_t pointer_type_id,
                                    uint32_t initializer_id = 0);
   uint32_t BuildLogicalAggregateLoad(InstructionBuilder* builder,

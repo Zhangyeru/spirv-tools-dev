@@ -139,6 +139,14 @@ bool HwLowerToStandardPass::TryLowerFusedVectorMatmulStore(Instruction* inst,
       matrix_load->GetSingleWordInOperand(kHwMatrixLoadOffsetInIdx);
   const uint32_t output_pointer_id =
       inst->GetSingleWordInOperand(kHwVectorStorePointerInIdx);
+  if (!HasSameWidthHwMemoryPointer(input_pointer_id,
+                                   input->component_type_id) ||
+      !HasSameWidthHwMemoryPointer(matrix_pointer_id,
+                                   matrix->component_type_id) ||
+      !HasSameWidthHwMemoryPointer(output_pointer_id,
+                                   result->component_type_id)) {
+    return true;
+  }
   const uint32_t input_root_id = GetRootModulePointerId(input_pointer_id);
   const uint32_t matrix_root_id = GetRootModulePointerId(matrix_pointer_id);
   const uint32_t output_root_id = GetRootModulePointerId(output_pointer_id);
@@ -388,6 +396,13 @@ bool HwLowerToStandardPass::TryLowerFusedMatrixMatmulStore(Instruction* inst,
       c_load->GetSingleWordInOperand(kHwMatrixLoadPointerInIdx);
   const uint32_t output_pointer_id =
       inst->GetSingleWordInOperand(kHwMatrixStorePointerInIdx);
+  if (!HasSameWidthHwMemoryPointer(a_pointer_id, a->component_type_id) ||
+      !HasSameWidthHwMemoryPointer(b_pointer_id, b->component_type_id) ||
+      !HasSameWidthHwMemoryPointer(c_pointer_id, c->component_type_id) ||
+      !HasSameWidthHwMemoryPointer(output_pointer_id,
+                                   result->component_type_id)) {
+    return true;
+  }
   const uint32_t a_shape_id =
       a_load->GetSingleWordInOperand(kHwMatrixLoadShapeInIdx);
   const uint32_t a_offset_id =
@@ -585,6 +600,8 @@ bool HwLowerToStandardPass::ResolveDirectVectorLoad(
   source->memory_operands =
       CopyMemoryOperands(load, kHwVectorLoadMemoryOperandsInIdx);
   return source->pointer_type_id != 0 &&
+         HasSameWidthHwMemoryPointer(source->pointer_id,
+                                     load_type->component_type_id) &&
          CanCapturePointer(source->pointer_id) &&
          CanMoveLoadToUse(load, use, /*function_memory=*/false,
                           kHwVectorLoadMemoryOperandsInIdx);
@@ -647,6 +664,8 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
   source->memory_operands =
       CopyMemoryOperands(load, kHwVectorLoadMemoryOperandsInIdx);
   return source->pointer_type_id != 0 &&
+         HasSameWidthHwMemoryPointer(source->pointer_id,
+                                     source_type->component_type_id) &&
          CanCapturePointer(source->pointer_id) &&
          CanMoveLoadToUse(load, use, /*function_memory=*/false,
                           kHwVectorLoadMemoryOperandsInIdx);
@@ -674,6 +693,8 @@ bool HwLowerToStandardPass::ResolveDirectMatrixLoad(
   }
 
   source->source_load = load;
+  const MatrixTypeInfo* load_type = GetMatrixType(load->type_id());
+  if (!load_type) return false;
   source->pointer_id = load->GetSingleWordInOperand(kHwMatrixLoadPointerInIdx);
   source->pointer_type_id = GetPointerTypeId(source->pointer_id);
   source->shape_id = load->GetSingleWordInOperand(kHwMatrixLoadShapeInIdx);
@@ -681,6 +702,8 @@ bool HwLowerToStandardPass::ResolveDirectMatrixLoad(
   source->memory_operands =
       CopyMemoryOperands(load, kHwMatrixLoadMemoryOperandsInIdx);
   return source->pointer_type_id != 0 &&
+         HasSameWidthHwMemoryPointer(source->pointer_id,
+                                     load_type->component_type_id) &&
          CanCapturePointer(source->pointer_id) &&
          IsModuleVisibleValue(source->shape_id) &&
          IsModuleVisibleValue(source->offset_id) &&

@@ -94,6 +94,7 @@ bool HwLowerToStandardPass::LowerMatrixLoad(Instruction* inst) {
   if (IsPackedVec2(*info)) {
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
+        HasSameWidthHwMemoryPointer(pointer_id, info->component_type_id) &&
         CanCapturePointer(pointer_id) &&
         MemoryAccessOperandsAreMovable(inst,
                                        kHwMatrixLoadMemoryOperandsInIdx)) {
@@ -212,6 +213,7 @@ bool HwLowerToStandardPass::LowerMatrixStore(
   if (IsPackedVec2(*info)) {
     if (layout ==
             static_cast<uint32_t>(spv::CooperativeMatrixLayout::RowMajorKHR) &&
+        HasSameWidthHwMemoryPointer(pointer_id, info->component_type_id) &&
         CanCapturePointer(pointer_id) &&
         MemoryAccessOperandsAreMovable(inst,
                                        kHwMatrixStoreMemoryOperandsInIdx)) {
@@ -329,6 +331,7 @@ bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
         offset_type->NumInOperands() >= 2 &&
         offset_type->GetSingleWordInOperand(0) == 32;
     if (has_32_bit_offset && CanCapturePointer(pointer_id) &&
+        HasSameWidthHwMemoryPointer(pointer_id, info->component_type_id) &&
         MemoryAccessOperandsAreMovable(inst,
                                        kHwVectorLoadMemoryOperandsInIdx)) {
       uint32_t result_id = 0;
@@ -443,6 +446,7 @@ bool HwLowerToStandardPass::LowerVectorStore(
         offset_type->NumInOperands() >= 2 &&
         offset_type->GetSingleWordInOperand(0) == 32;
     if (has_32_bit_offset && CanCapturePointer(pointer_id) &&
+        HasSameWidthHwMemoryPointer(pointer_id, info->component_type_id) &&
         MemoryAccessOperandsAreMovable(inst,
                                        kHwVectorStoreMemoryOperandsInIdx)) {
       if (!BuildPackedVectorStoreOuterLoop(inst, *info, pointer_id,
@@ -760,12 +764,92 @@ bool HwLowerToStandardPass::DescribeHwMemoryPointerLayout(
       get_def_use_mgr()->GetDef(layout->leaf_component_type_id);
   if (layout->array_levels.empty() || layout->leaf_vector_width == 0 ||
       !leaf_component || !IsNumericScalarType(leaf_component) ||
-      leaf_component->NumInOperands() < 1 ||
-      leaf_component->GetSingleWordInOperand(0) !=
-          cooperative_component->GetSingleWordInOperand(0)) {
+      leaf_component->NumInOperands() < 1) {
     return false;
   }
   return true;
+}
+
+bool HwLowerToStandardPass::HasSameWidthHwMemoryPointer(
+    uint32_t pointer_id, uint32_t component_type_id) const {
+  Instruction* pointer = get_def_use_mgr()->GetDef(pointer_id);
+  HwMemoryPointerLayout layout;
+  if (!pointer || !DescribeHwMemoryPointerLayout(pointer->type_id(),
+                                                 component_type_id, &layout)) {
+    return false;
+  }
+  const NumericScalarInfo component =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(component_type_id));
+  const NumericScalarInfo leaf = DescribeNumericScalarType(
+      get_def_use_mgr()->GetDef(layout.leaf_component_type_id));
+  return component.valid && leaf.valid && component.width == leaf.width;
+}
+
+void HwLowerToStandardPass::EnsureMemoryConversionCapability(uint32_t type_id) {
+  const NumericScalarInfo info =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(type_id));
+  if (!info.valid) return;
+  if (info.is_float) {
+    if (info.width == 16) context()->AddCapability(spv::Capability::Float16);
+    if (info.width == 64) context()->AddCapability(spv::Capability::Float64);
+  } else {
+    if (info.width == 8) context()->AddCapability(spv::Capability::Int8);
+    if (info.width == 16) context()->AddCapability(spv::Capability::Int16);
+    if (info.width == 64) context()->AddCapability(spv::Capability::Int64);
+  }
+}
+
+uint32_t HwLowerToStandardPass::ConvertMemoryComponent(
+    InstructionBuilder* builder, uint32_t source_type_id,
+    uint32_t target_type_id, uint32_t value_id) {
+  if (!builder || source_type_id == 0 || target_type_id == 0 || value_id == 0) {
+    return 0;
+  }
+  if (source_type_id == target_type_id) return value_id;
+  const NumericScalarInfo source =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(source_type_id));
+  const NumericScalarInfo target =
+      DescribeNumericScalarType(get_def_use_mgr()->GetDef(target_type_id));
+  if (!source.valid || !target.valid) return 0;
+
+  // Storage-only 8/16-bit types need arithmetic capabilities once a memory
+  // boundary introduces a conversion. AddCapability also deduplicates them.
+  EnsureMemoryConversionCapability(source_type_id);
+  EnsureMemoryConversionCapability(target_type_id);
+  if (source.width == target.width) {
+    // Preserve the existing raw-bit interpretation of equal-width accesses.
+    Instruction* converted =
+        builder->AddUnaryOp(target_type_id, spv::Op::OpBitcast, value_id);
+    return converted ? converted->result_id() : 0;
+  }
+
+  spv::Op opcode;
+  uint32_t converted_type_id = target_type_id;
+  if (source.is_float && target.is_float) {
+    opcode = spv::Op::OpFConvert;
+  } else if (source.is_float) {
+    opcode = target.is_signed ? spv::Op::OpConvertFToS : spv::Op::OpConvertFToU;
+  } else if (target.is_float) {
+    opcode = source.is_signed ? spv::Op::OpConvertSToF : spv::Op::OpConvertUToF;
+  } else {
+    // Extend according to the source's signedness, or truncate low bits when
+    // narrowing. Change signedness only after the width conversion.
+    opcode = source.is_signed ? spv::Op::OpSConvert : spv::Op::OpUConvert;
+    if (source.is_signed != target.is_signed) {
+      converted_type_id =
+          GetOrCreateIntegerType(target.width, source.is_signed);
+    }
+  }
+  Instruction* converted =
+      converted_type_id
+          ? builder->AddUnaryOp(converted_type_id, opcode, value_id)
+          : nullptr;
+  if (!converted) return 0;
+  if (target.is_float) ApplyActiveFPFastMathMode(converted);
+  if (converted_type_id == target_type_id) return converted->result_id();
+  Instruction* bitcast = builder->AddUnaryOp(target_type_id, spv::Op::OpBitcast,
+                                             converted->result_id());
+  return bitcast ? bitcast->result_id() : 0;
 }
 
 HwLowerToStandardPass::HwMemoryElementAccess
@@ -932,9 +1016,8 @@ uint32_t HwLowerToStandardPass::AddMemoryElementLoad(
   if (loaded_id == 0 || access.component_type_id == component_type_id) {
     return loaded_id;
   }
-  Instruction* converted =
-      builder->AddUnaryOp(component_type_id, spv::Op::OpBitcast, loaded_id);
-  return converted ? converted->result_id() : 0;
+  return ConvertMemoryComponent(builder, access.component_type_id,
+                                component_type_id, loaded_id);
 }
 
 bool HwLowerToStandardPass::AddMemoryElementStore(
@@ -953,10 +1036,9 @@ bool HwLowerToStandardPass::AddMemoryElementStore(
   if (access.pointer_id == 0) return false;
   uint32_t stored_id = object_id;
   if (access.component_type_id != component_type_id) {
-    Instruction* converted = builder->AddUnaryOp(access.component_type_id,
-                                                 spv::Op::OpBitcast, object_id);
-    if (!converted) return false;
-    stored_id = converted->result_id();
+    stored_id = ConvertMemoryComponent(builder, component_type_id,
+                                       access.component_type_id, object_id);
+    if (stored_id == 0) return false;
   }
   return AddStore(builder, access.pointer_id, stored_id, memory_operands,
                   access.component_type_id);
@@ -1896,9 +1978,9 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
     uint32_t value_id = AddLoad(&body_builder, memory_access.component_type_id,
                                 memory_access.pointer_id, memory_operands);
     if (value_id != 0 && memory_access.component_type_id != component_type_id) {
-      Instruction* converted = body_builder.AddUnaryOp(
-          component_type_id, spv::Op::OpBitcast, value_id);
-      value_id = converted ? converted->result_id() : 0;
+      value_id =
+          ConvertMemoryComponent(&body_builder, memory_access.component_type_id,
+                                 component_type_id, value_id);
     }
     uint32_t stored_id = value_id;
     if (value_id != 0 && packed_vec2_type_id != 0) {
@@ -1929,10 +2011,10 @@ bool HwLowerToStandardPass::BuildScalarMemoryLoop(
     if (value_id == 0) return false;
     uint32_t stored_id = value_id;
     if (memory_access.component_type_id != component_type_id) {
-      Instruction* converted = body_builder.AddUnaryOp(
-          memory_access.component_type_id, spv::Op::OpBitcast, value_id);
-      if (!converted) return false;
-      stored_id = converted->result_id();
+      stored_id =
+          ConvertMemoryComponent(&body_builder, component_type_id,
+                                 memory_access.component_type_id, value_id);
+      if (stored_id == 0) return false;
     }
     if (!AddStore(&body_builder, memory_access.pointer_id, stored_id,
                   memory_operands, memory_access.component_type_id)) {

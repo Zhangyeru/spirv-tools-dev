@@ -27,6 +27,18 @@ namespace spvtools {
 namespace val {
 namespace {
 
+bool IsSupportedHwCooperativeComponentType(ValidationState_t& _,
+                                           uint32_t type_id) {
+  const uint32_t bit_width = _.GetBitWidth(type_id);
+  if (_.IsFloatScalarType(type_id)) {
+    return bit_width == 16 || bit_width == 32;
+  }
+  if (_.IsIntScalarType(type_id)) {
+    return bit_width == 8 || bit_width == 16 || bit_width == 32;
+  }
+  return false;
+}
+
 // Validates that type declarations are unique, unless multiple declarations
 // of the same data type are allowed by the specification.
 // (see section 2.8 Types and Variables)
@@ -231,6 +243,13 @@ spv_result_t ValidateTypeCooperativeVectorHW(ValidationState_t& _,
            << "OpTypeCooperativeVectorHW Component Type <id> "
            << _.getIdName(component_type_id)
            << " is not a scalar numerical type.";
+  }
+  if (!IsSupportedHwCooperativeComponentType(_, component_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "OpTypeCooperativeVectorHW Component Type <id> "
+           << _.getIdName(component_type_id)
+           << " must be a 16/32-bit floating-point or 8/16/32-bit integer "
+              "scalar type.";
   }
 
   const auto num_components_index = 2;
@@ -765,6 +784,13 @@ spv_result_t ValidateTypeCooperativeMatrixHW(ValidationState_t& _,
            << _.getIdName(component_type_id)
            << " is not a scalar numerical type.";
   }
+  if (!IsSupportedHwCooperativeComponentType(_, component_type_id)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "OpTypeCooperativeMatrixHW Component Type <id> "
+           << _.getIdName(component_type_id)
+           << " must be a 16/32-bit floating-point or 8/16/32-bit integer "
+              "scalar type.";
+  }
 
   const auto rows_index = 2;
   const auto rows_id = inst->GetOperandAs<uint32_t>(rows_index);
@@ -788,8 +814,7 @@ spv_result_t ValidateTypeCooperativeMatrixHW(ValidationState_t& _,
 
   if (inst->operands().size() > 4) {
     const auto use_index = 4;
-    const auto use =
-        inst->GetOperandAs<spv::CooperativeMatrixUseHW>(use_index);
+    const auto use = inst->GetOperandAs<spv::CooperativeMatrixUseHW>(use_index);
     switch (use) {
       case spv::CooperativeMatrixUseHW::MatrixUseAHW:
       case spv::CooperativeMatrixUseHW::MatrixUseBHW:
