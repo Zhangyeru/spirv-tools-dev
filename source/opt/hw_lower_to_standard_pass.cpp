@@ -73,8 +73,9 @@ Pass::Status HwLowerToStandardPass::Process() {
   generated_function_ids_.clear();
   read_only_generated_function_ids_.clear();
   loop_carried_packed_memory_roots_.clear();
+  contraction_off_function_ids_.clear();
   pending_fp_fast_math_modes_.clear();
-  active_fp_fast_math_mode_ = 0;
+  active_arithmetic_contract_ = {};
 
   bool has_hw = false;
   get_module()->ForEachInst([this, &has_hw](Instruction* inst) {
@@ -97,7 +98,7 @@ Pass::Status HwLowerToStandardPass::Process() {
     return Status::Failure;
   }
 
-  if (!PreflightNoContractionVectorMatmul()) return Status::Failure;
+  RecordContractionOffFunctions();
 
   if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
     RecordLoopCarriedPackedMemoryRoots();
@@ -129,6 +130,20 @@ Pass::Status HwLowerToStandardPass::Process() {
   context()->InvalidateAnalyses(IRContext::kAnalysisTypes |
                                 IRContext::kAnalysisConstants);
   return Status::SuccessWithChange;
+}
+
+void HwLowerToStandardPass::RecordContractionOffFunctions() {
+  for (const Instruction& execution_mode : get_module()->execution_modes()) {
+    if (execution_mode.opcode() != spv::Op::OpExecutionMode ||
+        execution_mode.NumInOperands() < 2 ||
+        execution_mode.GetSingleWordInOperand(1) !=
+            uint32_t(spv::ExecutionMode::ContractionOff)) {
+      continue;
+    }
+    context()->CollectCallTreeFromRoots(
+        execution_mode.GetSingleWordInOperand(0),
+        &contraction_off_function_ids_);
+  }
 }
 
 void HwLowerToStandardPass::RecordLoopCarriedPackedMemoryRoots() {
@@ -191,8 +206,8 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
   for (Instruction* inst : direct_matmuls) {
     if (!inst || inst->IsNop()) continue;
-    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-    active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
+    const ArithmeticContract saved_contract = active_arithmetic_contract_;
+    active_arithmetic_contract_ = GetArithmeticContract(inst);
     bool handled = false;
     bool ok = true;
     switch (inst->opcode()) {
@@ -208,8 +223,10 @@ bool HwLowerToStandardPass::LowerHwInstructions(
       default:
         break;
     }
-    if (handled) RemoveFPFastMathMode(inst->result_id());
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    if (handled && active_arithmetic_contract_.has_explicit_fp_fast_math_mode) {
+      RemoveFPFastMathMode(inst->result_id());
+    }
+    active_arithmetic_contract_ = saved_contract;
     if (!ok) return false;
   }
 
@@ -298,10 +315,9 @@ bool HwLowerToStandardPass::LowerHwInstructions(
   });
 
   for (Instruction* inst : worklist) {
-    const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-    const uint32_t source_fast_math_mode =
-        inst ? GetFPFastMathMode(inst->result_id()) : 0;
-    active_fp_fast_math_mode_ = source_fast_math_mode;
+    const ArithmeticContract saved_contract = active_arithmetic_contract_;
+    const ArithmeticContract source_contract = GetArithmeticContract(inst);
+    active_arithmetic_contract_ = source_contract;
     bool ok = true;
     switch (inst->opcode()) {
       case spv::Op::OpCooperativeMatrixLoadHW:
@@ -382,10 +398,13 @@ bool HwLowerToStandardPass::LowerHwInstructions(
         }
         break;
     }
-    if (ok && source_fast_math_mode != 0) {
+    if (ok && source_contract.has_explicit_fp_fast_math_mode) {
       RemoveFPFastMathMode(inst->result_id());
     }
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    if (ok && source_contract.propagate_no_contraction) {
+      RemoveNoContraction(inst->result_id());
+    }
+    active_arithmetic_contract_ = saved_contract;
     if (!ok) return false;
   }
 

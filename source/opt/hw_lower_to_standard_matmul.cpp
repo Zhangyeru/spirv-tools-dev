@@ -45,8 +45,8 @@ namespace opt {
 using namespace hw_lower_internal;
 
 bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
-  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-  active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
+  const ArithmeticContract saved_contract = active_arithmetic_contract_;
+  active_arithmetic_contract_ = GetArithmeticContract(inst);
   const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
   Instruction* a_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwMatrixMulAddAInIdx));
@@ -59,7 +59,7 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   const MatrixTypeInfo* c = GetMatrixTypeForValue(c_inst);
   if (!result || !a || !b || !c) {
     ReportError(inst, "invalid OpCooperativeMatrixMulAddHW");
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    active_arithmetic_contract_ = saved_contract;
     return false;
   }
 
@@ -68,11 +68,18 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
                              static_cast<uint64_t>(a->cols);
   bool lowered = mac_count > max_unrolled_matmul_macs_
                      ? LowerMatrixMulAddWithLoop(inst)
-                     : (CanUsePackedVec2MatrixMulAdd(*result, *a, *b, *c)
-                            ? LowerMatrixMulAddPackedVec2(inst)
-                            : LowerMatrixMulAddScalarFallback(inst));
-  if (lowered) RemoveFPFastMathMode(inst->result_id());
-  active_fp_fast_math_mode_ = saved_fast_math_mode;
+                     : (active_arithmetic_contract_.strict_matmul
+                            ? LowerMatrixMulAddScalarFallback(inst)
+                            : (CanUsePackedVec2MatrixMulAdd(*result, *a, *b, *c)
+                                   ? LowerMatrixMulAddPackedVec2(inst)
+                                   : LowerMatrixMulAddScalarFallback(inst)));
+  if (lowered && active_arithmetic_contract_.has_explicit_fp_fast_math_mode) {
+    RemoveFPFastMathMode(inst->result_id());
+  }
+  if (lowered && active_arithmetic_contract_.propagate_no_contraction) {
+    RemoveNoContraction(inst->result_id());
+  }
+  active_arithmetic_contract_ = saved_contract;
   return lowered;
 }
 
@@ -509,11 +516,14 @@ bool HwLowerToStandardPass::LowerMatrixLength(
 }
 
 bool HwLowerToStandardPass::LowerMatrixReduce(Instruction* inst) {
-  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-  active_fp_fast_math_mode_ = inst ? GetFPFastMathMode(inst->result_id()) : 0;
+  const ArithmeticContract saved_contract = active_arithmetic_contract_;
+  active_arithmetic_contract_ = GetArithmeticContract(inst);
   const bool lowered = LowerMatrixReduceImpl(inst);
-  if (lowered && inst) RemoveFPFastMathMode(inst->result_id());
-  active_fp_fast_math_mode_ = saved_fast_math_mode;
+  if (lowered && inst &&
+      active_arithmetic_contract_.has_explicit_fp_fast_math_mode) {
+    RemoveFPFastMathMode(inst->result_id());
+  }
+  active_arithmetic_contract_ = saved_contract;
   return lowered;
 }
 
@@ -929,8 +939,8 @@ bool HwLowerToStandardPass::LowerMatrixReduceWithLoop(Instruction* inst,
 
 bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
                                                  bool has_bias) {
-  const uint32_t saved_fast_math_mode = active_fp_fast_math_mode_;
-  active_fp_fast_math_mode_ = GetFPFastMathMode(inst->result_id());
+  const ArithmeticContract saved_contract = active_arithmetic_contract_;
+  active_arithmetic_contract_ = GetArithmeticContract(inst);
   const VectorTypeInfo* result = GetVectorType(inst->type_id());
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
@@ -948,7 +958,7 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
     ReportError(inst, "invalid HW vector matrix multiply");
-    active_fp_fast_math_mode_ = saved_fast_math_mode;
+    active_arithmetic_contract_ = saved_contract;
     return false;
   }
 
@@ -957,11 +967,19 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
   bool lowered =
       mac_count > max_unrolled_matmul_macs_
           ? LowerVectorMatrixMulWithLoop(inst, has_bias)
-          : (CanUsePackedVec2VectorMatrixMul(*result, *input, *matrix, bias)
-                 ? LowerVectorMatrixMulPackedVec2(inst, has_bias)
-                 : LowerVectorMatrixMulScalarFallback(inst, has_bias));
-  if (lowered) RemoveFPFastMathMode(inst->result_id());
-  active_fp_fast_math_mode_ = saved_fast_math_mode;
+          : (active_arithmetic_contract_.strict_matmul
+                 ? LowerVectorMatrixMulScalarFallback(inst, has_bias)
+                 : (CanUsePackedVec2VectorMatrixMul(*result, *input, *matrix,
+                                                    bias)
+                        ? LowerVectorMatrixMulPackedVec2(inst, has_bias)
+                        : LowerVectorMatrixMulScalarFallback(inst, has_bias)));
+  if (lowered && active_arithmetic_contract_.has_explicit_fp_fast_math_mode) {
+    RemoveFPFastMathMode(inst->result_id());
+  }
+  if (lowered && active_arithmetic_contract_.propagate_no_contraction) {
+    RemoveNoContraction(inst->result_id());
+  }
+  active_arithmetic_contract_ = saved_contract;
   return lowered;
 }
 
@@ -1470,6 +1488,20 @@ uint32_t HwLowerToStandardPass::BuildMatmulAccumulate(
   const uint32_t widened_rhs = widen(rhs_type_id, rhs_id, rhs);
   if (widened_lhs == 0 || widened_rhs == 0) return 0;
   if (accumulator.is_float) {
+    if (active_arithmetic_contract_.strict_matmul) {
+      Instruction* product = builder->AddBinaryOp(
+          accumulator_type_id, spv::Op::OpFMul, widened_lhs, widened_rhs);
+      Instruction* sum =
+          product ? builder->AddBinaryOp(accumulator_type_id, spv::Op::OpFAdd,
+                                         product->result_id(), accumulator_id)
+                  : nullptr;
+      if (!product || !sum) return 0;
+      ApplyActiveFPFastMathMode(product);
+      ApplyActiveFPFastMathMode(sum);
+      ApplyActiveNoContraction(product);
+      ApplyActiveNoContraction(sum);
+      return sum->result_id();
+    }
     return BuildFma(builder, accumulator_type_id, widened_lhs, widened_rhs,
                     accumulator_id);
   }

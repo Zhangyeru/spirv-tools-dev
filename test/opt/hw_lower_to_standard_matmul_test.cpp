@@ -57,6 +57,40 @@ bool HasHalfVec2WithZeroTail(const std::string& disassembly,
   return false;
 }
 
+void ExpectStrictFloatOpsDecorated(const std::string& disassembly) {
+  std::unordered_set<std::string> no_contraction_ids;
+  std::vector<std::string> float_op_ids;
+  std::istringstream lines(disassembly);
+  for (std::string line; std::getline(lines, line);) {
+    std::istringstream words(line);
+    std::string first;
+    words >> first;
+    if (first == "OpDecorate") {
+      std::string target;
+      std::string decoration;
+      words >> target >> decoration;
+      if (decoration == "NoContraction") {
+        no_contraction_ids.insert(target);
+      }
+      continue;
+    }
+
+    std::string equals;
+    std::string opcode;
+    words >> equals >> opcode;
+    if (equals == "=" && (opcode == "OpFMul" || opcode == "OpFAdd")) {
+      float_op_ids.push_back(first);
+    }
+  }
+
+  ASSERT_FALSE(float_op_ids.empty());
+  for (const std::string& id : float_op_ids) {
+    EXPECT_NE(no_contraction_ids.count(id), 0u)
+        << "Missing NoContraction on " << id << "\n"
+        << disassembly;
+  }
+}
+
 void ExpectPackedVec2VectorMatmulWithTails(const std::string& disassembly) {
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpExtInst %v2float"), 0u);
@@ -6327,6 +6361,462 @@ OpFunctionEnd
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_GT(CountSubstring(disassembly, "OpFunctionCall"), 0u)
       << "Expected direct path (OpFunctionCall) but got generic";
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionVectorMatmulAddPreservesKOrderAndDecorations) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_1 = OpConstant %uint 1
+%uint_3 = OpConstant %uint 3
+%float = OpTypeFloat 32
+%input_type = OpTypeCooperativeVectorHW %float %uint_3
+%result_type = OpTypeCooperativeVectorHW %float %uint_1
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_3 %uint_1
+%input = OpUndef %input_type
+%matrix = OpUndef %matrix_type
+%bias = OpUndef %result_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeVectorMatrixMulAddHW %result_type %input %matrix %bias
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  ExpectStrictFloatOpsDecorated(disassembly);
+
+  struct BinaryOp {
+    std::string result;
+    std::string lhs;
+    std::string rhs;
+  };
+  std::vector<BinaryOp> multiplies;
+  std::vector<BinaryOp> adds;
+  std::istringstream lines(disassembly);
+  for (std::string line; std::getline(lines, line);) {
+    std::istringstream words(line);
+    std::string id;
+    std::string equals;
+    std::string opcode;
+    std::string type;
+    BinaryOp operation;
+    words >> id >> equals >> opcode >> type >> operation.lhs >> operation.rhs;
+    operation.result = id;
+    if (equals != "=" || type != "%float") continue;
+    if (opcode == "OpFMul") multiplies.push_back(operation);
+    if (opcode == "OpFAdd") adds.push_back(operation);
+  }
+  ASSERT_EQ(3u, multiplies.size());
+  ASSERT_EQ(3u, adds.size());
+  for (size_t k = 0; k < adds.size(); ++k) {
+    EXPECT_EQ(multiplies[k].result, adds[k].lhs);
+    if (k != 0) EXPECT_EQ(adds[k - 1].result, adds[k].rhs);
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionBlocksDirectAndFusedStoreLowering) {
+  std::string text = MakeFusedConstantBiasStoreModule(4);
+  const size_t decoration_position = text.find("OpDecorate %_runtimearr_float");
+  ASSERT_NE(decoration_position, std::string::npos);
+  text.insert(decoration_position, "OpDecorate %y NoContraction\n");
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  EXPECT_GT(CountSubstring(disassembly, "OpFMul %float"), 0u);
+  EXPECT_EQ(CountSubstring(disassembly, "OpFMul %float"),
+            CountSubstring(disassembly, "OpFAdd %float"));
+  ExpectStrictFloatOpsDecorated(disassembly);
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionMixedF16MatrixMatmulUsesF32MulAndAdd) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%half = OpTypeFloat 16
+%float = OpTypeFloat 32
+%operand_type = OpTypeCooperativeMatrixHW %half %uint_2 %uint_2
+%result_type = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%lhs = OpUndef %operand_type
+%rhs = OpUndef %operand_type
+%accumulator = OpUndef %result_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeMatrixMulAddHW %result_type %lhs %rhs %accumulator
+OpReturn
+OpFunctionEnd
+)";
+
+  for (const auto mode :
+       {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+        HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, mode);
+    ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+    EXPECT_GT(CountSubstring(disassembly, "OpFConvert %float"), 0u);
+    EXPECT_GT(CountSubstring(disassembly, "OpFMul %float"), 0u);
+    EXPECT_EQ(CountSubstring(disassembly, "OpFMul %float"),
+              CountSubstring(disassembly, "OpFAdd %float"));
+    ExpectStrictFloatOpsDecorated(disassembly);
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionLargeVectorMatmulUsesStrictStructuredLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_65 = OpConstant %uint 65
+%float = OpTypeFloat 32
+%vector_type = OpTypeCooperativeVectorHW %float %uint_65
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_65 %uint_65
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 2u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
+  ExpectStrictFloatOpsDecorated(disassembly);
+}
+
+TEST_F(HwLowerToStandardTest,
+       ExplicitFPFastMathNoneDoesNotContaminateRelaxedMatmul) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability FloatControls2
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_float_controls2"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionModeId %main FPFastMathDefault %float %uint_default
+OpDecorate %explicit_none FPFastMathMode None
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%uint_default = OpConstant %uint 32
+%float = OpTypeFloat 32
+%vector_type = OpTypeCooperativeVectorHW %float %uint_4
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%explicit_none = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+%inherited_default = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  const size_t fma_count = CountSubstring(disassembly, " Fma ");
+  const size_t explicit_none_count =
+      CountSubstring(disassembly, "FPFastMathMode None");
+  EXPECT_GT(fma_count, 0u);
+  EXPECT_GT(explicit_none_count, 0u);
+  EXPECT_LT(explicit_none_count, fma_count);
+}
+
+TEST_F(HwLowerToStandardTest,
+       ContractionOffSharedFunctionIsStrictAndRelaxedCallerStaysFused) {
+  const std::string text = R"(
+OpCapability Addresses
+OpCapability Kernel
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Physical64 OpenCL
+OpEntryPoint Kernel %strict_main "strict_main"
+OpEntryPoint Kernel %relaxed_main "relaxed_main"
+OpExecutionMode %strict_main LocalSize 1 1 1
+OpExecutionMode %strict_main ContractionOff
+OpExecutionMode %relaxed_main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%float = OpTypeFloat 32
+%vector_type = OpTypeCooperativeVectorHW %float %uint_4
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%shared = OpFunction %void None %fn
+%shared_entry = OpLabel
+%shared_result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+%strict_main = OpFunction %void None %fn
+%strict_entry = OpLabel
+%strict_call = OpFunctionCall %void %shared
+OpReturn
+OpFunctionEnd
+%relaxed_main = OpFunction %void None %fn
+%relaxed_entry = OpLabel
+%relaxed_call = OpFunctionCall %void %shared
+%relaxed_result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFMul %float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "OpFAdd %float"), 0u);
+  EXPECT_GT(CountSubstring(disassembly, " Fma "), 0u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "NoContraction"));
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionLargeMatrixMatmulUsesStrictStructuredLoop) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_15 = OpConstant %uint 15
+%uint_17 = OpConstant %uint 17
+%float = OpTypeFloat 32
+%lhs_type = OpTypeCooperativeMatrixHW %float %uint_17 %uint_15
+%rhs_type = OpTypeCooperativeMatrixHW %float %uint_15 %uint_17
+%result_type = OpTypeCooperativeMatrixHW %float %uint_17 %uint_17
+%lhs = OpUndef %lhs_type
+%rhs = OpUndef %rhs_type
+%accumulator = OpUndef %result_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeMatrixMulAddHW %result_type %lhs %rhs %accumulator
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GE(CountSubstring(disassembly, "OpLoopMerge"), 2u);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %float"));
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %float"));
+  ExpectStrictFloatOpsDecorated(disassembly);
+}
+
+TEST_F(HwLowerToStandardTest,
+       IntegerNoContractionVectorMatmulLowersWithExactArithmetic) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%int = OpTypeInt 32 1
+%vector_type = OpTypeCooperativeVectorHW %int %uint_2
+%matrix_type = OpTypeCooperativeMatrixHW %int %uint_2 %uint_2
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpIMul %int"), 0u);
+  EXPECT_EQ(CountSubstring(disassembly, "OpIMul %int"),
+            CountSubstring(disassembly, "OpIAdd %int"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+}
+
+TEST_F(HwLowerToStandardTest,
+       NoContractionSharedFunctionSupportsDifferentRoundingModes) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability RoundingModeRTE
+OpCapability RoundingModeRTZ
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_float_controls"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main_rte "main_rte"
+OpEntryPoint GLCompute %main_rtz "main_rtz"
+OpExecutionMode %main_rte LocalSize 1 1 1
+OpExecutionMode %main_rte RoundingModeRTE 32
+OpExecutionMode %main_rtz LocalSize 1 1 1
+OpExecutionMode %main_rtz RoundingModeRTZ 32
+OpDecorate %shared_result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%float = OpTypeFloat 32
+%vector_type = OpTypeCooperativeVectorHW %float %uint_2
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%shared = OpFunction %void None %fn
+%shared_entry = OpLabel
+%shared_result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+%main_rte = OpFunction %void None %fn
+%rte_entry = OpLabel
+%rte_call = OpFunctionCall %void %shared
+OpReturn
+OpFunctionEnd
+%main_rtz = OpFunction %void None %fn
+%rtz_entry = OpLabel
+%rtz_call = OpFunctionCall %void %shared
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_NE(disassembly.find("RoundingModeRTE 32"), std::string::npos);
+  EXPECT_NE(disassembly.find("RoundingModeRTZ 32"), std::string::npos);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  ExpectStrictFloatOpsDecorated(disassembly);
+}
+
+TEST_F(HwLowerToStandardTest, NoContractionPreservesFloatControlContracts) {
+  struct FloatControl {
+    const char* capability;
+    const char* mode;
+  };
+  const FloatControl controls[] = {
+      {"DenormPreserve", "DenormPreserve"},
+      {"DenormFlushToZero", "DenormFlushToZero"},
+      {"SignedZeroInfNanPreserve", "SignedZeroInfNanPreserve"},
+  };
+
+  for (const FloatControl& control : controls) {
+    SCOPED_TRACE(control.mode);
+    std::ostringstream text;
+    text << "OpCapability Shader\nOpCapability " << control.capability << R"(
+OpCapability CooperativeVectorHW
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_KHR_float_controls"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+)"
+         << "OpExecutionMode %main " << control.mode << R"( 32
+OpDecorate %result NoContraction
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%float = OpTypeFloat 32
+%vector_type = OpTypeCooperativeVectorHW %float %uint_2
+%matrix_type = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%input = OpUndef %vector_type
+%matrix = OpUndef %matrix_type
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeVectorMatrixMulHW %vector_type %input %matrix
+OpReturn
+OpFunctionEnd
+)";
+
+    const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text.str(), true, true);
+    ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_NE(disassembly.find(std::string(control.mode) + " 32"),
+              std::string::npos);
+    EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+    ExpectStrictFloatOpsDecorated(disassembly);
+  }
 }
 
 }  // namespace

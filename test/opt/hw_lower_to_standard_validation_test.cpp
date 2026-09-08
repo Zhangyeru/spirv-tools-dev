@@ -18,6 +18,15 @@ namespace spvtools {
 namespace opt {
 namespace {
 
+void ExpectStrictNoContractionMatmul(const std::string& disassembly) {
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));
+  EXPECT_GT(CountSubstring(disassembly, "OpFMul "), 0u);
+  EXPECT_EQ(CountSubstring(disassembly, "OpFMul "),
+            CountSubstring(disassembly, "OpFAdd "));
+  EXPECT_GT(CountSubstring(disassembly, "NoContraction"), 0u);
+}
+
 TEST_F(HwLowerToStandardTest, NonHwModuleIsUnchanged) {
   const std::string text = R"(
 ; CHECK: OpCapability Shader
@@ -783,9 +792,8 @@ OpFunctionEnd
       HwLowerToStandardPass::CompletenessMode::kExtensionFree);
 }
 
-TEST_F(HwLowerToStandardTest, RejectsNoContractionMatrixMatmul) {
+TEST_F(HwLowerToStandardTest, LowersNoContractionMatrixMatmul) {
   const std::string text = R"(
-; CHECK: NoContraction HW cooperative matrix multiply cannot be lowered
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -809,12 +817,14 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectStrictNoContractionMatmul(std::get<0>(result));
 }
 
-TEST_F(HwLowerToStandardTest, RejectsNoContractionVectorMatmul) {
+TEST_F(HwLowerToStandardTest, LowersNoContractionVectorMatmul) {
   const std::string text = R"(
-; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpCapability CooperativeVectorHW
@@ -839,12 +849,14 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectStrictNoContractionMatmul(std::get<0>(result));
 }
 
-TEST_F(HwLowerToStandardTest, RejectsGroupedNoContractionVectorMatmul) {
+TEST_F(HwLowerToStandardTest, LowersGroupedNoContractionVectorMatmul) {
   const std::string text = R"(
-; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpCapability CooperativeVectorHW
@@ -871,12 +883,14 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectStrictNoContractionMatmul(std::get<0>(result));
 }
 
-TEST_F(HwLowerToStandardTest, RejectsNoContractionVectorMatmulAdd) {
+TEST_F(HwLowerToStandardTest, LowersNoContractionVectorMatmulAdd) {
   const std::string text = R"(
-; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpCapability CooperativeVectorHW
@@ -902,13 +916,15 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  ExpectStrictNoContractionMatmul(std::get<0>(result));
 }
 
 TEST_F(HwLowerToStandardTest,
-       RejectsNoContractionBeforeTwoLayerVectorMatmulFusion) {
+       LowersNoContractionWithoutTwoLayerVectorMatmulFusion) {
   const std::string text = R"(
-; CHECK: NoContraction HW cooperative vector matrix multiply cannot be lowered
 OpCapability Shader
 OpCapability Float16
 OpCapability CooperativeMatrixHW
@@ -941,7 +957,13 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(text);
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_GT(CountSubstring(disassembly, "OpFMul "), 0u);
+  EXPECT_GT(CountSubstring(disassembly, "NoContraction"), 0u);
 }
 
 TEST_F(HwLowerToStandardTest, RejectsSpecConstantCooperativeShape) {

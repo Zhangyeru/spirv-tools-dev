@@ -153,6 +153,8 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   bool IsIgnorableUser(const Instruction* inst) const;
   bool HasFPFastMathDefault() const;
   bool Has16BitRoundingMode() const;
+  void RecordContractionOffFunctions();
+  bool FunctionHasContractionOff(const Instruction* inst) const;
 
   uint32_t GetOrCreateGLSLStd450Import();
   uint32_t GetOrCreateVectorType(uint32_t component_type_id,
@@ -200,6 +202,7 @@ class HwFuseTwoLayerVectorMatmulPass : public Pass {
   void ReportError(const Instruction* inst, const char* message) const;
 
   uint64_t max_unrolled_matmul_macs_ = 4096;
+  std::unordered_set<uint32_t> contraction_off_function_ids_;
 };
 
 }  // namespace opt

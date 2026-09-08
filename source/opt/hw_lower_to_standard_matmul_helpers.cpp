@@ -1646,7 +1646,10 @@ std::string HwLowerToStandardPass::VectorMatmulPatternFunctionKey(
     append_vector(*bias);
   }
   key += "|fm:";
-  key += std::to_string(active_fp_fast_math_mode_);
+  key += std::to_string(active_arithmetic_contract_.fp_fast_math_mode);
+  key += "|fme:";
+  key += active_arithmetic_contract_.has_explicit_fp_fast_math_mode ? "1"
+                                                                    : "0";
   return key;
 }
 
@@ -1678,7 +1681,10 @@ std::string HwLowerToStandardPass::MatmulPatternFunctionKey(
   key += '|';
   append_matrix(c);
   key += "|fm:";
-  key += std::to_string(active_fp_fast_math_mode_);
+  key += std::to_string(active_arithmetic_contract_.fp_fast_math_mode);
+  key += "|fme:";
+  key += active_arithmetic_contract_.has_explicit_fp_fast_math_mode ? "1"
+                                                                    : "0";
   return key;
 }
 
@@ -1831,10 +1837,25 @@ bool HwLowerToStandardPass::GetExplicitFPFastMathMode(uint32_t result_id,
   return false;
 }
 
-uint32_t HwLowerToStandardPass::GetFPFastMathMode(uint32_t result_id) const {
-  uint32_t mode = 0;
-  GetExplicitFPFastMathMode(result_id, &mode);
-  return mode;
+HwLowerToStandardPass::ArithmeticContract
+HwLowerToStandardPass::GetArithmeticContract(const Instruction* inst) const {
+  ArithmeticContract contract;
+  if (!inst) return contract;
+
+  contract.has_explicit_fp_fast_math_mode =
+      GetExplicitFPFastMathMode(inst->result_id(), &contract.fp_fast_math_mode);
+  contract.propagate_no_contraction =
+      inst->result_id() != 0 &&
+      context()->get_decoration_mgr()->HasDecoration(
+          inst->result_id(), spv::Decoration::NoContraction);
+
+  const BasicBlock* block =
+      context()->get_instr_block(const_cast<Instruction*>(inst));
+  const Function* function = block ? block->GetParent() : nullptr;
+  contract.strict_matmul =
+      contract.propagate_no_contraction ||
+      (function && contraction_off_function_ids_.count(function->result_id()));
+  return contract;
 }
 
 void HwLowerToStandardPass::ApplyFPFastMathMode(Instruction* inst,
@@ -1851,18 +1872,27 @@ void HwLowerToStandardPass::ApplyFPFastMathMode(Instruction* inst,
 }
 
 void HwLowerToStandardPass::ApplyActiveFPFastMathMode(Instruction* inst) {
-  ApplyFPFastMathMode(inst, active_fp_fast_math_mode_);
+  ApplyFPFastMathMode(
+      inst, active_arithmetic_contract_.fp_fast_math_mode,
+      active_arithmetic_contract_.has_explicit_fp_fast_math_mode);
+}
+
+void HwLowerToStandardPass::ApplyActiveNoContraction(Instruction* inst) {
+  if (!inst || inst->result_id() == 0 ||
+      !active_arithmetic_contract_.propagate_no_contraction) {
+    return;
+  }
+  context()->get_decoration_mgr()->AddDecoration(
+      inst->result_id(), uint32_t(spv::Decoration::NoContraction));
 }
 
 bool HwLowerToStandardPass::MatmulAllowsReassociation(
     const Instruction* inst) const {
   if (!inst || inst->result_id() == 0) return false;
 
+  if (GetArithmeticContract(inst).strict_matmul) return false;
+
   const auto* decoration_mgr = context()->get_decoration_mgr();
-  if (decoration_mgr->HasDecoration(inst->result_id(),
-                                    spv::Decoration::NoContraction)) {
-    return false;
-  }
 
   bool has_explicit_mode = false;
   uint32_t mode = 0;
@@ -1926,6 +1956,16 @@ void HwLowerToStandardPass::RemoveFPFastMathMode(uint32_t result_id) {
         return decoration.NumInOperands() >= 2 &&
                decoration.GetSingleWordInOperand(1) ==
                    uint32_t(spv::Decoration::FPFastMathMode);
+      });
+}
+
+void HwLowerToStandardPass::RemoveNoContraction(uint32_t result_id) {
+  if (result_id == 0) return;
+  context()->get_decoration_mgr()->RemoveDecorationsFrom(
+      result_id, [](const Instruction& decoration) {
+        return decoration.NumInOperands() >= 2 &&
+               decoration.GetSingleWordInOperand(1) ==
+                   uint32_t(spv::Decoration::NoContraction);
       });
 }
 

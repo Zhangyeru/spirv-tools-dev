@@ -8566,7 +8566,7 @@ TEST_F(ValidateMemory, CoopVecHWMatMulSuccess) {
   EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
-TEST_F(ValidateMemory, CoopVecHWMatMulRejectsDirectNoContraction) {
+TEST_F(ValidateMemory, CoopVecHWMatMulAllowsDirectNoContraction) {
   const std::string spirv = GenCoopVecHWShader(
       R"(
 %result = OpCooperativeVectorMatrixMulHW %result_vec %input %mat
@@ -8576,14 +8576,10 @@ OpDecorate %result NoContraction
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(
-      getDiagnosticString(),
-      HasSubstr("NoContraction decoration must not be applied to the result of "
-                "CooperativeVectorMatrixMulHW"));
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
-TEST_F(ValidateMemory, CoopVecHWMatMulAddRejectsDirectNoContraction) {
+TEST_F(ValidateMemory, CoopVecHWMatMulAddAllowsDirectNoContraction) {
   const std::string spirv = GenCoopVecHWShader(
       R"(
 %result = OpCooperativeVectorMatrixMulAddHW %result_vec %input %mat %bias
@@ -8593,14 +8589,10 @@ OpDecorate %result NoContraction
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(
-      getDiagnosticString(),
-      HasSubstr("NoContraction decoration must not be applied to the result of "
-                "CooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
-TEST_F(ValidateMemory, CoopVecHWMatMulRejectsGroupedNoContraction) {
+TEST_F(ValidateMemory, CoopVecHWMatMulAllowsGroupedNoContraction) {
   const std::string spirv = GenCoopVecHWShader(
       R"(
 %result = OpCooperativeVectorMatrixMulHW %result_vec %input %mat
@@ -8612,14 +8604,10 @@ OpGroupDecorate %decorations %result
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(
-      getDiagnosticString(),
-      HasSubstr("NoContraction decoration must not be applied to the result of "
-                "CooperativeVectorMatrixMulHW"));
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
-TEST_F(ValidateMemory, CoopVecHWMatMulAddRejectsGroupedNoContraction) {
+TEST_F(ValidateMemory, CoopVecHWMatMulAddAllowsGroupedNoContraction) {
   const std::string spirv = GenCoopVecHWShader(
       R"(
 %result = OpCooperativeVectorMatrixMulAddHW %result_vec %input %mat %bias
@@ -8631,11 +8619,7 @@ OpGroupDecorate %decorations %result
 )");
 
   CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
-  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
-  EXPECT_THAT(
-      getDiagnosticString(),
-      HasSubstr("NoContraction decoration must not be applied to the result of "
-                "CooperativeVectorMatrixMulAddHW"));
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
 }
 
 TEST_F(ValidateMemory, CoopVecHWMatMulResultColumnMismatchFail) {

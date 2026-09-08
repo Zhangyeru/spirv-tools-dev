@@ -132,6 +132,13 @@ class HwLowerToStandardPass : public Pass {
     std::vector<Operand> memory_operands;
   };
 
+  struct ArithmeticContract {
+    uint32_t fp_fast_math_mode = 0;
+    bool has_explicit_fp_fast_math_mode = false;
+    bool strict_matmul = false;
+    bool propagate_no_contraction = false;
+  };
+
   enum class ElementwiseLoopKind {
     kConversion,
     kArithmetic,
@@ -145,7 +152,7 @@ class HwLowerToStandardPass : public Pass {
   bool MaterializeLoweredTypes();
   bool PreflightExtensionFreeMode() const;
   bool PreflightReplicatedComposites() const;
-  bool PreflightNoContractionVectorMatmul() const;
+  void RecordContractionOffFunctions();
   void RecordOriginalHwValueTypes();
   bool EliminateHwFunctionVariables();
   bool LegalizeModule();
@@ -695,12 +702,14 @@ class HwLowerToStandardPass : public Pass {
   uint32_t PackedLane(uint32_t scalar_index) const;
   uint32_t GetOrCreateGLSLStd450Import();
   bool GetExplicitFPFastMathMode(uint32_t result_id, uint32_t* mode) const;
-  uint32_t GetFPFastMathMode(uint32_t result_id) const;
+  ArithmeticContract GetArithmeticContract(const Instruction* inst) const;
   void ApplyFPFastMathMode(Instruction* inst, uint32_t mode,
                            bool preserve_none = false);
   void ApplyActiveFPFastMathMode(Instruction* inst);
+  void ApplyActiveNoContraction(Instruction* inst);
   bool MatmulAllowsReassociation(const Instruction* inst) const;
   void RemoveFPFastMathMode(uint32_t result_id);
+  void RemoveNoContraction(uint32_t result_id);
 
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const MatrixTypeInfo* GetMatrixTypeForValue(const Instruction* value) const;
@@ -754,6 +763,7 @@ class HwLowerToStandardPass : public Pass {
   std::unordered_set<uint32_t> generated_function_ids_;
   std::unordered_set<uint32_t> read_only_generated_function_ids_;
   std::unordered_set<uint32_t> loop_carried_packed_memory_roots_;
+  std::unordered_set<uint32_t> contraction_off_function_ids_;
   std::vector<std::pair<uint32_t, uint32_t>> pending_fp_fast_math_modes_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec2;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
@@ -761,7 +771,7 @@ class HwLowerToStandardPass : public Pass {
   uint64_t max_matmul_macs_ = 16777216;
   uint32_t max_unrolled_elements_ = 4096;
   uint64_t max_unrolled_matmul_macs_ = 4096;
-  uint32_t active_fp_fast_math_mode_ = 0;
+  ArithmeticContract active_arithmetic_contract_;
 };
 
 }  // namespace opt

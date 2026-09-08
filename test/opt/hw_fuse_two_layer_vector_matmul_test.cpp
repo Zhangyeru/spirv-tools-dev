@@ -694,6 +694,26 @@ TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsNoContractionOnSecondLayer) {
   EXPECT_EQ(1u, CountSubstring(disassembly, "NoContraction"));
 }
 
+TEST_F(HwFuseTwoLayerVectorMatmulTest, RejectsContractionOffCallTree) {
+  std::string text = MakePureMulChain(18, 7, /*use_float16=*/false);
+  ASSERT_TRUE(ReplaceOnce(&text, "OpCapability Shader\n",
+                          "OpCapability Addresses\nOpCapability Kernel\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpMemoryModel Logical GLSL450\n",
+                          "OpMemoryModel Physical64 OpenCL\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpEntryPoint GLCompute %main \"main\"\n",
+                          "OpEntryPoint Kernel %main \"main\"\n"));
+  ASSERT_TRUE(ReplaceOnce(&text, "OpExecutionMode %main LocalSize 1 1 1\n",
+                          "OpExecutionMode %main LocalSize 1 1 1\n"
+                          "OpExecutionMode %main ContractionOff\n"));
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(text, true,
+                                                                  true);
+  const std::string& disassembly = std::get<0>(result);
+  EXPECT_EQ(Pass::Status::SuccessWithoutChange, std::get<1>(result));
+  EXPECT_EQ(2u, CountSubstring(disassembly, "OpCooperativeVectorMatrixMulHW"));
+}
+
 TEST_F(HwFuseTwoLayerVectorMatmulTest, FusesSingleHiddenLaneFinalSplit) {
   auto result = SinglePassRunAndDisassemble<HwFuseTwoLayerVectorMatmulPass>(
       MakePureMulChain(17, 7), true, true);

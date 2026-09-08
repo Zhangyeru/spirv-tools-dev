@@ -105,25 +105,6 @@ bool HwLowerToStandardPass::PreflightReplicatedComposites() const {
   return ok;
 }
 
-bool HwLowerToStandardPass::PreflightNoContractionVectorMatmul() const {
-  bool ok = true;
-  get_module()->ForEachInst([this, &ok](Instruction* inst) {
-    if (!ok || (inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulHW &&
-                inst->opcode() != spv::Op::OpCooperativeVectorMatrixMulAddHW)) {
-      return;
-    }
-
-    if (context()->get_decoration_mgr()->HasDecoration(
-            inst->result_id(), spv::Decoration::NoContraction)) {
-      ReportError(inst,
-                  "NoContraction HW cooperative vector matrix multiply "
-                  "cannot be lowered");
-      ok = false;
-    }
-  });
-  return ok;
-}
-
 bool HwLowerToStandardPass::ValidateCompositeIndices(
     const Instruction* inst, uint32_t composite_in_operand,
     uint32_t first_index_in_operand) const {
@@ -981,14 +962,6 @@ bool HwLowerToStandardPass::LegalizeModule() {
     }
 
     if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
-      if (context()->get_decoration_mgr()->HasDecoration(
-              inst->result_id(), spv::Decoration::NoContraction)) {
-        ReportError(inst,
-                    "NoContraction HW cooperative matrix multiply cannot be "
-                    "lowered");
-        ok = false;
-        return;
-      }
       const MatrixTypeInfo* result = GetMatrixType(inst->type_id());
       const MatrixTypeInfo* a = nullptr;
       const MatrixTypeInfo* b = nullptr;

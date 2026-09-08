@@ -25,6 +25,7 @@
 #include "source/opt/decoration_manager.h"
 #include "source/opt/def_use_manager.h"
 #include "source/opt/feature_manager.h"
+#include "source/opt/function.h"
 #include "source/opt/instruction.h"
 #include "source/opt/ir_builder.h"
 #include "source/opt/ir_context.h"
@@ -56,6 +57,9 @@ Operand IdOperand(uint32_t id) { return {SPV_OPERAND_TYPE_ID, {id}}; }
 
 Pass::Status HwFuseTwoLayerVectorMatmulPass::Process() {
   if (max_unrolled_matmul_macs_ == 0) return Status::SuccessWithoutChange;
+
+  contraction_off_function_ids_.clear();
+  RecordContractionOffFunctions();
 
   // Collect first.  A successful rewrite kills instructions in the same basic
   // block, so mutating while Module::ForEachInst is walking the list is unsafe.
@@ -89,6 +93,7 @@ Pass::Status HwFuseTwoLayerVectorMatmulPass::Process() {
 bool HwFuseTwoLayerVectorMatmulPass::MatchSecondLayer(Instruction* second,
                                                       Match* match) const {
   if (!second || !match || !IsVectorMatrixMul(second)) return false;
+  if (FunctionHasContractionOff(second)) return false;
   const uint32_t expected_operands = IsVectorMatrixMulAdd(second) ? 3u : 2u;
   if (second->NumInOperands() != expected_operands) return false;
   if (context()->get_decoration_mgr()->HasDecoration(
@@ -1326,6 +1331,30 @@ bool HwFuseTwoLayerVectorMatmulPass::IsIgnorableUser(
     const Instruction* inst) const {
   return inst && (spvOpcodeIsDebug(inst->opcode()) || inst->IsDecoration() ||
                   inst->IsNonSemanticInstruction() || inst->IsDebugLineInst());
+}
+
+void HwFuseTwoLayerVectorMatmulPass::RecordContractionOffFunctions() {
+  for (const Instruction& execution_mode : get_module()->execution_modes()) {
+    if (execution_mode.opcode() != spv::Op::OpExecutionMode ||
+        execution_mode.NumInOperands() < 2 ||
+        execution_mode.GetSingleWordInOperand(1) !=
+            uint32_t(spv::ExecutionMode::ContractionOff)) {
+      continue;
+    }
+    context()->CollectCallTreeFromRoots(
+        execution_mode.GetSingleWordInOperand(0),
+        &contraction_off_function_ids_);
+  }
+}
+
+bool HwFuseTwoLayerVectorMatmulPass::FunctionHasContractionOff(
+    const Instruction* inst) const {
+  if (!inst) return false;
+  BasicBlock* block =
+      context()->get_instr_block(const_cast<Instruction*>(inst));
+  Function* function = block ? block->GetParent() : nullptr;
+  return function &&
+         contraction_off_function_ids_.count(function->result_id()) != 0;
 }
 
 bool HwFuseTwoLayerVectorMatmulPass::HasFPFastMathDefault() const {
