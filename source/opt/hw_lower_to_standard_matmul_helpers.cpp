@@ -46,10 +46,9 @@ using namespace hw_lower_internal;
 
 bool HwLowerToStandardPass::PrepareMatmulPatternFunctions() {
   // Validation only — pattern functions are created lazily via
-  // GetOrCreateMatmulPatternFunctionPackedVec2 when needed (by the direct
-  // matmul path or the non-fused store path).  This avoids generating dead
-  // pattern functions for matmuls that will be handled by the fused
-  // matrix-matmul-store path in LowerHwInstructions.
+  // GetOrCreateMatmulPatternFunctionPackedVec2 when needed by the direct or
+  // generic packed matmul paths. This avoids generating dead pattern
+  // functions for matmuls handled by another lowering path.
   std::vector<Instruction*> matmul_insts;
   get_module()->ForEachInst([&matmul_insts](Instruction* inst) {
     if (inst->opcode() == spv::Op::OpCooperativeMatrixMulAddHW) {
@@ -1884,69 +1883,6 @@ void HwLowerToStandardPass::ApplyActiveNoContraction(Instruction* inst) {
   }
   context()->get_decoration_mgr()->AddDecoration(
       inst->result_id(), uint32_t(spv::Decoration::NoContraction));
-}
-
-bool HwLowerToStandardPass::MatmulAllowsReassociation(
-    const Instruction* inst) const {
-  if (!inst || inst->result_id() == 0) return false;
-
-  if (GetArithmeticContract(inst).strict_matmul) return false;
-
-  const auto* decoration_mgr = context()->get_decoration_mgr();
-
-  bool has_explicit_mode = false;
-  uint32_t mode = 0;
-  for (const Instruction* decoration : decoration_mgr->GetDecorationsFor(
-           inst->result_id(), /*include_linkage=*/false)) {
-    if (decoration && decoration->NumInOperands() >= 3 &&
-        decoration->GetSingleWordInOperand(1) ==
-            uint32_t(spv::Decoration::FPFastMathMode)) {
-      has_explicit_mode = true;
-      mode = decoration->GetSingleWordInOperand(2);
-      break;
-    }
-  }
-
-  const uint32_t reassociation_modes =
-      uint32_t(spv::FPFastMathModeMask::AllowReassoc) |
-      uint32_t(spv::FPFastMathModeMask::Fast);
-  if (has_explicit_mode) return (mode & reassociation_modes) != 0;
-
-  uint32_t component_type_id = 0;
-  if (const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id())) {
-    component_type_id = matrix->component_type_id;
-  } else if (const VectorTypeInfo* vector = GetVectorType(inst->type_id())) {
-    component_type_id = vector->component_type_id;
-  }
-
-  std::unordered_set<uint32_t> default_entry_points;
-  std::unordered_set<uint32_t> reassoc_entry_points;
-  for (const Instruction& execution_mode : get_module()->execution_modes()) {
-    if (execution_mode.opcode() != spv::Op::OpExecutionModeId ||
-        execution_mode.NumInOperands() < 4 ||
-        execution_mode.GetSingleWordInOperand(1) !=
-            uint32_t(spv::ExecutionMode::FPFastMathDefault)) {
-      continue;
-    }
-    const uint32_t entry_point_id = execution_mode.GetSingleWordInOperand(0);
-    default_entry_points.insert(entry_point_id);
-    if (execution_mode.GetSingleWordInOperand(2) != component_type_id) continue;
-
-    uint32_t default_mode = 0;
-    if (!GetConstantU32(execution_mode.GetSingleWordInOperand(3),
-                        &default_mode) ||
-        (default_mode & uint32_t(spv::FPFastMathModeMask::AllowReassoc)) == 0) {
-      return false;
-    }
-    reassoc_entry_points.insert(entry_point_id);
-  }
-  for (uint32_t entry_point_id : default_entry_points) {
-    if (reassoc_entry_points.count(entry_point_id) == 0) return false;
-  }
-
-  // With no explicit per-instruction or module default, this pass deliberately
-  // uses its relaxed matmul contract and permits K-direction reassociation.
-  return true;
 }
 
 void HwLowerToStandardPass::RemoveFPFastMathMode(uint32_t result_id) {

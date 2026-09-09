@@ -63,8 +63,6 @@ constexpr uint32_t kDefaultMatrixTileM = 2;
 constexpr uint32_t kDefaultMatrixTileN = 2;
 constexpr uint32_t kDefaultVectorMatmulTileN = 2;
 constexpr uint32_t kPackedVec2Width = 2;
-// Preserve the previous 16-scalar constant-bias fusion limit.
-constexpr uint32_t kMaxFusedConstantBiasPacks = 8;
 constexpr uint32_t kMaxCompositeConstituents = 65532;
 
 inline Operand IdOperand(uint32_t id) { return {SPV_OPERAND_TYPE_ID, {id}}; }
