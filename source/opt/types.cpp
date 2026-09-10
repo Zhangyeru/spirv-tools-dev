@@ -132,7 +132,9 @@ std::unique_ptr<Type> Type::Clone() const {
     DeclareKindCase(AccelerationStructureNV);
     DeclareKindCase(CooperativeMatrixNV);
     DeclareKindCase(CooperativeMatrixKHR);
+    DeclareKindCase(CooperativeMatrixHW);
     DeclareKindCase(CooperativeVectorNV);
+    DeclareKindCase(CooperativeVectorHW);
     DeclareKindCase(RayQueryKHR);
     DeclareKindCase(HitObjectNV);
 #undef DeclareKindCase
@@ -182,7 +184,9 @@ bool Type::operator==(const Type& other) const {
     DeclareKindCase(AccelerationStructureNV);
     DeclareKindCase(CooperativeMatrixNV);
     DeclareKindCase(CooperativeMatrixKHR);
+    DeclareKindCase(CooperativeMatrixHW);
     DeclareKindCase(CooperativeVectorNV);
+    DeclareKindCase(CooperativeVectorHW);
     DeclareKindCase(RayQueryKHR);
     DeclareKindCase(HitObjectNV);
     DeclareKindCase(TensorLayoutNV);
@@ -242,7 +246,9 @@ size_t Type::ComputeHashValue(size_t hash, SeenTypes* seen) const {
     DeclareKindCase(AccelerationStructureNV);
     DeclareKindCase(CooperativeMatrixNV);
     DeclareKindCase(CooperativeMatrixKHR);
+    DeclareKindCase(CooperativeMatrixHW);
     DeclareKindCase(CooperativeVectorNV);
+    DeclareKindCase(CooperativeVectorHW);
     DeclareKindCase(RayQueryKHR);
     DeclareKindCase(HitObjectNV);
     DeclareKindCase(TensorLayoutNV);
@@ -791,6 +797,45 @@ bool CooperativeMatrixKHR::IsSameImpl(const Type* that,
          HasSameDecorations(that);
 }
 
+CooperativeMatrixHW::CooperativeMatrixHW(const Type* type, uint32_t rows,
+                                         uint32_t columns, bool has_use,
+                                         uint32_t use)
+    : Type(kCooperativeMatrixHW),
+      component_type_(type),
+      rows_id_(rows),
+      columns_id_(columns),
+      has_use_(has_use),
+      use_(use) {
+  assert(type != nullptr);
+  assert(rows != 0);
+  assert(columns != 0);
+}
+
+std::string CooperativeMatrixHW::str() const {
+  std::ostringstream oss;
+  oss << "<" << component_type_->str() << ", " << rows_id_ << ", "
+      << columns_id_;
+  if (has_use_) oss << ", " << use_;
+  oss << ">";
+  return oss.str();
+}
+
+size_t CooperativeMatrixHW::ComputeExtraStateHash(size_t hash,
+                                                  SeenTypes* seen) const {
+  hash = hash_combine(hash, rows_id_, columns_id_, has_use_, use_);
+  return component_type_->ComputeHashValue(hash, seen);
+}
+
+bool CooperativeMatrixHW::IsSameImpl(const Type* that,
+                                     IsSameCache* seen) const {
+  const CooperativeMatrixHW* matrix = that->AsCooperativeMatrixHW();
+  if (!matrix) return false;
+  return component_type_->IsSameImpl(matrix->component_type_, seen) &&
+         rows_id_ == matrix->rows_id_ && columns_id_ == matrix->columns_id_ &&
+         has_use_ == matrix->has_use_ && use_ == matrix->use_ &&
+         HasSameDecorations(that);
+}
+
 TensorLayoutNV::TensorLayoutNV(const uint32_t dim, const uint32_t clamp_mode)
     : Type(kTensorLayoutNV), dim_id_(dim), clamp_mode_id_(clamp_mode) {}
 
@@ -865,6 +910,34 @@ bool CooperativeVectorNV::IsSameImpl(const Type* that,
   if (!mt) return false;
   return component_type_->IsSameImpl(mt->component_type_, seen) &&
          components_ == mt->components_ && HasSameDecorations(that);
+}
+
+CooperativeVectorHW::CooperativeVectorHW(const Type* type, uint32_t components)
+    : Type(kCooperativeVectorHW),
+      component_type_(type),
+      components_(components) {
+  assert(type != nullptr);
+  assert(components != 0);
+}
+
+std::string CooperativeVectorHW::str() const {
+  std::ostringstream oss;
+  oss << "<" << component_type_->str() << ", " << components_ << ">";
+  return oss.str();
+}
+
+size_t CooperativeVectorHW::ComputeExtraStateHash(size_t hash,
+                                                  SeenTypes* seen) const {
+  hash = hash_combine(hash, components_);
+  return component_type_->ComputeHashValue(hash, seen);
+}
+
+bool CooperativeVectorHW::IsSameImpl(const Type* that,
+                                     IsSameCache* seen) const {
+  const CooperativeVectorHW* vector = that->AsCooperativeVectorHW();
+  if (!vector) return false;
+  return component_type_->IsSameImpl(vector->component_type_, seen) &&
+         components_ == vector->components_ && HasSameDecorations(that);
 }
 
 }  // namespace analysis

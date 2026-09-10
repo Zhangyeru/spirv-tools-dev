@@ -1126,8 +1126,9 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       uint64_t reduce_value = 0;
       if (!reduce_mask || !_.IsIntScalarType(reduce_mask->type_id()) ||
           !spvOpcodeIsConstant(reduce_mask->opcode()) ||
-          !_.EvalConstantValUint64(reduce_mask_id, &reduce_value) ||
-          reduce_value > 1) {
+          (!spvOpcodeIsSpecConstant(reduce_mask->opcode()) &&
+           (!_.EvalConstantValUint64(reduce_mask_id, &reduce_value) ||
+            reduce_value > 1))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "ReduceMask must be a constant integer in range [0, 1]: "
                << spvOpcodeString(opcode);
@@ -1138,8 +1139,9 @@ spv_result_t ArithmeticsPass(ValidationState_t& _, const Instruction* inst) {
       uint64_t combine_value = 0;
       if (!combine_op || !_.IsIntScalarType(combine_op->type_id()) ||
           !spvOpcodeIsConstant(combine_op->opcode()) ||
-          !_.EvalConstantValUint64(combine_op_id, &combine_value) ||
-          combine_value > 2) {
+          (!spvOpcodeIsSpecConstant(combine_op->opcode()) &&
+           (!_.EvalConstantValUint64(combine_op_id, &combine_value) ||
+            combine_value > 2))) {
         return _.diag(SPV_ERROR_INVALID_DATA, inst)
                << "CombineOp must be a constant integer in range [0, 2]: "
                << spvOpcodeString(opcode);

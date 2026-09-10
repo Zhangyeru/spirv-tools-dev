@@ -449,13 +449,23 @@ uint32_t HwLowerToStandardPass::GetOrCreateUIntConstantAfter(
 uint32_t HwLowerToStandardPass::GetOrCreateUIntTypeAfter(
     Instruction** insert_after) {
   bool can_reuse = true;
+  Instruction* later_uint_type = nullptr;
   for (Instruction& inst : get_module()->types_values()) {
-    if (can_reuse && inst.opcode() == spv::Op::OpTypeInt &&
+    if (inst.opcode() == spv::Op::OpTypeInt &&
         inst.GetSingleWordInOperand(0) == 32 &&
         inst.GetSingleWordInOperand(1) == 0) {
-      return inst.result_id();
+      if (can_reuse) return inst.result_id();
+      later_uint_type = &inst;
+      break;
     }
     if (&inst == *insert_after) can_reuse = false;
+  }
+
+  if (later_uint_type) {
+    Instruction* moved = MoveTypeAfter(later_uint_type, *insert_after);
+    if (!moved) return 0;
+    *insert_after = moved;
+    return moved->result_id();
   }
 
   const uint32_t result_id = TakeNextId();

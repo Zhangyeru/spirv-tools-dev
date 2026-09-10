@@ -174,9 +174,15 @@ std::vector<std::unique_ptr<Type>> GenerateAllTypes() {
   types.emplace_back(new AccelerationStructureNV());
   types.emplace_back(new CooperativeMatrixNV(f32, 24, 24, 24));
   types.emplace_back(new CooperativeMatrixKHR(f32, 8, 8, 8, 1002));
+  types.emplace_back(new CooperativeMatrixHW(f32, 8, 8, false, 0));
+  types.emplace_back(new CooperativeMatrixHW(
+      f32, 8, 8, true, uint32_t(spv::CooperativeMatrixUseHW::MatrixUseAHW)));
+  types.emplace_back(new CooperativeMatrixHW(
+      f32, 8, 8, true, uint32_t(spv::CooperativeMatrixUseHW::MatrixUseBHW)));
   types.emplace_back(new RayQueryKHR());
   types.emplace_back(new HitObjectNV());
   types.emplace_back(new CooperativeVectorNV(f32, 16));
+  types.emplace_back(new CooperativeVectorHW(f32, 8));
 
   // SPV_AMDX_shader_enqueue
   types.emplace_back(new NodePayloadArrayAMDX(sts32f32));
@@ -1102,8 +1108,12 @@ TEST(TypeManager, GetTypeInstructionAllTypes) {
 ; CHECK: OpTypeAccelerationStructureKHR
 ; CHECK: OpTypeCooperativeMatrixNV [[f32]] [[uint24]] [[uint24]] [[uint24]]
 ; CHECK: OpTypeCooperativeMatrixKHR [[f32]] [[uint8]] [[uint8]] [[uint8]] [[uint2]]
+; CHECK: OpTypeCooperativeMatrixHW [[f32]] [[uint8]] [[uint8]]
+; CHECK: OpTypeCooperativeMatrixHW [[f32]] [[uint8]] [[uint8]] MatrixUseAHW
+; CHECK: OpTypeCooperativeMatrixHW [[f32]] [[uint8]] [[uint8]] MatrixUseBHW
 ; CHECK: OpTypeRayQueryKHR
 ; CHECK: OpTypeHitObjectNV
+; CHECK: OpTypeCooperativeVectorHW [[f32]] [[uint8]]
 OpCapability Shader
 OpCapability Int64
 OpCapability Linkage

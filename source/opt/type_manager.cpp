@@ -454,6 +454,25 @@ uint32_t TypeManager::GetTypeInstruction(const Type* type) {
               {SPV_OPERAND_TYPE_ID, {coop_mat->use_id()}}});
       break;
     }
+    case Type::kCooperativeMatrixHW: {
+      auto coop_mat = type->AsCooperativeMatrixHW();
+      const uint32_t component_type =
+          GetTypeInstruction(coop_mat->component_type());
+      if (component_type == 0) return 0;
+      std::vector<Operand> operands = {
+          {SPV_OPERAND_TYPE_ID, {component_type}},
+          {SPV_OPERAND_TYPE_ID, {coop_mat->rows_id()}},
+          {SPV_OPERAND_TYPE_ID, {coop_mat->columns_id()}},
+      };
+      if (coop_mat->has_use()) {
+        operands.push_back(
+            {SPV_OPERAND_TYPE_COOPERATIVE_MATRIX_USE_HW, {coop_mat->use()}});
+      }
+      typeInst =
+          MakeUnique<Instruction>(context(), spv::Op::OpTypeCooperativeMatrixHW,
+                                  0, id, std::move(operands));
+      break;
+    }
     case Type::kTensorLayoutNV: {
       auto tensor_layout = type->AsTensorLayoutNV();
       typeInst = MakeUnique<Instruction>(
@@ -485,6 +504,18 @@ uint32_t TypeManager::GetTypeInstruction(const Type* type) {
       }
       typeInst = MakeUnique<Instruction>(
           context(), spv::Op::OpTypeCooperativeVectorNV, 0, id,
+          std::initializer_list<Operand>{
+              {SPV_OPERAND_TYPE_ID, {component_type}},
+              {SPV_OPERAND_TYPE_ID, {coop_vec->components()}}});
+      break;
+    }
+    case Type::kCooperativeVectorHW: {
+      auto coop_vec = type->AsCooperativeVectorHW();
+      const uint32_t component_type =
+          GetTypeInstruction(coop_vec->component_type());
+      if (component_type == 0) return 0;
+      typeInst = MakeUnique<Instruction>(
+          context(), spv::Op::OpTypeCooperativeVectorHW, 0, id,
           std::initializer_list<Operand>{
               {SPV_OPERAND_TYPE_ID, {component_type}},
               {SPV_OPERAND_TYPE_ID, {coop_vec->components()}}});
@@ -723,6 +754,15 @@ Type* TypeManager::RebuildType(uint32_t type_id, const Type& type) {
           cm_type->use_id());
       break;
     }
+    case Type::kCooperativeMatrixHW: {
+      const CooperativeMatrixHW* cm_type = type.AsCooperativeMatrixHW();
+      const Type* component_type = cm_type->component_type();
+      rebuilt_ty = MakeUnique<CooperativeMatrixHW>(
+          RebuildType(GetId(component_type), *component_type),
+          cm_type->rows_id(), cm_type->columns_id(), cm_type->has_use(),
+          cm_type->use());
+      break;
+    }
     case Type::kTensorLayoutNV: {
       const TensorLayoutNV* tl_type = type.AsTensorLayoutNV();
       rebuilt_ty = MakeUnique<TensorLayoutNV>(tl_type->dim_id(),
@@ -739,6 +779,14 @@ Type* TypeManager::RebuildType(uint32_t type_id, const Type& type) {
       const CooperativeVectorNV* cv_type = type.AsCooperativeVectorNV();
       const Type* component_type = cv_type->component_type();
       rebuilt_ty = MakeUnique<CooperativeVectorNV>(
+          RebuildType(GetId(component_type), *component_type),
+          cv_type->components());
+      break;
+    }
+    case Type::kCooperativeVectorHW: {
+      const CooperativeVectorHW* cv_type = type.AsCooperativeVectorHW();
+      const Type* component_type = cv_type->component_type();
+      rebuilt_ty = MakeUnique<CooperativeVectorHW>(
           RebuildType(GetId(component_type), *component_type),
           cv_type->components());
       break;
@@ -992,8 +1040,19 @@ Type* TypeManager::RecordIfTypeDefinition(const Instruction& inst) {
           inst.GetSingleWordInOperand(1), inst.GetSingleWordInOperand(2),
           inst.GetSingleWordInOperand(3), inst.GetSingleWordInOperand(4));
       break;
+    case spv::Op::OpTypeCooperativeMatrixHW:
+      type = new CooperativeMatrixHW(
+          GetType(inst.GetSingleWordInOperand(0)),
+          inst.GetSingleWordInOperand(1), inst.GetSingleWordInOperand(2),
+          inst.NumInOperands() >= 4,
+          inst.NumInOperands() >= 4 ? inst.GetSingleWordInOperand(3) : 0);
+      break;
     case spv::Op::OpTypeCooperativeVectorNV:
       type = new CooperativeVectorNV(GetType(inst.GetSingleWordInOperand(0)),
+                                     inst.GetSingleWordInOperand(1));
+      break;
+    case spv::Op::OpTypeCooperativeVectorHW:
+      type = new CooperativeVectorHW(GetType(inst.GetSingleWordInOperand(0)),
                                      inst.GetSingleWordInOperand(1));
       break;
     case spv::Op::OpTypeRayQueryKHR:

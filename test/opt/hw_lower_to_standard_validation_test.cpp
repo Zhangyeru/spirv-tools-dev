@@ -81,6 +81,41 @@ OpFunctionEnd
   EXPECT_EQ(1u, CountSubstring(disassembly, "OpTypeArray"));
 }
 
+TEST_F(HwLowerToStandardTest,
+       MovesLaterUintTypeWhenMaterializingFrozenSpecShape) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%int = OpTypeInt 32 1
+%rows = OpConstant %int 5
+%cols = OpConstant %int 7
+%float = OpTypeFloat 32
+%matrix = OpTypeCooperativeMatrixHW %float %rows %cols
+%value = OpUndef %matrix
+%uint = OpTypeInt 32 0
+%v3uint = OpTypeVector %uint 3
+%uint_1 = OpConstant %uint 1
+%workgroup_size = OpConstantComposite %v3uint %uint_1 %uint_1 %uint_1
+%main = OpFunction %void None %fn
+%entry = OpLabel
+OpReturn
+OpFunctionEnd
+)";
+
+  const auto result =
+      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+  const std::string& disassembly = std::get<0>(result);
+  ExpectNoHwOrCoopMatrix(disassembly);
+  EXPECT_EQ(1u, CountSubstring(disassembly, "OpTypeInt 32 0"));
+}
+
 TEST_F(HwLowerToStandardTest, PreservesSharedExtensionForBarrierOps) {
   const std::string text = R"(
 OpCapability Shader

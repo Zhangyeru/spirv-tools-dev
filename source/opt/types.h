@@ -64,7 +64,9 @@ class NamedBarrier;
 class AccelerationStructureNV;
 class CooperativeMatrixNV;
 class CooperativeMatrixKHR;
+class CooperativeMatrixHW;
 class CooperativeVectorNV;
+class CooperativeVectorHW;
 class RayQueryKHR;
 class HitObjectNV;
 class TensorLayoutNV;
@@ -109,7 +111,9 @@ class Type {
     kAccelerationStructureNV,
     kCooperativeMatrixNV,
     kCooperativeMatrixKHR,
+    kCooperativeMatrixHW,
     kCooperativeVectorNV,
+    kCooperativeVectorHW,
     kRayQueryKHR,
     kHitObjectNV,
     kTensorLayoutNV,
@@ -215,7 +219,9 @@ class Type {
   DeclareCastMethod(AccelerationStructureNV)
   DeclareCastMethod(CooperativeMatrixNV)
   DeclareCastMethod(CooperativeMatrixKHR)
+  DeclareCastMethod(CooperativeMatrixHW)
   DeclareCastMethod(CooperativeVectorNV)
+  DeclareCastMethod(CooperativeVectorHW)
   DeclareCastMethod(RayQueryKHR)
   DeclareCastMethod(HitObjectNV)
   DeclareCastMethod(TensorLayoutNV)
@@ -698,6 +704,37 @@ class CooperativeMatrixKHR : public Type {
   const uint32_t use_id_;
 };
 
+class CooperativeMatrixHW : public Type {
+ public:
+  CooperativeMatrixHW(const Type* type, uint32_t rows, uint32_t columns,
+                      bool has_use, uint32_t use);
+  CooperativeMatrixHW(const CooperativeMatrixHW&) = default;
+
+  std::string str() const override;
+
+  CooperativeMatrixHW* AsCooperativeMatrixHW() override { return this; }
+  const CooperativeMatrixHW* AsCooperativeMatrixHW() const override {
+    return this;
+  }
+
+  size_t ComputeExtraStateHash(size_t hash, SeenTypes* seen) const override;
+
+  const Type* component_type() const { return component_type_; }
+  uint32_t rows_id() const { return rows_id_; }
+  uint32_t columns_id() const { return columns_id_; }
+  bool has_use() const { return has_use_; }
+  uint32_t use() const { return use_; }
+
+ private:
+  bool IsSameImpl(const Type* that, IsSameCache*) const override;
+
+  const Type* component_type_;
+  const uint32_t rows_id_;
+  const uint32_t columns_id_;
+  const bool has_use_;
+  const uint32_t use_;
+};
+
 class TensorLayoutNV : public Type {
  public:
   TensorLayoutNV(const uint32_t dim, const uint32_t clamp_mode);
@@ -754,6 +791,30 @@ class CooperativeVectorNV : public Type {
 
   CooperativeVectorNV* AsCooperativeVectorNV() override { return this; }
   const CooperativeVectorNV* AsCooperativeVectorNV() const override {
+    return this;
+  }
+
+  size_t ComputeExtraStateHash(size_t hash, SeenTypes* seen) const override;
+
+  const Type* component_type() const { return component_type_; }
+  uint32_t components() const { return components_; }
+
+ private:
+  bool IsSameImpl(const Type* that, IsSameCache*) const override;
+
+  const Type* component_type_;
+  const uint32_t components_;
+};
+
+class CooperativeVectorHW : public Type {
+ public:
+  CooperativeVectorHW(const Type* type, uint32_t components);
+  CooperativeVectorHW(const CooperativeVectorHW&) = default;
+
+  std::string str() const override;
+
+  CooperativeVectorHW* AsCooperativeVectorHW() override { return this; }
+  const CooperativeVectorHW* AsCooperativeVectorHW() const override {
     return this;
   }
 

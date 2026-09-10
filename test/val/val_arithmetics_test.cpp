@@ -2413,6 +2413,66 @@ TEST_F(ValidateArithmetics, HwCoopMatMulRejectsNarrowingAccumulator) {
               HasSubstr("accumulator component bit width must be at least"));
 }
 
+TEST_F(ValidateArithmetics, HwCoopMatReduceAllowsSpecConstantControls) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %axis SpecId 0
+OpDecorate %operation SpecId 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%axis = OpSpecConstant %uint 0
+%operation = OpSpecConstant %uint 0
+%float = OpTypeFloat 32
+%matrix = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%input = OpUndef %matrix
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeMatrixReduceHW %matrix %input %axis %operation
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateArithmetics, HwCoopMatReduceRejectsOrdinaryControlOutOfRange) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%float = OpTypeFloat 32
+%matrix = OpTypeCooperativeMatrixHW %float %uint_2 %uint_2
+%input = OpUndef %matrix
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%result = OpCooperativeMatrixReduceHW %matrix %input %uint_2 %uint_3
+OpReturn
+OpFunctionEnd
+)";
+
+  CompileSuccessfully(text.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_DATA,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("ReduceMask must be a constant integer in range"));
+}
+
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

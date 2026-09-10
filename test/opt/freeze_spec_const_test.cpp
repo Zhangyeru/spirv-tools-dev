@@ -172,6 +172,42 @@ TEST_F(FreezeSpecConstantValueRemoveDecorationTest,
                                                      /* skip_nop = */ true);
 }
 
+TEST_F(FreezeSpecConstantValueRemoveDecorationTest,
+       FreezeConstantsReferencedByHwCooperativeTypes) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability Linkage
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpDecorate %rows SpecId 0
+OpDecorate %cols SpecId 1
+%int = OpTypeInt 32 1
+%rows = OpSpecConstant %int 5
+%cols = OpSpecConstant %int 7
+%float = OpTypeFloat 32
+%matrix = OpTypeCooperativeMatrixHW %float %rows %cols MatrixUseBHW
+%vector = OpTypeCooperativeVectorHW %float %cols
+)";
+  const std::string expected = R"(OpCapability Shader
+OpCapability Linkage
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+%int = OpTypeInt 32 1
+%int_5 = OpConstant %int 5
+%int_7 = OpConstant %int 7
+%float = OpTypeFloat 32
+%5 = OpTypeCooperativeMatrixHW %float %int_5 %int_7 MatrixUseBHW
+%6 = OpTypeCooperativeVectorHW %float %int_7
+)";
+
+  SinglePassRunAndCheck<FreezeSpecConstantValuePass>(
+      text, expected, /* skip_nop = */ true, /* do_validation = */ true);
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools
