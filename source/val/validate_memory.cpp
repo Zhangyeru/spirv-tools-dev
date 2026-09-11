@@ -76,13 +76,6 @@ bool IsScalarOrVectorNumericArrayType(ValidationState_t& _, uint32_t type_id) {
   return IsScalarOrVectorNumericArrayType(_, element_type_id);
 }
 
-bool IsInt2Type(ValidationState_t& _, uint32_t type_id) {
-  const auto* type = _.FindDef(type_id);
-  return type && type->opcode() == spv::Op::OpTypeVector &&
-         type->word(3) == 2 && _.IsIntScalarType(type->word(2)) &&
-         _.GetBitWidth(type->word(2)) == 32;
-}
-
 spv_result_t ValidateCpAsyncWaitGroupCount(ValidationState_t& _,
                                            const Instruction* inst) {
   const auto count_id = inst->GetOperandAs<uint32_t>(0);
@@ -2147,6 +2140,27 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
     }
   }
 
+  const auto component_type_id = matrix_type->GetOperandAs<uint32_t>(1);
+  const auto component_type = _.FindDef(component_type_id);
+  bool supported_component_type = false;
+  if (component_type) {
+    const auto bit_width = _.GetBitWidth(component_type_id);
+    if (component_type->opcode() == spv::Op::OpTypeFloat) {
+      supported_component_type = bit_width == 16 || bit_width == 32;
+    } else if (component_type->opcode() == spv::Op::OpTypeInt) {
+      const auto signedness = component_type->GetOperandAs<uint32_t>(2);
+      supported_component_type =
+          signedness == 1 &&
+          (bit_width == 8 || bit_width == 16 || bit_width == 32);
+    }
+  }
+  if (!supported_component_type) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << opname << " cooperative matrix component type <id> "
+           << _.getIdName(component_type_id)
+           << " must be s8, s16, s32, fp16, or fp32.";
+  }
+
   const auto pointer_index =
       (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 2u : 0u;
   const auto pointer_id = inst->GetOperandAs<uint32_t>(pointer_index);
@@ -2178,7 +2192,7 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << opname << " storage class for pointer type <id> "
            << _.getIdName(pointer_type_id)
-           << " is not Workgroup or StorageBuffer.";
+           << " is not Workgroup, StorageBuffer, or PhysicalStorageBuffer.";
   }
 
   const auto pointee_id = pointer_type->GetOperandAs<uint32_t>(2);
@@ -2189,25 +2203,26 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
            << "s Type must be an array of scalar or vector type.";
   }
 
-  const auto matrix_shape_index =
+  const auto offset_index =
       (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 3u : 2u;
-  const auto matrix_shape_id = inst->GetOperandAs<uint32_t>(matrix_shape_index);
-  const auto matrix_shape = _.FindDef(matrix_shape_id);
-  if (!matrix_shape || !IsInt2Type(_, matrix_shape->type_id())) {
+  const auto offset_id = inst->GetOperandAs<uint32_t>(offset_index);
+  const auto offset = _.FindDef(offset_id);
+  if (!offset || !_.IsIntScalarType(offset->type_id()) ||
+      _.GetBitWidth(offset->type_id()) != 32) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "Matrix Shape operand <id> " << _.getIdName(matrix_shape_id)
-           << " must be an ivec2.";
+           << "Offset operand <id> " << _.getIdName(offset_id)
+           << " must be a 32-bit integer scalar.";
   }
 
-  const auto matrix_offset_index =
+  const auto stride_index =
       (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 4u : 3u;
-  const auto matrix_offset_id =
-      inst->GetOperandAs<uint32_t>(matrix_offset_index);
-  const auto matrix_offset = _.FindDef(matrix_offset_id);
-  if (!matrix_offset || !IsInt2Type(_, matrix_offset->type_id())) {
+  const auto stride_id = inst->GetOperandAs<uint32_t>(stride_index);
+  const auto stride = _.FindDef(stride_id);
+  if (!stride || !_.IsIntScalarType(stride->type_id()) ||
+      _.GetBitWidth(stride->type_id()) != 32) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
-           << "Matrix Offset operand <id> " << _.getIdName(matrix_offset_id)
-           << " must be an ivec2.";
+           << "Stride operand <id> " << _.getIdName(stride_id)
+           << " must be a 32-bit integer scalar.";
   }
 
   const auto matrix_layout_index =
@@ -2215,10 +2230,20 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
   const auto matrix_layout_id =
       inst->GetOperandAs<uint32_t>(matrix_layout_index);
   const auto matrix_layout = _.FindDef(matrix_layout_id);
-  if (!matrix_layout || !_.IsIntScalarType(matrix_layout->type_id())) {
+  if (!matrix_layout || !_.IsIntScalarType(matrix_layout->type_id()) ||
+      _.GetBitWidth(matrix_layout->type_id()) != 32 ||
+      (matrix_layout->opcode() != spv::Op::OpConstant &&
+       matrix_layout->opcode() != spv::Op::OpConstantNull)) {
     return _.diag(SPV_ERROR_INVALID_ID, inst)
            << "Matrix Layout operand <id> " << _.getIdName(matrix_layout_id)
-           << " must be a scalar integer type.";
+           << " must be a 32-bit integer compile-time constant.";
+  }
+
+  int64_t matrix_layout_value = 0;
+  if (!_.EvalConstantValInt64(matrix_layout_id, &matrix_layout_value) ||
+      matrix_layout_value < 0 || matrix_layout_value > 1) {
+    return _.diag(SPV_ERROR_INVALID_VALUE, inst)
+           << "Matrix Layout must be 0 (RowMajorHW) or 1 (ColumnMajorHW).";
   }
 
   const auto memory_access_index =

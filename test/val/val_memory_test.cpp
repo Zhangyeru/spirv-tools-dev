@@ -8517,6 +8517,210 @@ OpCooperativeVectorReduceSumAccumulateNV %array_ptr %offset %f16c
                         "'28[%v4half]' is not a cooperative vector type."));
 }
 
+std::string GenCoopMatHWLoadStoreShader(const std::string& main_body) {
+  return R"(
+OpCapability Shader
+OpCapability Int8
+OpCapability Int16
+OpCapability Int64
+OpCapability Float16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf %scalar_buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %array ArrayStride 64
+OpDecorate %spec_layout SpecId 0
+
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u8 = OpTypeInt 8 0
+%s8 = OpTypeInt 8 1
+%u16 = OpTypeInt 16 0
+%s16 = OpTypeInt 16 1
+%u32 = OpTypeInt 32 0
+%s32 = OpTypeInt 32 1
+%u64 = OpTypeInt 64 0
+%s64 = OpTypeInt 64 1
+%f16 = OpTypeFloat 16
+%f32 = OpTypeFloat 32
+%v2u32 = OpTypeVector %u32 2
+%v3u32 = OpTypeVector %u32 3
+%u32_0 = OpConstant %u32 0
+%u32_16 = OpConstant %u32 16
+%u32_32 = OpConstant %u32 32
+%u32_256 = OpConstant %u32 256
+%u64_16 = OpConstant %u64 16
+%s32_0 = OpConstant %s32 0
+%s32_1 = OpConstant %s32 1
+%s32_2 = OpConstant %s32 2
+%spec_layout = OpSpecConstant %s32 0
+%v2u32_0 = OpConstantComposite %v2u32 %u32_0 %u32_0
+%array = OpTypeArray %v3u32 %u32_256
+%array_ptr = OpTypePointer Workgroup %array
+%buf = OpVariable %array_ptr Workgroup
+%u32_ptr = OpTypePointer Workgroup %u32
+%scalar_buf = OpVariable %u32_ptr Workgroup
+%u32_func_ptr = OpTypePointer Function %u32
+%s32_func_ptr = OpTypePointer Function %s32
+%mat_s8 = OpTypeCooperativeMatrixHW %s8 %u32_16 %u32_16 MatrixUseAHW
+%mat_s16 = OpTypeCooperativeMatrixHW %s16 %u32_16 %u32_16 MatrixUseAHW
+%mat_s32 = OpTypeCooperativeMatrixHW %s32 %u32_16 %u32_16 MatrixUseAHW
+%mat_f16 = OpTypeCooperativeMatrixHW %f16 %u32_16 %u32_16 MatrixUseAHW
+%mat_f32 = OpTypeCooperativeMatrixHW %f32 %u32_16 %u32_16 MatrixUseAHW
+%mat_u8 = OpTypeCooperativeMatrixHW %u8 %u32_16 %u32_16 MatrixUseAHW
+%mat_u16 = OpTypeCooperativeMatrixHW %u16 %u32_16 %u32_16 MatrixUseAHW
+%mat_u32 = OpTypeCooperativeMatrixHW %u32 %u32_16 %u32_16 MatrixUseAHW
+%mat_s64 = OpTypeCooperativeMatrixHW %s64 %u32_16 %u32_16 MatrixUseAHW
+
+%main = OpFunction %void None %func
+%entry = OpLabel
+%offset_var = OpVariable %u32_func_ptr Function
+%stride_var = OpVariable %u32_func_ptr Function
+%layout_var = OpVariable %s32_func_ptr Function
+OpStore %offset_var %u32_32
+OpStore %stride_var %u32_16
+OpStore %layout_var %s32_0
+%offset = OpLoad %u32 %offset_var
+%stride = OpLoad %u32 %stride_var
+%layout = OpLoad %s32 %layout_var
+)" + main_body +
+         R"(
+OpReturn
+OpFunctionEnd
+)";
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadStoreSuccess) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%s8_value = OpCooperativeMatrixLoadHW %mat_s8 %buf %offset %stride %s32_0 Volatile
+%s16_value = OpCooperativeMatrixLoadHW %mat_s16 %buf %offset %stride %s32_1
+%s32_value = OpCooperativeMatrixLoadHW %mat_s32 %buf %offset %stride %s32_0
+%f16_value = OpCooperativeMatrixLoadHW %mat_f16 %buf %offset %stride %s32_1
+%f32_value = OpCooperativeMatrixLoadHW %mat_f32 %buf %offset %stride %s32_0
+OpCooperativeMatrixStoreHW %buf %s8_value %offset %stride %s32_1 Volatile
+OpCooperativeMatrixStoreHW %buf %s16_value %offset %stride %s32_0
+OpCooperativeMatrixStoreHW %buf %s32_value %offset %stride %s32_1
+OpCooperativeMatrixStoreHW %buf %f16_value %offset %stride %s32_0
+OpCooperativeMatrixStoreHW %buf %f32_value %offset %stride %s32_1
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadOldVectorOperandsFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpCooperativeMatrixLoadHW %mat_f16 %buf %v2u32_0 %v2u32_0 %s32_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Offset operand"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer scalar"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadOffsetTypeFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpCooperativeMatrixLoadHW %mat_f16 %buf %u64_16 %stride %s32_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Offset operand"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer scalar"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWStoreStrideTypeFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpUndef %mat_f16
+OpCooperativeMatrixStoreHW %buf %value %offset %v2u32_0 %s32_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Stride operand"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer scalar"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadLayoutNotConstantFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpCooperativeMatrixLoadHW %mat_f16 %buf %offset %stride %layout
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Matrix Layout operand"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadLayoutSpecConstantFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpCooperativeMatrixLoadHW %mat_f16 %buf %offset %stride %spec_layout
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Matrix Layout operand"));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be a 32-bit integer compile-time constant"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWStoreLayoutValueFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpUndef %mat_f16
+OpCooperativeMatrixStoreHW %buf %value %offset %stride %s32_2
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_VALUE,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(
+      getDiagnosticString(),
+      HasSubstr("Matrix Layout must be 0 (RowMajorHW) or 1 (ColumnMajorHW)"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadPointerArrayFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpCooperativeMatrixLoadHW %mat_f16 %scalar_buf %offset %stride %s32_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Type must be an array of scalar or vector type"));
+}
+
+TEST_F(ValidateMemory, CoopMatHWLoadUnsignedComponentFail) {
+  for (const char* matrix_type : {"%mat_u8", "%mat_u16", "%mat_u32"}) {
+    const std::string spirv = GenCoopMatHWLoadStoreShader(
+        std::string("%value = OpCooperativeMatrixLoadHW ") + matrix_type +
+        " %buf %offset %stride %s32_0\n");
+
+    CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+    ASSERT_EQ(SPV_ERROR_INVALID_ID,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    EXPECT_THAT(getDiagnosticString(),
+                HasSubstr("must be s8, s16, s32, fp16, or fp32"));
+  }
+}
+
+TEST_F(ValidateMemory, CoopMatHWStoreInt64ComponentFail) {
+  const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
+%value = OpUndef %mat_s64
+OpCooperativeMatrixStoreHW %buf %value %offset %stride %s32_0
+)");
+
+  CompileSuccessfully(spirv.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("must be s8, s16, s32, fp16, or fp32"));
+}
+
 std::string GenCoopVecHWShader(const std::string& main_body) {
   return R"(
 OpCapability Shader
