@@ -46,10 +46,9 @@ namespace opt {
 using namespace hw_lower_internal;
 
 Pass::Status HwLowerToStandardPass::Process() {
-  if (max_elements_ == 0 || max_matmul_macs_ == 0 ||
-      max_unrolled_elements_ == 0 || max_unrolled_matmul_macs_ == 0 ||
-      max_unrolled_elements_ > max_elements_ ||
-      max_unrolled_matmul_macs_ > max_matmul_macs_) {
+  if (max_unrolled_elements_ == 0 || max_unrolled_matmul_macs_ == 0 ||
+      (max_elements_ && max_unrolled_elements_ > max_elements_) ||
+      (max_matmul_macs_ && max_unrolled_matmul_macs_ > max_matmul_macs_)) {
     ReportError(nullptr, "invalid HW lowering size configuration");
     return Status::Failure;
   }
@@ -98,6 +97,8 @@ Pass::Status HwLowerToStandardPass::Process() {
     return Status::Failure;
   }
 
+  if (!AnalyzeLargeConstants() || !FoldLargeConstantExtracts()) return Status::Failure;
+
   RecordContractionOffFunctions();
 
   if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
@@ -114,11 +115,16 @@ Pass::Status HwLowerToStandardPass::Process() {
   if (!LegalizeModule()) return Status::Failure;
   if (!MaterializeLoweredTypes()) return Status::Failure;
   RecordOriginalHwValueTypes();
+  if (!MaterializeLargeConstants()) return Status::Failure;
   if (!EliminateHwFunctionVariables()) return Status::Failure;
   if (!PrepareMatmulPatternFunctions()) return Status::Failure;
 
   std::vector<Instruction*> to_kill;
   if (!LowerHwInstructions(&to_kill)) return Status::Failure;
+  for (const auto& materialized : materialized_constant_variables_) {
+    Instruction* load = get_def_use_mgr()->GetDef(materialized.first);
+    if (load && get_def_use_mgr()->NumUsers(load) == 0) context()->KillInst(load);
+  }
   if (!ReplaceHwTypeUses()) return Status::Failure;
   if (completeness_mode_ == CompletenessMode::kExtensionFree &&
       !LowerRemainingReplicatedComposites()) {

@@ -98,7 +98,11 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       }
       const uint64_t element_count =
           static_cast<uint64_t>(info.rows) * static_cast<uint64_t>(info.cols);
-      if (element_count == 0 || element_count > max_elements_) {
+      if (element_count > std::numeric_limits<uint32_t>::max()) {
+        ReportError(inst, "HW cooperative matrix element count exceeds uint32 index representation");
+        return false;
+      }
+      if (element_count == 0 || (max_elements_ && element_count > max_elements_)) {
         ReportError(inst, "HW cooperative matrix shape is unsupported");
         return false;
       }
@@ -145,7 +149,7 @@ bool HwLowerToStandardPass::CollectHwTypes() {
       ReportError(inst, "HW cooperative vector length must be constant");
       return false;
     }
-    if (info.length == 0 || info.length > max_elements_) {
+    if (info.length == 0 || (max_elements_ && info.length > max_elements_)) {
       ReportError(inst, "HW cooperative vector length is unsupported");
       return false;
     }

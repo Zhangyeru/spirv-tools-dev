@@ -83,7 +83,9 @@ bool ParseHwLowerOptions(const std::string& pass_args,
       }
 
       uint64_t value = 0;
-      if (!ParsePositiveUint64(argument.substr(equals + 1), &value)) {
+      if (!(argument.substr(equals + 1) == "0" &&
+            (name == "max-elements" || name == "max-macs")) &&
+          !ParsePositiveUint64(argument.substr(equals + 1), &value)) {
         *error = "invalid value for '" + name + "'";
         return false;
       }
@@ -114,11 +116,13 @@ bool ParseHwLowerOptions(const std::string& pass_args,
     begin = end + 1;
   }
 
-  if (options->max_unrolled_elements > options->max_elements) {
+  if (options->max_elements != 0 &&
+      options->max_unrolled_elements > options->max_elements) {
     *error = "unroll-elements must not exceed max-elements";
     return false;
   }
-  if (options->max_unrolled_matmul_macs > options->max_matmul_macs) {
+  if (options->max_matmul_macs != 0 &&
+      options->max_unrolled_matmul_macs > options->max_matmul_macs) {
     *error = "unroll-macs must not exceed max-macs";
     return false;
   }

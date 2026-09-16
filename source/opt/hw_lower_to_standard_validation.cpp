@@ -397,19 +397,6 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
           return false;
         }
       }
-      const bool packed =
-          matrix ? IsPackedVec2(*matrix) : IsPackedVec2(*vector);
-      const uint64_t lowered_constituent_count =
-          packed ? expected / kPackedVec2Width : expected;
-      if (lowered_constituent_count > kMaxCompositeConstituents) {
-        ReportError(inst,
-                    is_replicate
-                        ? "HW replicated constant exceeds the SPIR-V composite "
-                          "operand limit after lowering"
-                        : "HW constant composite exceeds the SPIR-V composite "
-                          "operand limit after lowering");
-        return false;
-      }
       return true;
     }
 
@@ -1000,7 +987,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       const uint64_t mac_count = static_cast<uint64_t>(result->rows) *
                                  static_cast<uint64_t>(result->cols) *
                                  static_cast<uint64_t>(a->cols);
-      if (mac_count > max_matmul_macs_) {
+      if (max_matmul_macs_ && mac_count > max_matmul_macs_) {
         ReportError(inst,
                     "HW cooperative matrix multiply expansion is too large");
         ok = false;
@@ -1058,7 +1045,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       }
       const uint64_t mac_count = static_cast<uint64_t>(result->length) *
                                  static_cast<uint64_t>(input->length);
-      if (mac_count > max_matmul_macs_) {
+      if (max_matmul_macs_ && mac_count > max_matmul_macs_) {
         ReportError(inst,
                     "HW cooperative vector matrix multiply expansion is too "
                     "large");
@@ -1232,12 +1219,6 @@ bool HwLowerToStandardPass::GetReplicatedCompositeInfo(
     ReportError(inst,
                 "replicated composite result type is not a supported "
                 "homogeneous composite");
-    return false;
-  }
-  if (count > kMaxCompositeConstituents) {
-    ReportError(inst,
-                "replicated composite exceeds the SPIR-V composite operand "
-                "limit");
     return false;
   }
   if (value->type_id() != type_id) {

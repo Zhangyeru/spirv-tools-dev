@@ -2281,6 +2281,20 @@ spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
            << " must be a scalar integer type.";
   }
 
+  if (matrix_layout->opcode() != spv::Op::OpConstant &&
+      matrix_layout->opcode() != spv::Op::OpConstantNull) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Matrix Layout must be an ordinary integer constant (0 or 1); "
+              "runtime and specialization constants are not allowed.";
+  }
+  uint64_t layout_value = 0;
+  if (matrix_layout->opcode() != spv::Op::OpConstantNull &&
+      (!_.EvalConstantValUint64(matrix_layout_id, &layout_value) ||
+       layout_value > 1)) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Matrix Layout constant must be 0 (RowMajor) or 1 (ColumnMajor).";
+  }
+
   const auto memory_access_index =
       (inst->opcode() == spv::Op::OpCooperativeMatrixLoadHW) ? 6u : 5u;
   if (inst->operands().size() > memory_access_index) {

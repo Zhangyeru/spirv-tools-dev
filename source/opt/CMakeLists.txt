@@ -142,6 +142,7 @@ set(SPIRV_TOOLS_OPT_SOURCES
   hw_fuse_two_layer_vector_matmul_pass.cpp
   hw_lower_to_standard_pass.cpp
   hw_lower_to_standard_aggregate.cpp
+  hw_lower_to_standard_constants.cpp
   hw_lower_to_standard_direct.cpp
   hw_lower_to_standard_direct_generated.cpp
   hw_lower_to_standard_elementwise.cpp

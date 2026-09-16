@@ -221,6 +221,9 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       "max-macs=18446744073709551615,unroll-elements=4294967295,"
       "unroll-macs=18446744073709551615"));
 
+  EXPECT_TRUE(opt.RegisterPassFromFlag(
+      "--hw-lower-to-standard=max-elements=0,max-macs=0"));
+
   // Test some invalid flags.
   EXPECT_FALSE(opt.RegisterPassFromFlag("-O2"));
   EXPECT_EQ(msg_level, SPV_MSG_ERROR);
@@ -257,8 +260,6 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       "--hw-lower-to-standard=pack,scalar",
       "--hw-lower-to-standard=pack,pack",
       "--hw-lower-to-standard=max-elements=1,max-elements=2",
-      "--hw-lower-to-standard=max-elements=0",
-      "--hw-lower-to-standard=max-macs=0",
       "--hw-lower-to-standard=unroll-elements=0",
       "--hw-lower-to-standard=unroll-macs=0",
       "--hw-lower-to-standard=max-elements=-1",
@@ -285,8 +286,8 @@ TEST(Optimizer, HwLowerToStandardOptionsHaveStableDefaults) {
   const HwLowerToStandardOptions options;
   EXPECT_FALSE(options.force_scalar_lowering);
   EXPECT_EQ(options.completeness, HwLoweringCompleteness::kCooperativeOnly);
-  EXPECT_EQ(options.max_elements, 1048576u);
-  EXPECT_EQ(options.max_matmul_macs, 16777216u);
+  EXPECT_EQ(options.max_elements, 0u);
+  EXPECT_EQ(options.max_matmul_macs, 0u);
   EXPECT_EQ(options.max_unrolled_elements, 4096u);
   EXPECT_EQ(options.max_unrolled_matmul_macs, 4096u);
 

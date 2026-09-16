@@ -501,7 +501,7 @@ OpFunctionEnd
 }
 
 TEST_F(HwLowerToStandardTest,
-       RejectsReplicatedConstantThatCannotBeSerializedAfterLowering) {
+       LowersOversizedReplicatedConstant) {
   const std::vector<std::string> opcodes = {
       "OpConstantCompositeReplicateEXT",
       "OpSpecConstantCompositeReplicateEXT",
@@ -509,7 +509,6 @@ TEST_F(HwLowerToStandardTest,
   for (const std::string& opcode : opcodes) {
     SCOPED_TRACE(opcode);
     const std::string text = std::string(R"(
-; CHECK: HW replicated constant exceeds the SPIR-V composite operand limit
 OpCapability Shader
 OpCapability ReplicatedCompositesEXT
 OpCapability CooperativeVectorHW
@@ -532,15 +531,16 @@ OpReturn
 OpFunctionEnd
 )";
 
-    SinglePassRunAndFail<HwLowerToStandardPass>(
-        text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+    const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
         HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
         16777216ull, 70000u, 4096ull);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   }
 }
 
 TEST_F(HwLowerToStandardTest,
-       RejectsDirectConstantCompositesAboveConstituentLimit) {
+       LowersDirectConstantCompositesAboveConstituentLimit) {
   const std::vector<std::pair<std::string, std::string>> cases = {
       {"OpConstantComposite", "OpConstant %float 1"},
       {"OpSpecConstantComposite", "OpSpecConstant %float 1065353216"},
@@ -549,7 +549,6 @@ TEST_F(HwLowerToStandardTest,
     const std::string& opcode = test_case.first;
     SCOPED_TRACE(opcode);
     const std::string text = std::string(R"(
-; CHECK: HW constant composite exceeds the SPIR-V composite operand limit
 OpCapability Shader
 OpCapability CooperativeMatrixHW
 OpExtension "SPV_HW_neural_shader"
@@ -572,10 +571,11 @@ OpReturn
 OpFunctionEnd
 )";
 
-    SinglePassRunAndFail<HwLowerToStandardPass>(
-        text, HwLowerToStandardPass::LoweringMode::kForceScalar,
+    const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, HwLowerToStandardPass::LoweringMode::kForceScalar,
         HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 70000u,
         16777216ull, 65532u, 4096ull);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   }
 }
 
@@ -1216,9 +1216,8 @@ OpFunctionEnd
 }
 
 TEST_F(HwLowerToStandardTest,
-       ExtensionFreeRejectsOversizedOrdinaryReplicatedComposite) {
+       ExtensionFreeLowersOversizedOrdinaryReplicatedComposite) {
   const std::string text = R"(
-; CHECK: replicated composite exceeds the SPIR-V composite operand limit
 OpCapability Shader
 OpCapability ReplicatedCompositesEXT
 OpExtension "SPV_EXT_replicated_composites"
@@ -1239,9 +1238,10 @@ OpReturn
 OpFunctionEnd
 )";
 
-  SinglePassRunAndFail<HwLowerToStandardPass>(
-      text, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+  const auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
       HwLowerToStandardPass::CompletenessMode::kExtensionFree, 70000u);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
 }
 
 }  // namespace

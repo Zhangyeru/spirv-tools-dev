@@ -54,10 +54,10 @@ struct HwLowerToStandardOptions {
   HwLoweringCompleteness completeness =
       HwLoweringCompleteness::kCooperativeOnly;
 
-  // Hard ceilings that protect the pass from unexpectedly large lowered
-  // values and matrix multiplications.
-  uint32_t max_elements = 1048576;
-  uint64_t max_matmul_macs = 16777216;
+  // Optional resource-policy ceilings. Zero disables the policy limit;
+  // representability and overflow checks still apply.
+  uint32_t max_elements = 0;
+  uint64_t max_matmul_macs = 0;
 
   // Operations above these thresholds are emitted as structured loops rather
   // than being fully unrolled. The matmul threshold also selects the rolled

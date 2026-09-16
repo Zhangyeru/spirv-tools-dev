@@ -466,6 +466,19 @@ bool HwLowerToStandardPass::LowerRemainingReplicatedComposites() {
       return false;
     }
 
+    if (constituent_count > kMaxCompositeConstituents) {
+      const uint32_t function_id = BuildRepeatedValueFunction(
+          inst->type_id(), constituent_type_id, constituent_count);
+      InstructionBuilder builder(context(), inst,
+          IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+      auto* call = function_id ? builder.AddFunctionCall(inst->type_id(), function_id,
+          {inst->GetSingleWordInOperand(0)}) : nullptr;
+      if (!call) return false;
+      context()->ReplaceAllUsesWith(inst->result_id(), call->result_id());
+      context()->KillInst(inst);
+      continue;
+    }
+
     spv::Op replacement = spv::Op::OpNop;
     switch (inst->opcode()) {
       case spv::Op::OpConstantCompositeReplicateEXT:
@@ -781,13 +794,21 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
   const uint32_t value_ptr_type = GetOrCreatePointerType(
       vector->lowered_type_id, spv::StorageClass::Function);
   if (!function || value_ptr_type == 0) return false;
-  Instruction* variable = AddFunctionVariable(function, value_ptr_type);
-  if (!variable) return false;
+  uint32_t variable_id = 0;
+  auto materialized = materialized_constant_variables_.find(object->result_id());
+  if (materialized != materialized_constant_variables_.end()) {
+    variable_id = materialized->second;
+  } else {
+    Instruction* variable = AddFunctionVariable(function, value_ptr_type);
+    if (!variable) return false;
+    variable_id = variable->result_id();
+  }
 
   InstructionBuilder builder(
       context(), inst,
       IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
-  if (!AddStore(&builder, variable->result_id(), object->result_id(), {})) {
+  if (materialized == materialized_constant_variables_.end() &&
+      !AddStore(&builder, variable_id, object->result_id(), {})) {
     return false;
   }
   uint32_t index_id = inst->GetSingleWordInOperand(1);
@@ -820,7 +841,7 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
   const uint32_t piece_ptr_type =
       GetOrCreatePointerType(piece_type_id, spv::StorageClass::Function);
   Instruction* pointer = builder.AddAccessChain(
-      piece_ptr_type, variable->result_id(), {piece_index_id});
+      piece_ptr_type, variable_id, {piece_index_id});
   if (!pointer) return false;
   const uint32_t piece =
       AddLoad(&builder, piece_type_id, pointer->result_id(), {});

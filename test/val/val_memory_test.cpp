@@ -9361,6 +9361,111 @@ OpFunctionEnd
   EXPECT_THAT(getDiagnosticString(),
               HasSubstr("must be a 32-bit integer compile-time constant"));
 }
+TEST_F(ValidateMemory, CoopMatHWLayoutRequiresOrdinaryZeroOrOne) {
+  const std::string base = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpCapability Int8
+OpCapability Int16
+OpCapability Int64
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %arr ArrayStride 4
+OpMemberDecorate %Buf 0 Offset 0
+%void = OpTypeVoid
+%func = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%u32_0 = OpConstant %u32 0
+%u32_4 = OpConstant %u32 4
+%i32 = OpTypeInt 32 1
+%i32_0 = OpConstant %i32 0
+%u64 = OpTypeInt 64 0
+%i16 = OpTypeInt 16 1
+%u8 = OpTypeInt 8 0
+%bool = OpTypeBool
+%true = OpConstantTrue %bool
+%fnptr = OpTypePointer Function %i32
+@DECL@
+%f32 = OpTypeFloat 32
+%shape_type = OpTypeVector %u32 2
+%shape = OpConstantComposite %shape_type %u32_4 %u32_4
+%offset = OpConstantComposite %shape_type %u32_0 %u32_0
+%mat = OpTypeCooperativeMatrixHW %f32 %u32_4 %u32_4
+%arr = OpTypeArray %f32 %u32_4
+%Buf = OpTypeStruct %arr
+%ptr_uniform_buf = OpTypePointer Workgroup %Buf
+%ptr_uniform_arr = OpTypePointer Workgroup %arr
+%buf = OpVariable %ptr_uniform_buf Workgroup
+%main = OpFunction %void None %func
+%entry = OpLabel
+%local = OpVariable %fnptr Function %i32_0
+@BODY@
+%base = OpAccessChain %ptr_uniform_arr %buf %i32_0
+@ACCESS@
+OpReturn
+OpFunctionEnd
+)";
+
+  struct Case { const char* declaration; const char* body; bool valid; };
+  const Case cases[] = {
+    {"%layout = OpConstant %i32 0", "", true},
+    {"%layout = OpConstant %u32 1", "", true},
+    {"%layout = OpConstantNull %i32", "", true},
+    {"%layout = OpConstant %u64 1", "", true},
+    {"%layout = OpConstant %i16 1", "", true},
+    {"%layout = OpConstant %u8 0", "", true},
+    {"%layout = OpConstant %i32 -1", "", false},
+    {"%layout = OpConstant %u32 2", "", false},
+    {"%layout = OpConstant %u64 4294967296", "", false},
+    {"%layout = OpSpecConstant %i32 0", "", false},
+    {"%layout = OpSpecConstantOp %i32 IAdd %i32_0 %i32_0", "", false},
+    {"%layout = OpUndef %i32", "", false},
+    {"", "%layout = OpLoad %i32 %local", false},
+    {"", "%layout = OpSelect %i32 %true %i32_0 %i32_0", false},
+    {"", "OpBranch %join\n%join = OpLabel\n%layout = OpPhi %i32 %i32_0 %entry", false},
+  };
+  for (bool store : {false, true}) {
+    for (const auto& test : cases) {
+      SCOPED_TRACE(test.declaration);
+      SCOPED_TRACE(test.body);
+      SCOPED_TRACE(store);
+      std::string text = base;
+      auto replace = [&](const std::string& from, const std::string& to) {
+        text.replace(text.find(from), from.size(), to);
+      };
+      replace("@DECL@", test.declaration);
+      replace("@BODY@", test.body);
+      replace("@ACCESS@", store
+          ? "%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %i32_0\n"
+            "OpCooperativeMatrixStoreHW %base %value %shape %offset %layout"
+          : "%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %layout");
+      CompileSuccessfully(text.c_str(), SPV_ENV_UNIVERSAL_1_6);
+      EXPECT_EQ(test.valid ? SPV_SUCCESS : SPV_ERROR_INVALID_ID,
+                ValidateInstructions(SPV_ENV_UNIVERSAL_1_6)) << getDiagnosticString();
+      if (!test.valid) EXPECT_THAT(getDiagnosticString(), HasSubstr("Matrix Layout"));
+    }
+  }
+  // Even a literal argument at the call site does not make its parameter a
+  // compile-time constant inside the callee.
+  std::string parameter = base;
+  auto replace_parameter = [&](const std::string& from, const std::string& to) {
+    parameter.replace(parameter.find(from), from.size(), to);
+  };
+  replace_parameter("@DECL@", "%helper_type = OpTypeFunction %void %i32");
+  replace_parameter("@BODY@", "");
+  replace_parameter("@ACCESS@", "%value = OpCooperativeMatrixLoadHW %mat %base %shape %offset %layout");
+  replace_parameter("%main = OpFunction %void None %func\n%entry = OpLabel",
+      "%main = OpFunction %void None %func\n%main_entry = OpLabel\n"
+      "%invoke = OpFunctionCall %void %helper %i32_0\nOpReturn\nOpFunctionEnd\n"
+      "%helper = OpFunction %void None %helper_type\n"
+      "%layout = OpFunctionParameter %i32\n%entry = OpLabel");
+  CompileSuccessfully(parameter.c_str(), SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Matrix Layout"));
+
+}
 }  // namespace
 }  // namespace val
 }  // namespace spvtools

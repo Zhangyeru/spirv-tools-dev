@@ -111,8 +111,9 @@ Options (in lexicographical order):)",
                containing an optional pack or scalar mode and any of:
                  max-elements=N,max-macs=N,
                  unroll-elements=N,unroll-macs=N
-               Values must be positive and each unroll limit must not exceed
-               its corresponding hard limit. unroll-macs also selects
+               max-elements and max-macs default to zero (no policy limit).
+               Unroll limits must be positive and must not exceed a nonzero
+               corresponding hard limit. unroll-macs also selects
                unrolled versus rolled matrix/vector direct helpers.)");
   printf(R"(
   --hw-lower-to-standard-extension-free[=<options>]

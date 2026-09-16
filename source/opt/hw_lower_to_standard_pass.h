@@ -50,7 +50,7 @@ class HwLowerToStandardPass : public Pass {
   explicit HwLowerToStandardPass(
       LoweringMode lowering_mode = LoweringMode::kPreferPackedVec2,
       CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly,
-      uint32_t max_elements = 1048576, uint64_t max_matmul_macs = 16777216,
+      uint32_t max_elements = 0, uint64_t max_matmul_macs = 0,
       uint32_t max_unrolled_elements = 4096,
       uint64_t max_unrolled_matmul_macs = 4096)
       : lowering_mode_(lowering_mode),
@@ -147,6 +147,19 @@ class HwLowerToStandardPass : public Pass {
     kSelect,
     kBroadcast,
   };
+
+  bool AnalyzeLargeConstants();
+  bool FoldLargeConstantExtracts();
+  bool MaterializeLargeConstants();
+  uint32_t BuildRepeatedValueFunction(uint32_t type_id, uint32_t element_type_id,
+                                      uint32_t count, bool into_pointer = false);
+  uint32_t MaterializeConstantValue(InstructionBuilder* builder, uint32_t id,
+                                    Function* caller = nullptr);
+  std::unordered_set<uint32_t> large_constants_;
+  std::unordered_map<uint32_t, uint32_t> constant_functions_;
+  std::unordered_map<uint32_t, uint32_t> repeat_functions_;
+  std::unordered_map<uint32_t, uint32_t> repeat_pointer_functions_;
+  std::unordered_map<uint32_t, uint32_t> materialized_constant_variables_;
 
   bool CollectHwTypes();
   bool MaterializeLoweredTypes();
@@ -729,8 +742,8 @@ class HwLowerToStandardPass : public Pass {
   std::vector<std::pair<uint32_t, uint32_t>> pending_fp_fast_math_modes_;
   LoweringMode lowering_mode_ = LoweringMode::kPreferPackedVec2;
   CompletenessMode completeness_mode_ = CompletenessMode::kCooperativeOnly;
-  uint32_t max_elements_ = 1048576;
-  uint64_t max_matmul_macs_ = 16777216;
+  uint32_t max_elements_ = 0;
+  uint64_t max_matmul_macs_ = 0;
   uint32_t max_unrolled_elements_ = 4096;
   uint64_t max_unrolled_matmul_macs_ = 4096;
   ArithmeticContract active_arithmetic_contract_;
