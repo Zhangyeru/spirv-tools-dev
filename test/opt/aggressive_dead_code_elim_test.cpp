@@ -29,6 +29,42 @@ using AggressiveDCETest = PassTest<::testing::Test>;
 
 using ::testing::HasSubstr;
 
+TEST_F(AggressiveDCETest, PreserveVolatileLoadMatrixHW) {
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_6);
+  const std::string shader = R"(
+OpCapability Shader
+OpCapability Int8
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 32 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%s8 = OpTypeInt 8 1
+%zero = OpConstant %u32 0
+%sixteen = OpConstant %u32 16
+%workgroup = OpConstant %u32 2
+%size = OpConstant %u32 1024
+%array = OpTypeArray %u32 %size
+%ptr = OpTypePointer Workgroup %array
+%buf = OpVariable %ptr Workgroup
+%mat = OpTypeCooperativeMatrixHW %s8 %sixteen %sixteen MatrixUseAHW
+%main = OpFunction %void None %fn
+%entry = OpLabel
+; CHECK: OpLoadMatrixB8X1Burst1RowHW {{.*}} Volatile
+%row = OpLoadMatrixB8X1Burst1RowHW %mat %buf %zero Volatile
+; CHECK: OpControlBarrier
+OpControlBarrier %workgroup %workgroup %zero
+; CHECK: OpLoadMatrixB8X1Burst1ColumnHW {{.*}} Volatile
+%column = OpLoadMatrixB8X1Burst1ColumnHW %mat %buf %zero Volatile
+OpReturn
+OpFunctionEnd
+)";
+  SinglePassRunAndMatch<AggressiveDCEPass>(shader, true);
+}
+
 TEST_F(AggressiveDCETest, EliminateExtendedInst) {
   //  #version 140
   //

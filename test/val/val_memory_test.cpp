@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "gmock/gmock.h"
+#include "spirv-tools/libspirv.hpp"
 #include "test/unit_spirv.h"
 #include "test/val/val_code_generator.h"
 #include "test/val/val_fixtures.h"
@@ -8590,6 +8591,251 @@ OpReturn
 OpFunctionEnd
 )";
 }
+
+struct LoadMatrixHWCase {
+  const char* opcode;
+  uint32_t number;
+  uint32_t width;
+  uint32_t rows;
+  uint32_t columns;
+  uint32_t alignment;
+};
+
+const LoadMatrixHWCase kLoadMatrixHWCases[] = {
+    {"OpLoadMatrixB8X1Burst1RowHW", 6700, 8, 16, 16, 16},
+    {"OpLoadMatrixB8X1Burst2RowHW", 6701, 8, 16, 32, 32},
+    {"OpLoadMatrixB8X2Burst1RowHW", 6702, 8, 32, 16, 16},
+    {"OpLoadMatrixB8X2Burst2RowHW", 6703, 8, 32, 32, 32},
+    {"OpLoadMatrixB8X1Burst1ColumnHW", 6704, 8, 16, 16, 16},
+    {"OpLoadMatrixB8X1Burst2ColumnHW", 6705, 8, 32, 16, 32},
+    {"OpLoadMatrixB8X2Burst1ColumnHW", 6706, 8, 16, 32, 16},
+    {"OpLoadMatrixB8X2Burst2ColumnHW", 6707, 8, 32, 32, 32},
+    {"OpLoadMatrixB16X1Burst1RowHW", 6708, 16, 16, 8, 16},
+    {"OpLoadMatrixB16X1Burst2RowHW", 6709, 16, 16, 16, 32},
+    {"OpLoadMatrixB16X2Burst1RowHW", 6710, 16, 32, 8, 16},
+    {"OpLoadMatrixB16X2Burst2RowHW", 6711, 16, 32, 16, 32},
+    {"OpLoadMatrixB16X1Burst2ColumnHW", 6712, 16, 16, 16, 32},
+    {"OpLoadMatrixB16X2Burst2ColumnHW", 6713, 16, 16, 32, 32},
+};
+
+using ValidateLoadMatrixHW = spvtest::ValidateBase<LoadMatrixHWCase>;
+
+std::string GenLoadMatrixHWShader(const LoadMatrixHWCase& variant,
+                                  const std::string& operands = "%buf %offset",
+                                  const std::string& component = "",
+                                  uint32_t rows = 0, uint32_t columns = 0) {
+  std::string shader = GenCoopMatHWLoadStoreShader(
+      std::string("%value = ") + variant.opcode + " %ldmat " + operands + "\n");
+  const auto pos = shader.find("%main = OpFunction");
+  shader.insert(pos,
+                "%ldrows = OpConstant %u32 " +
+                    std::to_string(rows ? rows : variant.rows) +
+                    "\n%ldcolumns = OpConstant %u32 " +
+                    std::to_string(columns ? columns : variant.columns) +
+                    "\n%bad_offset = OpConstant %u32 " +
+                    std::to_string(variant.alignment / 2) +
+                    "\n%ldmat = OpTypeCooperativeMatrixHW " +
+                    (component.empty() ? "%s" + std::to_string(variant.width)
+                                       : component) +
+                    " %ldrows %ldcolumns MatrixUseAHW\n");
+  return shader;
+}
+
+TEST_P(ValidateLoadMatrixHW, DynamicOffsetAndOpcodeRoundTrip) {
+  const auto& variant = GetParam();
+  CompileSuccessfully(GenLoadMatrixHWShader(variant), SPV_ENV_UNIVERSAL_1_6);
+  ASSERT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  bool found = false;
+  for (size_t i = 5; i < binary_->wordCount; i += binary_->code[i] >> 16) {
+    if ((binary_->code[i] & 0xffff) == variant.number) {
+      EXPECT_EQ(5u, binary_->code[i] >> 16);
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found);
+  spvtools::SpirvTools tools(SPV_ENV_UNIVERSAL_1_6);
+  std::string disassembly;
+  ASSERT_TRUE(
+      tools.Disassemble(binary_->code, binary_->wordCount, &disassembly,
+                        SPV_BINARY_TO_TEXT_OPTION_NO_HEADER));
+  EXPECT_THAT(disassembly, HasSubstr(variant.opcode));
+  std::vector<uint32_t> roundtrip;
+  ASSERT_TRUE(tools.Assemble(disassembly, &roundtrip,
+                             SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
+  EXPECT_EQ(
+      std::vector<uint32_t>(binary_->code, binary_->code + binary_->wordCount),
+      roundtrip);
+}
+
+TEST_P(ValidateLoadMatrixHW, AlignedConstantsAndMemoryOperands) {
+  for (const char* operands :
+       {"%buf %u32_0", "%buf %u32_32 Volatile|Aligned|Nontemporal 4"}) {
+    CompileSuccessfully(GenLoadMatrixHWShader(GetParam(), operands),
+                        SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  }
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectMisalignedConstant) {
+  CompileSuccessfully(GenLoadMatrixHWShader(GetParam(), "%buf %bad_offset"),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_VALUE,
+            ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Offset must be aligned to"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectOffsetTypes) {
+  for (const char* offset : {"%s32_0", "%u64_16", "%v2u32_0"}) {
+    CompileSuccessfully(
+        GenLoadMatrixHWShader(GetParam(), std::string("%buf ") + offset),
+        SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_ERROR_INVALID_ID,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    EXPECT_THAT(getDiagnosticString(),
+                HasSubstr("Offset must be a 32-bit unsigned integer scalar"));
+  }
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectComponentTypes) {
+  for (const char* component : {"%u8", "%u16", "%s32", "%f16", "%s64"}) {
+    CompileSuccessfully(
+        GenLoadMatrixHWShader(GetParam(), "%buf %offset", component),
+        SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_ERROR_INVALID_ID,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    EXPECT_THAT(getDiagnosticString(),
+                HasSubstr("Matrix component type must be a signed"));
+  }
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectRowsAndColumns) {
+  for (bool wrong_rows : {false, true}) {
+    CompileSuccessfully(
+        GenLoadMatrixHWShader(GetParam(), "%buf %offset", "",
+                              wrong_rows ? 4 : 0, wrong_rows ? 0 : 4),
+        SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(SPV_ERROR_INVALID_ID,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    EXPECT_THAT(getDiagnosticString(), HasSubstr("Matrix shape must be"));
+  }
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectScalarPointerWithShader) {
+  CompileSuccessfully(GenLoadMatrixHWShader(GetParam(), "%scalar_buf %offset"),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("Shader requires an array"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectNonPointer) {
+  CompileSuccessfully(GenLoadMatrixHWShader(GetParam(), "%u32_0 %offset"),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Pointer must have an OpTypePointer"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectFunctionStorage) {
+  CompileSuccessfully(GenLoadMatrixHWShader(GetParam(), "%offset_var %offset"),
+                      SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Pointer storage class must be"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectNonMatrixResult) {
+  auto shader = GenLoadMatrixHWShader(GetParam());
+  const std::string target = std::string(GetParam().opcode) + " %ldmat";
+  shader.replace(shader.find(target), target.size(),
+                 std::string(GetParam().opcode) + " %u32");
+  CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(),
+              HasSubstr("Result Type must be an OpTypeCooperativeMatrixHW"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectMissingCapability) {
+  auto shader = GenLoadMatrixHWShader(GetParam());
+  const std::string capability = "OpCapability CooperativeMatrixHW\n";
+  shader.erase(shader.find(capability), capability.size());
+  CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("CooperativeMatrixHW"));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectMissingExtension) {
+  auto shader = GenLoadMatrixHWShader(GetParam());
+  const std::string extension = "OpExtension \"SPV_HW_neural_shader\"\n";
+  shader.erase(shader.find(extension), extension.size());
+  CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_NE(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("SPV_HW_neural_shader"));
+}
+
+TEST_P(ValidateLoadMatrixHW, SpecializationOffset) {
+  auto shader = GenLoadMatrixHWShader(GetParam(), "%buf %special_offset");
+  shader.insert(shader.find("%main = OpFunction"),
+                "%special_offset = OpSpecConstant %u32 1\n");
+  CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_SUCCESS, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+}
+
+TEST_P(ValidateLoadMatrixHW, RejectArrayOfStructs) {
+  auto shader = GenLoadMatrixHWShader(GetParam());
+  const std::string array = "%array = OpTypeArray %v3u32 %u32_256";
+  shader.replace(
+      shader.find(array), array.size(),
+      "%element = OpTypeStruct %u32\n%array = OpTypeArray %element %u32_256");
+  CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+  EXPECT_EQ(SPV_ERROR_INVALID_ID, ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+  EXPECT_THAT(getDiagnosticString(), HasSubstr("numeric scalars or vectors"));
+}
+
+TEST_P(ValidateLoadMatrixHW, VulkanMemoryOperands) {
+  for (bool available : {false, true}) {
+    auto shader = GenLoadMatrixHWShader(
+        GetParam(),
+        available ? "%buf %offset MakePointerAvailable|NonPrivatePointer %s32_2"
+                  : "%buf %offset MakePointerVisible|NonPrivatePointer %s32_2");
+    shader.insert(0, "OpCapability VulkanMemoryModel\n");
+    const std::string model = "OpMemoryModel Logical GLSL450";
+    shader.replace(shader.find(model), model.size(),
+                   "OpMemoryModel Logical Vulkan");
+    CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(available ? SPV_ERROR_INVALID_ID : SPV_SUCCESS,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    if (available)
+      EXPECT_THAT(
+          getDiagnosticString(),
+          HasSubstr("MakePointerAvailableKHR cannot be used with OpLoad"));
+  }
+}
+
+TEST_P(ValidateLoadMatrixHW, PhysicalStorageRequiresAligned) {
+  for (bool aligned : {false, true}) {
+    auto shader = GenLoadMatrixHWShader(
+        GetParam(),
+        aligned ? "%physical_buf %offset Aligned 4" : "%physical_buf %offset");
+    shader.insert(0, "OpCapability PhysicalStorageBufferAddresses\n");
+    const std::string model = "OpMemoryModel Logical GLSL450";
+    shader.replace(shader.find(model), model.size(),
+                   "OpMemoryModel PhysicalStorageBuffer64 GLSL450");
+    shader.insert(
+        shader.find("%main = OpFunction"),
+        "%physical_ptr = OpTypePointer PhysicalStorageBuffer %array\n");
+    shader.insert(shader.find("%value ="),
+                  "%physical_buf = OpConvertUToPtr %physical_ptr %u64_16\n");
+    CompileSuccessfully(shader, SPV_ENV_UNIVERSAL_1_6);
+    EXPECT_EQ(aligned ? SPV_SUCCESS : SPV_ERROR_INVALID_ID,
+              ValidateInstructions(SPV_ENV_UNIVERSAL_1_6));
+    if (!aligned)
+      EXPECT_THAT(getDiagnosticString(),
+                  HasSubstr("PhysicalStorageBuffer must use Aligned"));
+  }
+}
+
+INSTANTIATE_TEST_SUITE_P(AllVariants, ValidateLoadMatrixHW,
+                         ::testing::ValuesIn(kLoadMatrixHWCases));
 
 TEST_F(ValidateMemory, CoopMatHWLoadStoreSuccess) {
   const std::string spirv = GenCoopMatHWLoadStoreShader(R"(
