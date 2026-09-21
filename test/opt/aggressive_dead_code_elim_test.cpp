@@ -65,6 +65,75 @@ OpFunctionEnd
   SinglePassRunAndMatch<AggressiveDCEPass>(shader, true);
 }
 
+TEST_F(AggressiveDCETest, PreserveStoreMatrixHW) {
+  SetTargetEnv(SPV_ENV_UNIVERSAL_1_6);
+  const std::string shader = R"(
+OpCapability Shader
+OpCapability Int8
+OpCapability Int16
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %buf
+OpExecutionMode %main LocalSize 32 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%u32 = OpTypeInt 32 0
+%s8 = OpTypeInt 8 1
+%s16 = OpTypeInt 16 1
+%zero = OpConstant %u32 0
+%eight = OpConstant %u32 8
+%sixteen = OpConstant %u32 16
+%thirtytwo = OpConstant %u32 32
+%workgroup = OpConstant %u32 2
+%size = OpConstant %u32 1024
+%array = OpTypeArray %u32 %size
+%ptr = OpTypePointer Workgroup %array
+%buf = OpVariable %ptr Workgroup
+%mat0 = OpTypeCooperativeMatrixHW %s8 %sixteen %sixteen MatrixUseAHW
+%mat1 = OpTypeCooperativeMatrixHW %s8 %sixteen %thirtytwo MatrixUseAHW
+%mat2 = OpTypeCooperativeMatrixHW %s8 %thirtytwo %sixteen MatrixUseAHW
+%mat3 = OpTypeCooperativeMatrixHW %s16 %sixteen %eight MatrixUseAHW
+%mat4 = OpTypeCooperativeMatrixHW %s16 %thirtytwo %eight MatrixUseAHW
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%obj0 = OpUndef %mat0
+%obj1 = OpUndef %mat1
+%obj2 = OpUndef %mat2
+%obj3 = OpUndef %mat3
+%obj4 = OpUndef %mat4
+; CHECK: OpStoreMatrixB8X1Burst1RowHW {{.*}}
+OpStoreMatrixB8X1Burst1RowHW %buf %obj0 %zero
+; CHECK: OpStoreMatrixB8X2Burst1RowHW {{.*}}
+OpStoreMatrixB8X2Burst1RowHW %buf %obj2 %zero
+; CHECK: OpStoreMatrixB8X1Burst1ColumnHW {{.*}}
+OpStoreMatrixB8X1Burst1ColumnHW %buf %obj0 %zero
+; CHECK: OpStoreMatrixB8X2Burst1ColumnHW {{.*}}
+OpStoreMatrixB8X2Burst1ColumnHW %buf %obj1 %zero
+; CHECK: OpStoreMatrixB16X1Burst1RowHW {{.*}}
+OpStoreMatrixB16X1Burst1RowHW %buf %obj3 %zero
+; CHECK: OpStoreMatrixB16X2Burst1RowHW {{.*}}
+OpStoreMatrixB16X2Burst1RowHW %buf %obj4 %zero
+; CHECK: OpControlBarrier
+OpControlBarrier %workgroup %workgroup %zero
+; CHECK: OpStoreMatrixB8X1Burst1RowHW {{.*}} Volatile
+OpStoreMatrixB8X1Burst1RowHW %buf %obj0 %zero Volatile
+; CHECK: OpStoreMatrixB8X2Burst1RowHW {{.*}} Volatile
+OpStoreMatrixB8X2Burst1RowHW %buf %obj2 %zero Volatile
+; CHECK: OpStoreMatrixB8X1Burst1ColumnHW {{.*}} Volatile
+OpStoreMatrixB8X1Burst1ColumnHW %buf %obj0 %zero Volatile
+; CHECK: OpStoreMatrixB8X2Burst1ColumnHW {{.*}} Volatile
+OpStoreMatrixB8X2Burst1ColumnHW %buf %obj1 %zero Volatile
+; CHECK: OpStoreMatrixB16X1Burst1RowHW {{.*}} Volatile
+OpStoreMatrixB16X1Burst1RowHW %buf %obj3 %zero Volatile
+; CHECK: OpStoreMatrixB16X2Burst1RowHW {{.*}} Volatile
+OpStoreMatrixB16X2Burst1RowHW %buf %obj4 %zero Volatile
+OpReturn
+OpFunctionEnd
+)";
+  SinglePassRunAndMatch<AggressiveDCEPass>(shader, true);
+}
+
 TEST_F(AggressiveDCETest, EliminateExtendedInst) {
   //  #version 140
   //

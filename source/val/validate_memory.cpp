@@ -60,6 +60,20 @@ bool IsLoadMatrixHW(spv::Op opcode) {
   }
 }
 
+bool IsStoreMatrixHW(spv::Op opcode) {
+  switch (opcode) {
+    case spv::Op::OpStoreMatrixB8X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X1Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB16X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB16X2Burst1RowHW:
+      return true;
+    default:
+      return false;
+  }
+}
+
 bool IsAllowedTypeOrArrayOfSame(ValidationState_t& _, const Instruction* type,
                                 std::initializer_list<spv::Op> allowed) {
   if (std::find(allowed.begin(), allowed.end(), type->opcode()) !=
@@ -299,6 +313,12 @@ std::pair<spv::StorageClass, spv::StorageClass> GetStorageClass(
     case spv::Op::OpCooperativeMatrixStoreNV:
     case spv::Op::OpCooperativeMatrixStoreTensorNV:
     case spv::Op::OpCooperativeMatrixStoreKHR:
+    case spv::Op::OpStoreMatrixB8X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X1Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB16X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB16X2Burst1RowHW:
     case spv::Op::OpCooperativeMatrixStoreHW:
     case spv::Op::OpCooperativeVectorStoreNV:
     case spv::Op::OpCooperativeVectorStoreHW:
@@ -414,7 +434,7 @@ spv_result_t CheckMemoryAccess(ValidationState_t& _, const Instruction* inst,
   }
 
   if (mask & uint32_t(spv::MemoryAccessMask::MakePointerVisibleKHR)) {
-    if (inst->opcode() == spv::Op::OpStore ||
+    if (IsStoreMatrixHW(inst->opcode()) || inst->opcode() == spv::Op::OpStore ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreNV ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreKHR ||
         inst->opcode() == spv::Op::OpCooperativeMatrixStoreTensorNV ||
@@ -2321,6 +2341,123 @@ spv_result_t ValidateLoadMatrixHW(ValidationState_t& _,
   return CheckMemoryAccess(_, inst, 4);
 }
 
+spv_result_t ValidateStoreMatrixHW(ValidationState_t& _,
+                                   const Instruction* inst) {
+  uint32_t width = 0, rows = 0, columns = 0;
+  switch (inst->opcode()) {
+    case spv::Op::OpStoreMatrixB8X1Burst1RowHW:
+      width = 8;
+      rows = 16;
+      columns = 16;
+      break;
+    case spv::Op::OpStoreMatrixB8X2Burst1RowHW:
+      width = 8;
+      rows = 32;
+      columns = 16;
+      break;
+    case spv::Op::OpStoreMatrixB8X1Burst1ColumnHW:
+      width = 8;
+      rows = 16;
+      columns = 16;
+      break;
+    case spv::Op::OpStoreMatrixB8X2Burst1ColumnHW:
+      width = 8;
+      rows = 16;
+      columns = 32;
+      break;
+    case spv::Op::OpStoreMatrixB16X1Burst1RowHW:
+      width = 16;
+      rows = 16;
+      columns = 8;
+      break;
+    case spv::Op::OpStoreMatrixB16X2Burst1RowHW:
+      width = 16;
+      rows = 32;
+      columns = 8;
+      break;
+    default:
+      assert(false);
+      return SPV_ERROR_INTERNAL;
+  }
+  const auto* object = _.FindDef(inst->GetOperandAs<uint32_t>(1));
+  const auto* matrix = object ? _.FindDef(object->type_id()) : nullptr;
+  if (!matrix || matrix->opcode() != spv::Op::OpTypeCooperativeMatrixHW) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Object must have an OpTypeCooperativeMatrixHW type.";
+  }
+  const auto* component = _.FindDef(matrix->GetOperandAs<uint32_t>(1));
+  if (!component || component->opcode() != spv::Op::OpTypeInt ||
+      component->GetOperandAs<uint32_t>(1) != width ||
+      component->GetOperandAs<uint32_t>(2) != 1) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Matrix component type must be a signed " << width
+           << "-bit integer.";
+  }
+  int64_t actual_rows = 0, actual_columns = 0;
+  if (!_.EvalConstantValInt64(matrix->GetOperandAs<uint32_t>(2),
+                              &actual_rows) ||
+      !_.EvalConstantValInt64(matrix->GetOperandAs<uint32_t>(3),
+                              &actual_columns) ||
+      actual_rows != rows || actual_columns != columns) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Matrix shape must be " << rows << " rows by " << columns
+           << " columns.";
+  }
+
+  const auto* pointer = _.FindDef(inst->GetOperandAs<uint32_t>(0));
+  const auto* pointer_type = pointer ? _.FindDef(pointer->type_id()) : nullptr;
+  if (!pointer_type || pointer_type->opcode() != spv::Op::OpTypePointer) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Pointer must have an OpTypePointer type.";
+  }
+  if (_.addressing_model() == spv::AddressingModel::Logical &&
+      ((!_.features().variable_pointers &&
+        !spvOpcodeReturnsLogicalPointer(pointer->opcode())) ||
+       (_.features().variable_pointers &&
+        !spvOpcodeReturnsLogicalVariablePointer(pointer->opcode())))) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Pointer must be a logical pointer.";
+  }
+  const auto storage = pointer_type->GetOperandAs<spv::StorageClass>(1);
+  if (storage != spv::StorageClass::Workgroup &&
+      storage != spv::StorageClass::StorageBuffer &&
+      storage != spv::StorageClass::PhysicalStorageBuffer) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Pointer storage class must be Workgroup, StorageBuffer, or "
+              "PhysicalStorageBuffer.";
+  }
+  const auto* pointee = _.FindDef(pointer_type->GetOperandAs<uint32_t>(2));
+  const bool array =
+      pointee && (pointee->opcode() == spv::Op::OpTypeArray ||
+                  pointee->opcode() == spv::Op::OpTypeRuntimeArray);
+  if (!pointee || (_.HasCapability(spv::Capability::Shader) && !array) ||
+      !IsScalarOrVectorNumericType(
+          _, array ? pointee->GetOperandAs<uint32_t>(1) : pointee->id())) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Pointer must point to numeric scalars or vectors; Shader "
+              "requires an array of those elements.";
+  }
+
+  const auto offset_id = inst->GetOperandAs<uint32_t>(2);
+  const auto* offset = _.FindDef(offset_id);
+  const auto* offset_type = offset ? _.FindDef(offset->type_id()) : nullptr;
+  if (!offset_type || offset_type->opcode() != spv::Op::OpTypeInt ||
+      offset_type->GetOperandAs<uint32_t>(1) != 32 ||
+      offset_type->GetOperandAs<uint32_t>(2) != 0) {
+    return _.diag(SPV_ERROR_INVALID_ID, inst)
+           << "Offset must be a 32-bit unsigned integer scalar.";
+  }
+  // Dynamic and specialization-dependent offsets are permitted. Check only
+  // values known before specialization, without inferring pointer alignment.
+  int64_t offset_value = 0;
+  if (_.EvalConstantValInt64(offset_id, &offset_value) &&
+      offset_value % 16 != 0) {
+    return _.diag(SPV_ERROR_INVALID_VALUE, inst)
+           << "Offset must be aligned to 16 bytes.";
+  }
+  return CheckMemoryAccess(_, inst, 3);
+}
+
 spv_result_t ValidateCooperativeMatrixLoadStoreHW(ValidationState_t& _,
                                                   const Instruction* inst) {
   uint32_t type_id;
@@ -3565,6 +3702,14 @@ spv_result_t MemoryPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpLoadMatrixB16X1Burst2ColumnHW:
     case spv::Op::OpLoadMatrixB16X2Burst2ColumnHW:
       if (auto error = ValidateLoadMatrixHW(_, inst)) return error;
+      break;
+    case spv::Op::OpStoreMatrixB8X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1RowHW:
+    case spv::Op::OpStoreMatrixB8X1Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB8X2Burst1ColumnHW:
+    case spv::Op::OpStoreMatrixB16X1Burst1RowHW:
+    case spv::Op::OpStoreMatrixB16X2Burst1RowHW:
+      if (auto error = ValidateStoreMatrixHW(_, inst)) return error;
       break;
     case spv::Op::OpCooperativeMatrixLoadHW:
     case spv::Op::OpCooperativeMatrixStoreHW:
