@@ -624,6 +624,8 @@ class HwLowerToStandardPass : public Pass {
                                       uint32_t first_in_operand) const;
   bool DirectTransportChainIsMovable(
       const std::vector<Instruction*>& chain) const;
+  bool CanForwardFunctionStoreToLoad(Instruction* store,
+                                     Instruction* load) const;
   bool GetPointerStorageClass(uint32_t pointer_id,
                               uint32_t* storage_class) const;
   Instruction* TraceFunctionValueSource(Instruction* value_inst,

@@ -314,6 +314,27 @@ TEST_F(HwLargeConstantTest, RejectsIndexRepresentationOverflow) {
   SinglePassRunAndFail<HwLowerToStandardPass>(text);
 }
 
+TEST_F(HwLargeConstantTest,
+       ReplicatedStructContainingLargeCooperativeConstant) {
+  for (bool scalar : {false, true}) {
+    for (uint32_t n : {65532u, 65533u, 65534u}) {
+      SCOPED_TRACE(n);
+      SCOPED_TRACE(scalar);
+      const std::string text = ConstantModule(
+          "OpTypeCooperativeVectorHW %float %n", n,
+          "%Pair = OpTypeStruct %T %T\n"
+          "%pair = OpConstantCompositeReplicateEXT %Pair %value\n"
+          "%Outer = OpTypeStruct %Pair\n"
+          "%outer = OpConstantCompositeReplicateEXT %Outer %pair\n",
+          "%copy = OpCopyObject %Outer %outer\n");
+      const auto out = Lower(text, scalar);
+      EXPECT_NE(std::string::npos, out.find("OpTypeStruct"));
+      if ((scalar || n % 2 != 0) && n > 65532)
+        EXPECT_NE(std::string::npos, out.find("OpLoopMerge"));
+    }
+  }
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools

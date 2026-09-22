@@ -379,6 +379,8 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
           }
         }
         ApplyActiveFPFastMathMode(lowered);
+        if (IsFloatArithmeticOpcode(original_opcode))
+          ApplyActiveNoContraction(lowered);
         lowered_id = lowered ? lowered->result_id() : 0;
       } else if (kind == ElementwiseLoopKind::kScale) {
         const uint32_t operand_id = extract_scalar(loop_operands[0], index);
@@ -390,6 +392,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
                                       operand_id, original_operand_ids[1])
                 : nullptr;
         ApplyActiveFPFastMathMode(scaled);
+        if (scale_opcode == spv::Op::OpFMul) ApplyActiveNoContraction(scaled);
         lowered_id = scaled ? scaled->result_id() : 0;
       } else if (kind == ElementwiseLoopKind::kSelect) {
         const uint32_t lhs_id = extract_scalar(loop_operands[0], index);
@@ -701,6 +704,8 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
       }
     }
     ApplyActiveFPFastMathMode(lowered);
+    if (IsFloatArithmeticOpcode(original_opcode))
+      ApplyActiveNoContraction(lowered);
     lowered_piece_id = lowered ? lowered->result_id() : 0;
   } else if (kind == ElementwiseLoopKind::kScale) {
     const uint32_t input_id = load_for_result_piece(loop_operands[0]);
@@ -715,10 +720,13 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
           body_builder.AddBinaryOp(result_piece_type_id, scale_opcode, input_id,
                                    original_operand_ids[1]);
       ApplyActiveFPFastMathMode(scaled);
+      if (scale_opcode == spv::Op::OpFMul) ApplyActiveNoContraction(scaled);
       lowered_piece_id = scaled ? scaled->result_id() : 0;
     }
     if (lowered_piece_id != 0 && result_packed) {
       ApplyActiveFPFastMathMode(get_def_use_mgr()->GetDef(lowered_piece_id));
+      if (scale_opcode == spv::Op::OpFMul)
+        ApplyActiveNoContraction(get_def_use_mgr()->GetDef(lowered_piece_id));
     }
   } else if (kind == ElementwiseLoopKind::kSelect) {
     const uint32_t lhs_id = load_for_result_piece(loop_operands[0]);

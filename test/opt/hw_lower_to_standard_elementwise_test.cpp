@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sstream>
+
 #include "test/opt/hw_lower_to_standard_test_utils.h"
 
 namespace spvtools {
@@ -1056,6 +1058,177 @@ OpFunctionEnd
   EXPECT_EQ(1u, CountSubstring(disassembly, " SMin "));
   EXPECT_EQ(1u, CountSubstring(disassembly, " SMax "));
   EXPECT_EQ(1u, CountSubstring(disassembly, " SClamp "));
+}
+
+// Generated from Test/spv.hw_extfree_precise_arithmetic.comp (WIDTH=4).
+TEST_F(HwLowerToStandardTest,
+       ElementwisePreservesNoContractionWithoutContaminatingRelaxedOps) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability VulkanMemoryModel
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical Vulkan
+OpEntryPoint GLCompute %main "main" %A %B %D
+OpExecutionMode %main LocalSize 1 1 1
+OpSource GLSL 460
+OpSourceExtension "GL_HW_neural_shader"
+OpName %main "main"
+OpName %tempArg "tempArg"
+OpName %InputA "InputA"
+OpMemberName %InputA 0 "data"
+OpName %A "A"
+OpName %a "a"
+OpName %tempArg_0 "tempArg"
+OpName %InputB "InputB"
+OpMemberName %InputB 0 "data"
+OpName %B "B"
+OpName %b "b"
+OpName %tempArg_1 "tempArg"
+OpName %c "c"
+OpName %strictValue "strictValue"
+OpName %strictScale "strictScale"
+OpName %relaxed "relaxed"
+OpName %Output "Output"
+OpMemberName %Output 0 "data"
+OpName %D "D"
+OpDecorate %_runtimearr_float ArrayStride 4
+OpDecorate %InputA Block
+OpMemberDecorate %InputA 0 Offset 0
+OpDecorate %A Binding 0
+OpDecorate %A DescriptorSet 0
+OpDecorate %_runtimearr_float_0 ArrayStride 4
+OpDecorate %InputB Block
+OpMemberDecorate %InputB 0 Offset 0
+OpDecorate %B Binding 1
+OpDecorate %B DescriptorSet 0
+OpDecorate %42 NoContraction
+OpDecorate %44 NoContraction
+OpDecorate %51 NoContraction
+OpDecorate %_runtimearr_float_1 ArrayStride 4
+OpDecorate %Output Block
+OpMemberDecorate %Output 0 Offset 0
+OpDecorate %D Binding 2
+OpDecorate %D DescriptorSet 0
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%9 = OpTypeCooperativeVectorHW %float %uint_4
+%_ptr_Function_9 = OpTypePointer Function %9
+%_runtimearr_float = OpTypeRuntimeArray %float
+%InputA = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_InputA = OpTypePointer StorageBuffer %InputA
+%A = OpVariable %_ptr_StorageBuffer_InputA StorageBuffer
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%uint_0 = OpConstant %uint 0
+%_runtimearr_float_0 = OpTypeRuntimeArray %float
+%InputB = OpTypeStruct %_runtimearr_float_0
+%_ptr_StorageBuffer_InputB = OpTypePointer StorageBuffer %InputB
+%B = OpVariable %_ptr_StorageBuffer_InputB StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float_0 = OpTypePointer StorageBuffer %_runtimearr_float_0
+%int_4 = OpConstant %int 4
+%_ptr_StorageBuffer_float = OpTypePointer StorageBuffer %float
+%_runtimearr_float_1 = OpTypeRuntimeArray %float
+%Output = OpTypeStruct %_runtimearr_float_1
+%_ptr_StorageBuffer_Output = OpTypePointer StorageBuffer %Output
+%D = OpVariable %_ptr_StorageBuffer_Output StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float_1 = OpTypePointer StorageBuffer %_runtimearr_float_1
+%v3uint = OpTypeVector %uint 3
+%uint_1 = OpConstant %uint 1
+%67 = OpConstantComposite %v3uint %uint_1 %uint_1 %uint_1
+%main = OpFunction %void None %3
+%5 = OpLabel
+%tempArg = OpVariable %_ptr_Function_9 Function
+%a = OpVariable %_ptr_Function_9 Function
+%tempArg_0 = OpVariable %_ptr_Function_9 Function
+%b = OpVariable %_ptr_Function_9 Function
+%tempArg_1 = OpVariable %_ptr_Function_9 Function
+%c = OpVariable %_ptr_Function_9 Function
+%strictValue = OpVariable %_ptr_Function_9 Function
+%strictScale = OpVariable %_ptr_Function_9 Function
+%relaxed = OpVariable %_ptr_Function_9 Function
+%19 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %A %int_0
+%21 = OpCooperativeVectorLoadHW %9 %19 %uint_0
+OpStore %tempArg %21
+%23 = OpLoad %9 %tempArg
+OpStore %a %23
+%30 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_0 %B %int_0
+%31 = OpCooperativeVectorLoadHW %9 %30 %uint_0
+OpStore %tempArg_0 %31
+%33 = OpLoad %9 %tempArg_0
+OpStore %b %33
+%35 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %A %int_0
+%36 = OpCooperativeVectorLoadHW %9 %35 %uint_4
+OpStore %tempArg_1 %36
+%38 = OpLoad %9 %tempArg_1
+OpStore %c %38
+%40 = OpLoad %9 %a
+%41 = OpLoad %9 %b
+%42 = OpFMul %9 %40 %41
+%43 = OpLoad %9 %c
+%44 = OpFAdd %9 %42 %43
+OpStore %strictValue %44
+%46 = OpLoad %9 %strictValue
+%49 = OpAccessChain %_ptr_StorageBuffer_float %B %int_0 %int_4
+%50 = OpLoad %float %49
+%51 = OpVectorTimesScalar %9 %46 %50
+OpStore %strictScale %51
+%53 = OpLoad %9 %a
+%54 = OpLoad %9 %b
+%55 = OpFSub %9 %53 %54
+OpStore %relaxed %55
+%56 = OpLoad %9 %strictScale
+%62 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_1 %D %int_0
+OpCooperativeVectorStoreHW %62 %uint_0 %56
+%63 = OpLoad %9 %relaxed
+%64 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_1 %D %int_0
+OpCooperativeVectorStoreHW %64 %uint_4 %63
+OpReturn
+OpFunctionEnd
+)";
+  SetTargetEnv(SPV_ENV_VULKAN_1_3);
+  SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(text, &binary));
+  ASSERT_TRUE(tools.Validate(binary));
+  for (auto mode : {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                    HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+    for (uint32_t unroll : {2u, 4096u}) {
+      auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+          text, true, true, mode,
+          HwLowerToStandardPass::CompletenessMode::kExtensionFree, 0u, 0ull,
+          unroll, 4096ull);
+      ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+      const auto& out = std::get<0>(result);
+      ExpectNoHwOrCoopMatrix(out);
+      std::istringstream lines(out);
+      std::string line;
+      size_t strict_ops = 0, relaxed_ops = 0;
+      while (std::getline(lines, line)) {
+        const bool strict_op =
+            line.find(" OpFMul ") != std::string::npos ||
+            line.find(" OpFAdd ") != std::string::npos ||
+            line.find(" OpVectorTimesScalar ") != std::string::npos;
+        const bool relaxed_op = line.find(" OpFSub ") != std::string::npos;
+        if (!strict_op && !relaxed_op) continue;
+        std::istringstream tokens(line);
+        std::string id;
+        tokens >> id;
+        const bool decorated = out.find("OpDecorate " + id +
+                                        " NoContraction") != std::string::npos;
+        EXPECT_EQ(strict_op, decorated) << line;
+        strict_ops += strict_op;
+        relaxed_ops += relaxed_op;
+      }
+      EXPECT_GT(strict_ops, 0u);
+      EXPECT_GT(relaxed_ops, 0u);
+    }
+  }
 }
 
 }  // namespace

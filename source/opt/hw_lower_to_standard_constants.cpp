@@ -283,17 +283,58 @@ uint32_t HwLowerToStandardPass::MaterializeConstantValue(
         if (!pair) return 0;
         element = pair->result_id();
       }
-      uint32_t count = 0;
-      if (!type || type->opcode() != spv::Op::OpTypeArray ||
-          !GetConstantU32(type->GetSingleWordInOperand(1), &count))
-        return 0;
-      uint32_t element_type = type->GetSingleWordInOperand(0);
-      const uint32_t repeat =
-          BuildRepeatedValueFunction(type_id, element_type, count);
-      if (!repeat) return 0;
-      auto* call = body.AddFunctionCall(type_id, repeat, {element});
-      if (!call) return 0;
-      value_id = call->result_id();
+      if (type && type->opcode() == spv::Op::OpTypeStruct) {
+        // A replicated parent inherits largeness from its child, even when
+        // it has only one member. Materialize the child once and repeat that
+        // value across the struct; array indexing is not valid for structs.
+        const uint32_t count = type->NumInOperands();
+        if (count <= kMaxCompositeConstituents) {
+          auto* value = body.AddCompositeConstruct(
+              type_id, std::vector<uint32_t>(count, element));
+          if (!value) return 0;
+          value_id = value->result_id();
+        } else {
+          // OpTypeStruct has one fewer fixed word than OpCompositeConstruct.
+          // Its largest legal member count therefore needs addressable storage.
+          const uint32_t pointer_type =
+              GetOrCreatePointerType(type_id, spv::StorageClass::Function);
+          auto* variable = body.AddVariable(
+              pointer_type, uint32_t(spv::StorageClass::Function));
+          if (!variable) return 0;
+          // Variables must precede the child materialization instructions.
+          variable->RemoveFromList();
+          block->begin().InsertBefore(std::unique_ptr<Instruction>(variable));
+          for (uint32_t member = 0; member < count; ++member) {
+            const uint32_t member_pointer_type =
+                GetOrCreatePointerType(type->GetSingleWordInOperand(member),
+                                       spv::StorageClass::Function);
+            auto* pointer =
+                body.AddAccessChain(member_pointer_type, variable->result_id(),
+                                    {GetOrCreateUIntConstant(member)});
+            if (!pointer || !body.AddStore(pointer->result_id(), element))
+              return 0;
+          }
+          auto* value = body.AddLoad(type_id, variable->result_id());
+          if (!value) return 0;
+          value_id = value->result_id();
+        }
+      } else {
+        uint32_t count = 0;
+        if (!type || type->opcode() != spv::Op::OpTypeArray ||
+            !GetConstantU32(type->GetSingleWordInOperand(1), &count)) {
+          ReportError(inst,
+                      "large replicated constant requires a fixed array or "
+                      "homogeneous struct");
+          return 0;
+        }
+        uint32_t element_type = type->GetSingleWordInOperand(0);
+        const uint32_t repeat =
+            BuildRepeatedValueFunction(type_id, element_type, count);
+        if (!repeat) return 0;
+        auto* call = body.AddFunctionCall(type_id, repeat, {element});
+        if (!call) return 0;
+        value_id = call->result_id();
+      }
     } else if (inst->opcode() == spv::Op::OpSpecConstantOp) {
       const auto opcode = spv::Op(inst->GetSingleWordInOperand(0));
       std::vector<Operand> operands;

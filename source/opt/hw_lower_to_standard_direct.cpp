@@ -1615,6 +1615,56 @@ bool HwLowerToStandardPass::MemoryAccessOperandsAreMovable(
   return first_in_operand + 1 + parameter_count == inst->NumInOperands();
 }
 
+bool HwLowerToStandardPass::CanForwardFunctionStoreToLoad(
+    Instruction* store, Instruction* load) const {
+  if (!store || !load || !DirectTransportChainIsMovable({store, load}))
+    return false;
+  BasicBlock* block = context()->get_instr_block(store);
+  if (!block || block != context()->get_instr_block(load)) return false;
+
+  // Distinct Function variables cannot alias. Derived pointers share their
+  // variable's root; parameters and unrecognized pointer operations remain
+  // conservative. Do not infer disjointness merely from unequal pointer IDs.
+  auto root_variable = [this](uint32_t id) -> uint32_t {
+    std::unordered_set<uint32_t> visited;
+    while (id && visited.insert(id).second) {
+      Instruction* pointer = get_def_use_mgr()->GetDef(id);
+      if (!pointer || !IsFunctionPointer(id)) return 0;
+      if (pointer->opcode() == spv::Op::OpVariable) return id;
+      switch (pointer->opcode()) {
+        case spv::Op::OpAccessChain:
+        case spv::Op::OpInBoundsAccessChain:
+        case spv::Op::OpCopyObject:
+          id = pointer->GetSingleWordInOperand(0);
+          break;
+        default:
+          return 0;
+      }
+    }
+    return 0;
+  };
+  const uint32_t root = root_variable(store->GetSingleWordInOperand(0));
+  bool after_store = false;
+  for (Instruction& inst : *block) {
+    if (&inst == store) {
+      after_store = true;
+      continue;
+    }
+    if (&inst == load) return after_store;
+    if (!after_store || !InstructionMayWriteOrOrderMemory(&inst, true))
+      continue;
+    if (inst.opcode() == spv::Op::OpStore ||
+        inst.opcode() == spv::Op::OpCopyMemory ||
+        inst.opcode() == spv::Op::OpCopyMemorySized) {
+      const uint32_t written_root =
+          root_variable(inst.GetSingleWordInOperand(0));
+      if (root && written_root && root != written_root) continue;
+    }
+    return false;
+  }
+  return false;
+}
+
 Instruction* HwLowerToStandardPass::TraceFunctionValueSource(
     Instruction* value_inst, Instruction* before,
     std::vector<Instruction*>* chain, uint32_t depth) const {
@@ -1639,6 +1689,14 @@ Instruction* HwLowerToStandardPass::TraceFunctionValueSource(
 
   Instruction* store = FindLastStoreToFunctionPointer(pointer_id, value_inst);
   if (!store || store->NumInOperands() < 2) return nullptr;
+
+  // Tracing a source is also value forwarding: a derived-pointer write or a
+  // call between the whole-object store and load can change the loaded value.
+  // Apply this check before every consumer (including value-argument and
+  // constant fallbacks), not just before moving a direct buffer load.
+  if (!CanForwardFunctionStoreToLoad(store, value_inst)) {
+    return value_inst;
+  }
 
   chain->push_back(value_inst);
   chain->push_back(store);

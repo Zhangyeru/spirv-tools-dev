@@ -6112,6 +6112,174 @@ OpFunctionEnd
   }
 }
 
+// Frontend-generated input from Test/spv.hw_extfree_mutation_vector.comp,
+// WIDTH=4, Vulkan 1.3. The GLSL integration test remains the primary source.
+TEST_F(HwLowerToStandardTest, DirectValueArgumentsObserveComponentWrites) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability VulkanMemoryModel
+OpCapability CooperativeMatrixHW
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+%1 = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical Vulkan
+OpEntryPoint GLCompute %main "main" %A %B %gl_GlobalInvocationID %D
+OpExecutionMode %main LocalSize 1 1 1
+OpSource GLSL 460
+OpSourceExtension "GL_HW_neural_shader"
+OpName %modified_input "modified_input"
+OpName %modified_matrix "modified_matrix"
+OpName %modified_bias "modified_bias"
+OpName %main "main"
+OpName %tempArg "tempArg"
+OpName %InputA "InputA"
+OpMemberName %InputA 0 "data"
+OpName %A "A"
+OpName %inputValue "inputValue"
+OpName %tempArg_0 "tempArg"
+OpName %InputB "InputB"
+OpMemberName %InputB 0 "data"
+OpName %B "B"
+OpName %bias "bias"
+OpName %tempArg_1 "tempArg"
+OpName %matrixValue "matrixValue"
+OpName %index "index"
+OpName %gl_GlobalInvocationID "gl_GlobalInvocationID"
+OpName %tempArg_2 "tempArg"
+OpName %result "result"
+OpName %Output "Output"
+OpMemberName %Output 0 "data"
+OpName %D "D"
+OpDecorate %_runtimearr_float ArrayStride 4
+OpDecorate %InputA Block
+OpMemberDecorate %InputA 0 Offset 0
+OpDecorate %A Binding 0
+OpDecorate %A DescriptorSet 0
+OpDecorate %_runtimearr_float_0 ArrayStride 4
+OpDecorate %InputB Block
+OpMemberDecorate %InputB 0 Offset 0
+OpDecorate %B Binding 1
+OpDecorate %B DescriptorSet 0
+OpDecorate %gl_GlobalInvocationID BuiltIn GlobalInvocationId
+OpDecorate %_runtimearr_float_1 ArrayStride 4
+OpDecorate %Output Block
+OpMemberDecorate %Output 0 Offset 0
+OpDecorate %D Binding 2
+OpDecorate %D DescriptorSet 0
+%void = OpTypeVoid
+%3 = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%9 = OpTypeCooperativeVectorHW %float %uint_4
+%_ptr_Function_9 = OpTypePointer Function %9
+%_runtimearr_float = OpTypeRuntimeArray %float
+%InputA = OpTypeStruct %_runtimearr_float
+%_ptr_StorageBuffer_InputA = OpTypePointer StorageBuffer %InputA
+%A = OpVariable %_ptr_StorageBuffer_InputA StorageBuffer
+%int = OpTypeInt 32 1
+%int_0 = OpConstant %int 0
+%_ptr_StorageBuffer__runtimearr_float = OpTypePointer StorageBuffer %_runtimearr_float
+%uint_1 = OpConstant %uint 1
+%_runtimearr_float_0 = OpTypeRuntimeArray %float
+%InputB = OpTypeStruct %_runtimearr_float_0
+%_ptr_StorageBuffer_InputB = OpTypePointer StorageBuffer %InputB
+%B = OpVariable %_ptr_StorageBuffer_InputB StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float_0 = OpTypePointer StorageBuffer %_runtimearr_float_0
+%34 = OpTypeCooperativeMatrixHW %float %uint_4 %uint_4 MatrixUseBHW
+%_ptr_Function_34 = OpTypePointer Function %34
+%v2int = OpTypeVector %int 2
+%int_4 = OpConstant %int 4
+%40 = OpConstantComposite %v2int %int_4 %int_4
+%41 = OpConstantComposite %v2int %int_0 %int_0
+%int_1 = OpConstant %int 1
+%_ptr_Function_uint = OpTypePointer Function %uint
+%v3uint = OpTypeVector %uint 3
+%_ptr_Input_v3uint = OpTypePointer Input %v3uint
+%gl_GlobalInvocationID = OpVariable %_ptr_Input_v3uint Input
+%uint_0 = OpConstant %uint 0
+%_ptr_Input_uint = OpTypePointer Input %uint
+%float_7 = OpConstant %float 7
+%_ptr_Function_float = OpTypePointer Function %float
+%float_9 = OpConstant %float 9
+%float_11 = OpConstant %float 11
+%_runtimearr_float_1 = OpTypeRuntimeArray %float
+%Output = OpTypeStruct %_runtimearr_float_1
+%_ptr_StorageBuffer_Output = OpTypePointer StorageBuffer %Output
+%D = OpVariable %_ptr_StorageBuffer_Output StorageBuffer
+%_ptr_StorageBuffer__runtimearr_float_1 = OpTypePointer StorageBuffer %_runtimearr_float_1
+%80 = OpConstantComposite %v3uint %uint_1 %uint_1 %uint_1
+%main = OpFunction %void None %3
+%5 = OpLabel
+%tempArg = OpVariable %_ptr_Function_9 Function
+%inputValue = OpVariable %_ptr_Function_9 Function
+%tempArg_0 = OpVariable %_ptr_Function_9 Function
+%bias = OpVariable %_ptr_Function_9 Function
+%tempArg_1 = OpVariable %_ptr_Function_34 Function
+%matrixValue = OpVariable %_ptr_Function_34 Function
+%index = OpVariable %_ptr_Function_uint Function
+%tempArg_2 = OpVariable %_ptr_Function_9 Function
+%result = OpVariable %_ptr_Function_9 Function
+%19 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float %A %int_0
+%21 = OpCooperativeVectorLoadHW %9 %19 %uint_1
+OpStore %tempArg %21
+%23 = OpLoad %9 %tempArg
+OpStore %inputValue %23
+%30 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_0 %B %int_0
+%31 = OpCooperativeVectorLoadHW %9 %30 %uint_1
+OpStore %tempArg_0 %31
+%33 = OpLoad %9 %tempArg_0
+OpStore %bias %33
+%37 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_0 %B %int_0
+%43 = OpCooperativeMatrixLoadHW %34 %37 %40 %41 %int_1
+OpStore %tempArg_1 %43
+%45 = OpLoad %34 %tempArg_1
+OpStore %matrixValue %45
+%53 = OpAccessChain %_ptr_Input_uint %gl_GlobalInvocationID %uint_0
+%54 = OpLoad %uint %53
+%55 = OpUMod %uint %54 %uint_4
+OpStore %index %55
+%56 = OpLoad %uint %index
+%59 = OpAccessChain %_ptr_Function_float %inputValue %56
+OpStore %59 %float_7
+%60 = OpLoad %uint %index
+%62 = OpAccessChain %_ptr_Function_float %bias %60
+OpStore %62 %float_9
+%63 = OpLoad %uint %index
+%65 = OpAccessChain %_ptr_Function_float %matrixValue %63
+OpStore %65 %float_11
+%modified_input = OpLoad %9 %inputValue
+%modified_matrix = OpLoad %34 %matrixValue
+%modified_bias = OpLoad %9 %bias
+%70 = OpCooperativeVectorMatrixMulAddHW %9 %modified_input %modified_matrix %modified_bias
+OpStore %tempArg_2 %70
+%72 = OpLoad %9 %tempArg_2
+OpStore %result %72
+%73 = OpLoad %9 %result
+%79 = OpAccessChain %_ptr_StorageBuffer__runtimearr_float_1 %D %int_0
+OpCooperativeVectorStoreHW %79 %uint_0 %73
+OpReturn
+OpFunctionEnd
+)";
+  SetTargetEnv(SPV_ENV_VULKAN_1_3);
+  SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(text, &binary));
+  ASSERT_TRUE(tools.Validate(binary));
+  for (uint64_t unroll : {2ull, 4096ull}) {
+    auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true,
+        HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+        HwLowerToStandardPass::CompletenessMode::kExtensionFree, 0u, 0ull,
+        4096u, unroll);
+    ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    const auto& out = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(out);
+    EXPECT_NE(std::string::npos,
+              out.find(" %modified_input %modified_matrix %modified_bias"));
+  }
+}
+
 }  // namespace
 }  // namespace opt
 }  // namespace spvtools
