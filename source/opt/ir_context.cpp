@@ -20,6 +20,7 @@
 
 #include "OpenCLDebugInfo100.h"
 #include "source/latest_version_glsl_std_450_header.h"
+#include "source/opt/ir_loader.h"
 #include "source/opt/log.h"
 #include "source/opt/reflect.h"
 
@@ -38,6 +39,41 @@ constexpr int kEntryPointExecutionModelInIdx = 0;
 constexpr uint32_t kDebugFunctionOperandFunctionIndex = 13;
 constexpr uint32_t kDebugGlobalVariableOperandVariableIndex = 11;
 }  // namespace
+
+bool IRContext::ReplaceModule(const std::vector<uint32_t>& binary) {
+  auto replacement = MakeUnique<Module>();
+  replacement->SetContext(this);
+  IrLoader loader(consumer_, replacement.get());
+  // A snapshot already contains its line information. Injecting extra debug
+  // instructions would allocate IDs against the module being replaced.
+  loader.SetExtraLineTracking(false);
+  const auto result = spvBinaryParse(
+      syntax_context_, &loader, binary.data(), binary.size(),
+      [](void* data, spv_endianness_t, uint32_t magic, uint32_t version,
+         uint32_t generator, uint32_t bound, uint32_t reserved) {
+        static_cast<IrLoader*>(data)->SetModuleHeader(magic, version, generator,
+                                                      bound, reserved);
+        return SPV_SUCCESS;
+      },
+      [](void* data, const spv_parsed_instruction_t* inst) {
+        return static_cast<IrLoader*>(data)->AddInstruction(inst)
+                   ? SPV_SUCCESS
+                   : SPV_ERROR_INVALID_BINARY;
+      },
+      nullptr);
+  loader.EndModule();
+  if (result != SPV_SUCCESS) return false;
+
+  InvalidateAnalysesExceptFor(kAnalysisNone);
+  // These caches also hold module pointers even when their analysis is invalid.
+  loop_descriptors_.clear();
+  scalar_evolution_analysis_.reset();
+  reg_pressure_.reset();
+  inst_folder_.reset();
+  ResetFeatureManager();
+  module_ = std::move(replacement);
+  return true;
+}
 
 void IRContext::BuildInvalidAnalyses(IRContext::Analysis set) {
   set = Analysis(set & ~valid_analyses_);

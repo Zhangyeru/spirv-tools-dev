@@ -52,18 +52,27 @@ class HwLowerToStandardPass : public Pass {
       CompletenessMode completeness_mode = CompletenessMode::kCooperativeOnly,
       uint32_t max_elements = 0, uint64_t max_matmul_macs = 0,
       uint32_t max_unrolled_elements = 4096,
-      uint64_t max_unrolled_matmul_macs = 4096)
+      uint64_t max_unrolled_matmul_macs = 4096, bool enable_direct = true,
+      bool enable_fusion = true)
       : lowering_mode_(lowering_mode),
         completeness_mode_(completeness_mode),
         max_elements_(max_elements),
         max_matmul_macs_(max_matmul_macs),
         max_unrolled_elements_(max_unrolled_elements),
-        max_unrolled_matmul_macs_(max_unrolled_matmul_macs) {}
+        max_unrolled_matmul_macs_(max_unrolled_matmul_macs),
+        enable_direct_(enable_direct),
+        enable_fusion_(enable_fusion) {}
 
   const char* name() const override { return "hw-lower-to-standard"; }
   Status Process() override;
 
+ protected:
+  // Separate attempts make recovery testable without a production failure flag.
+  virtual Status RunLoweringAttempt(IRContext* attempt, LoweringMode mode,
+                                    bool* recoverable);
+
  private:
+  Status ProcessImpl();
   struct MatrixTypeInfo {
     uint32_t type_id = 0;
     uint32_t component_type_id = 0;
@@ -748,6 +757,10 @@ class HwLowerToStandardPass : public Pass {
   uint64_t max_matmul_macs_ = 0;
   uint32_t max_unrolled_elements_ = 4096;
   uint64_t max_unrolled_matmul_macs_ = 4096;
+  bool enable_direct_ = true;
+  bool enable_fusion_ = true;
+  bool transactional_ = true;
+  bool recoverable_failure_ = false;
   ArithmeticContract active_arithmetic_contract_;
 };
 

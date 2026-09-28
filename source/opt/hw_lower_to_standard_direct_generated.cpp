@@ -49,7 +49,7 @@ namespace {
 // pressure dominates, and reuse each A/input scalar across several N packs in
 // the rolled helpers.
 constexpr uint64_t kDirectF32VectorUnrolledMacLimit = 256;
-constexpr uint64_t kDirectF32MatrixUnrolledMacLimit = 2048;
+constexpr uint64_t kDirectF32MatrixUnrolledMacLimit = 1024;
 constexpr uint32_t kMaxDirectOutputPacksPerGroup = 8;
 
 uint32_t DirectOutputPacksPerGroup(uint32_t extent,
@@ -396,6 +396,142 @@ uint32_t HwLowerToStandardPass::BuildDirectVectorMatmulFunctionPackedVec2(
     bool bias_conversion_has_explicit_fp_fast_math_mode,
     uint32_t bias_constant_id, bool bias_is_value,
     const std::vector<std::pair<uint32_t, uint32_t>>& value_arguments) {
+  if (lowering_mode_ == LoweringMode::kForceScalar) {
+    // The matcher has proved every captured read movable and its deleted
+    // transport chain closed. Keep one scalar accumulator per output and stream
+    // the matrix from its original buffer; no weight-sized Function array.
+    if (input_is_value || matrix_is_value || (has_bias && bias_is_value) ||
+        !value_arguments.empty() ||
+        !CanUseDirectVectorMatrixMul(result, input, matrix, bias))
+      return 0;
+    const uint32_t function_type =
+        GetOrCreateFunctionType(result.lowered_type_id, {});
+    const uint32_t function_id = TakeNextId();
+    if (!function_type || !function_id) return 0;
+    auto start = MakeUnique<Instruction>(
+        context(), spv::Op::OpFunction, result.lowered_type_id, function_id,
+        std::initializer_list<Operand>{{SPV_OPERAND_TYPE_FUNCTION_CONTROL, {0}},
+                                       IdOperand(function_type)});
+    auto function = MakeUnique<Function>(std::move(start));
+    std::array<uint32_t, 5> labels{};
+    std::array<BasicBlock*, 5> blocks{};
+    for (size_t i = 0; i < labels.size(); ++i) {
+      labels[i] = TakeNextId();
+      if (!labels[i]) return 0;
+      auto block = std::unique_ptr<BasicBlock>(MakeBasicBlock(labels[i]));
+      blocks[i] = block.get();
+      function->AddBasicBlock(std::move(block));
+    }
+    const uint32_t uint_type = GetOrCreateUIntType();
+    const uint32_t bool_type = GetOrCreateBoolType();
+    const uint32_t zero = GetOrCreateUIntConstant(0),
+                   one = GetOrCreateUIntConstant(1);
+    const uint32_t count = GetOrCreateUIntConstant(input.length);
+    const uint32_t index_pointer =
+        GetOrCreatePointerType(uint_type, spv::StorageClass::Function);
+    const uint32_t acc_pointer = GetOrCreatePointerType(
+        result.component_type_id, spv::StorageClass::Function);
+    auto* index = AddFunctionVariable(function.get(), index_pointer);
+    if (!index) return 0;
+    std::vector<Instruction*> accumulators;
+    for (uint32_t col = 0; col < result.length; ++col) {
+      accumulators.push_back(AddFunctionVariable(function.get(), acc_pointer));
+      if (!accumulators.back()) return 0;
+    }
+    InstructionBuilder entry(context(), blocks[0]);
+    const uint32_t x_pointer = BuildCapturedPointer(&entry, input_pointer_id);
+    const uint32_t w_pointer = BuildCapturedPointer(&entry, matrix_pointer_id);
+    const uint32_t c_pointer =
+        has_bias ? BuildCapturedPointer(&entry, bias_pointer_id) : 0;
+    const uint32_t shape_cols =
+        BuildPairComponentAsUInt(&entry, nullptr, matrix_shape_id, 1);
+    const uint32_t offset_row =
+        BuildPairComponentAsUInt(&entry, nullptr, matrix_offset_id, 0);
+    const uint32_t offset_col =
+        BuildPairComponentAsUInt(&entry, nullptr, matrix_offset_id, 1);
+    if (!x_pointer || !w_pointer || (has_bias && !c_pointer) || !shape_cols ||
+        !offset_row || !offset_col)
+      return 0;
+    for (uint32_t col = 0; col < result.length; ++col) {
+      const uint32_t initial =
+          has_bias ? AddMemoryElementLoad(
+                         &entry, nullptr, c_pointer, bias_pointer_type_id,
+                         result.component_type_id,
+                         GetOrCreateUIntConstant(bias_offset + col),
+                         bias_memory_operands, uint_type)
+                   : GetOrCreateZero(result.component_type_id);
+      if (!initial || !entry.AddStore(accumulators[col]->result_id(), initial))
+        return 0;
+    }
+    if (!entry.AddStore(index->result_id(), zero) ||
+        !entry.AddBranch(labels[1]))
+      return 0;
+    InstructionBuilder header(context(), blocks[1]);
+    auto* k = header.AddLoad(uint_type, index->result_id());
+    auto* cond = k ? header.AddBinaryOp(bool_type, spv::Op::OpULessThan,
+                                        k->result_id(), count)
+                   : nullptr;
+    if (!cond || !header.AddLoopMerge(labels[4], labels[3]) ||
+        !header.AddConditionalBranch(cond->result_id(), labels[2], labels[4]))
+      return 0;
+    InstructionBuilder body(context(), blocks[2]);
+    const uint32_t x =
+        AddMemoryElementLoad(&body, nullptr, x_pointer, input_pointer_type_id,
+                             input.component_type_id, k->result_id(),
+                             input_memory_operands, uint_type);
+    auto* row = body.AddBinaryOp(uint_type, spv::Op::OpIAdd, offset_row,
+                                 k->result_id());
+    auto* base = row ? body.AddBinaryOp(uint_type, spv::Op::OpIMul,
+                                        row->result_id(), shape_cols)
+                     : nullptr;
+    auto* first = base ? body.AddBinaryOp(uint_type, spv::Op::OpIAdd,
+                                          base->result_id(), offset_col)
+                       : nullptr;
+    if (!x || !first) return 0;
+    for (uint32_t col = 0; col < result.length; ++col) {
+      auto* position =
+          body.AddBinaryOp(uint_type, spv::Op::OpIAdd, first->result_id(),
+                           GetOrCreateUIntConstant(col));
+      if (!position) return 0;
+      const uint32_t w = AddMemoryElementLoad(
+          &body, nullptr, w_pointer, matrix_pointer_type_id,
+          matrix.component_type_id, position->result_id(),
+          matrix_memory_operands, uint_type);
+      auto* acc = body.AddLoad(result.component_type_id,
+                               accumulators[col]->result_id());
+      const uint32_t next =
+          w && acc
+              ? BuildMatmulAccumulate(
+                    &body, result.component_type_id, input.component_type_id, x,
+                    matrix.component_type_id, w, acc->result_id())
+              : 0;
+      if (!next || !body.AddStore(accumulators[col]->result_id(), next))
+        return 0;
+    }
+    if (!body.AddBranch(labels[3])) return 0;
+    InstructionBuilder advance(context(), blocks[3]);
+    auto* next_k =
+        advance.AddBinaryOp(uint_type, spv::Op::OpIAdd, k->result_id(), one);
+    if (!next_k || !advance.AddStore(index->result_id(), next_k->result_id()) ||
+        !advance.AddBranch(labels[1]))
+      return 0;
+    InstructionBuilder exit(context(), blocks[4]);
+    std::vector<uint32_t> values;
+    for (auto* acc : accumulators) {
+      auto* value = exit.AddLoad(result.component_type_id, acc->result_id());
+      if (!value) return 0;
+      values.push_back(value->result_id());
+    }
+    auto* value = exit.AddCompositeConstruct(result.lowered_type_id, values);
+    if (!value ||
+        !exit.AddUnaryOp(0, spv::Op::OpReturnValue, value->result_id()))
+      return 0;
+    function->SetFunctionEnd(
+        MakeUnique<Instruction>(context(), spv::Op::OpFunctionEnd, 0, 0,
+                                std::initializer_list<Operand>{}));
+    AddGeneratedFunction(std::move(function), function_id, false);
+    return function_id;
+  }
   const uint64_t mac_count = static_cast<uint64_t>(input.length) *
                              static_cast<uint64_t>(result.length);
   const uint64_t unrolled_limit =

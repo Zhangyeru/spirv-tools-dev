@@ -120,7 +120,10 @@ Options (in lexicographical order):)",
                Lowers supported HW cooperative matrix/vector ops and types and
                requires that no HW extension feature remain. Fails if an HW
                feature has no equivalent lowering. The pack and scalar modes
-               and numeric options behave as for --hw-lower-to-standard.)");
+               and numeric options behave as for --hw-lower-to-standard.
+               no-direct and no-fusion independently disable optimizations.
+               Recoverable optimized generation failures retry scalar lowering
+               from the original module; failed attempts do not modify it.)");
   printf(R"(
   --before-hlsl-legalization
                Forwards this option to the validator.  See the validator help

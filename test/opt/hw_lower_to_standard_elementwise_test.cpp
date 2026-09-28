@@ -114,8 +114,8 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFAdd %v2float"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpFAdd %float"));
 }
 
@@ -146,9 +146,9 @@ OpFunctionEnd
       SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
   EXPECT_EQ(0u, CountSubstring(disassembly, "OpVectorTimesScalar"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v2float"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFMul %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorIMulScalarFallback) {
@@ -609,8 +609,9 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 0, 0, 2);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   ExpectSingleElementwiseLoop(disassembly);
@@ -641,8 +642,9 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 0, 0, 2);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
@@ -684,8 +686,9 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 0, 0, 2);
   const std::string& disassembly = std::get<0>(result);
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
@@ -777,13 +780,13 @@ OpFunctionEnd
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(5u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(7u, CountSubstring(disassembly, "OpFConvert %v2"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFAdd %v2float"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFSub %v2half"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFMul %v2float"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFDiv %v2half"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpFNegate %v2float"));
+  EXPECT_EQ(0u, CountSubstring(disassembly, "OpLoopMerge"));
+  EXPECT_EQ(28u, CountSubstring(disassembly, "OpFConvert %v2"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFAdd %v2float"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFSub %v2half"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFMul %v2float"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFDiv %v2half"));
+  EXPECT_EQ(4u, CountSubstring(disassembly, "OpFNegate %v2float"));
 }
 
 TEST_F(HwLowerToStandardTest, LowersMixedWidthFloatMatrixArithmeticScalar) {

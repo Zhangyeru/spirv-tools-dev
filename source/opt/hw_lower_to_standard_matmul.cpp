@@ -66,7 +66,13 @@ bool HwLowerToStandardPass::LowerMatrixMulAdd(Instruction* inst) {
   const uint64_t mac_count = static_cast<uint64_t>(result->rows) *
                              static_cast<uint64_t>(result->cols) *
                              static_cast<uint64_t>(a->cols);
-  bool lowered = mac_count > max_unrolled_matmul_macs_
+  // Large f32 result tiles keep too many unrolled accumulators live at once.
+  // Bound that expansion independently of the caller's overall MAC ceiling.
+  const uint64_t unroll_limit =
+      IsFloat32Type(result->component_type_id)
+          ? std::min(max_unrolled_matmul_macs_, uint64_t(1024))
+          : max_unrolled_matmul_macs_;
+  bool lowered = mac_count > unroll_limit
                      ? LowerMatrixMulAddWithLoop(inst)
                      : (active_arithmetic_contract_.strict_matmul
                             ? LowerMatrixMulAddScalarFallback(inst)

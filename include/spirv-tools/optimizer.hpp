@@ -44,6 +44,12 @@ enum class HwLoweringCompleteness {
 };
 
 // Configuration for the HW cooperative matrix/vector lowering pass.
+// The raw pass requires resolved cooperative shapes/reduce controls and
+// uint32-representable logical element counts. Apply specialization overrides,
+// freeze-spec-const and fold-spec-const-op-composite first when needed.
+// Attempts are transactional: recoverable optimized generation/validation
+// failures retry scalar lowering with direct/fusion disabled; unsuccessful
+// lowering leaves the original module intact.
 struct HwLowerToStandardOptions {
   // Use scalar arrays for every lowered value instead of preferring packed
   // vec2 arrays for even-width f16/f32 values.
@@ -64,6 +70,11 @@ struct HwLowerToStandardOptions {
   // form of matrix/vector direct helpers.
   uint32_t max_unrolled_elements = 4096;
   uint64_t max_unrolled_matmul_macs = 4096;
+
+  // Independently disable the optional direct and two-layer fusion paths.
+  // Packed generic lowering remains available for differential validation.
+  bool enable_direct = true;
+  bool enable_fusion = true;
 };
 
 // C++ interface for SPIR-V optimization functionalities. It wraps the context

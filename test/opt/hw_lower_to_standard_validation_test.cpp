@@ -18,6 +18,108 @@ namespace spvtools {
 namespace opt {
 namespace {
 
+// Fault injection supplements GLSL-derived positive cases. It deliberately
+// fails after real code generation, so the retry must discard an entire module.
+class FailingHwAttempt : public HwLowerToStandardPass {
+ public:
+  explicit FailingHwAttempt(bool recoverable = true, bool fail_scalar = false,
+                            bool invalid_output = false)
+      : recoverable_(recoverable),
+        fail_scalar_(fail_scalar),
+        invalid_output_(invalid_output) {}
+  unsigned attempts = 0;
+
+ protected:
+  Status RunLoweringAttempt(IRContext* attempt, LoweringMode mode,
+                            bool* recoverable) override {
+    std::vector<uint32_t> before;
+    attempt->module()->ToBinary(&before, false);
+    if (attempts++ == 0)
+      original_ = before;
+    else
+      EXPECT_EQ(original_, before);
+    const auto status =
+        HwLowerToStandardPass::RunLoweringAttempt(attempt, mode, recoverable);
+    if (status != Status::Failure &&
+        (mode == LoweringMode::kPreferPackedVec2 || fail_scalar_)) {
+      *recoverable = recoverable_;
+      // Also mutate a declaration after lowering to detect leaked failure IR.
+      attempt->AddCapability(spv::Capability::Float64);
+      if (invalid_output_) {
+        attempt->module()->SetIdBound(1);
+        return status;
+      }
+      return Status::Failure;
+    }
+    return status;
+  }
+
+ private:
+  bool recoverable_;
+  bool fail_scalar_;
+  bool invalid_output_;
+  std::vector<uint32_t> original_;
+};
+
+TEST_F(HwLowerToStandardTest, RecoversGenerationFailureFromOriginalModule) {
+  const auto text = MakeAsymmetricHwElementwiseModule(
+      "", "%sum = OpFAdd %fvec4 %hw_float %hw_float");
+  auto ctx = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), text);
+  ASSERT_NE(nullptr, ctx);
+  ctx->get_def_use_mgr();
+  ctx->get_type_mgr();
+  ctx->cfg();
+  ctx->get_feature_mgr();
+  ctx->set_preserve_bindings(true);
+  ctx->set_preserve_spec_constants(true);
+  FailingHwAttempt pass;
+  EXPECT_EQ(Pass::Status::SuccessWithChange, pass.Run(ctx.get()));
+  EXPECT_EQ(2u, pass.attempts);
+  EXPECT_TRUE(ctx->preserve_bindings());
+  EXPECT_TRUE(ctx->preserve_spec_constants());
+  std::vector<uint32_t> actual;
+  ctx->module()->ToBinary(&actual, false);
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  EXPECT_TRUE(tools.Validate(actual));
+  auto scalar = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), text);
+  HwLowerToStandardPass reference(
+      HwLowerToStandardPass::LoweringMode::kForceScalar);
+  ASSERT_EQ(Pass::Status::SuccessWithChange, reference.Run(scalar.get()));
+  std::vector<uint32_t> expected;
+  scalar->module()->ToBinary(&expected, false);
+  EXPECT_EQ(expected, actual);
+  EXPECT_TRUE(ctx->IsConsistent());
+}
+
+TEST_F(HwLowerToStandardTest, FailedAttemptsLeaveOriginalModuleIntact) {
+  const auto text = MakeAsymmetricHwElementwiseModule(
+      "", "%sum = OpFAdd %fvec4 %hw_float %hw_float");
+  for (bool recoverable : {false, true}) {
+    auto ctx = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), text);
+    std::vector<uint32_t> original, after;
+    ctx->module()->ToBinary(&original, false);
+    ctx->get_def_use_mgr();
+    FailingHwAttempt pass(recoverable, true);
+    EXPECT_EQ(Pass::Status::Failure, pass.Run(ctx.get()));
+    EXPECT_EQ(recoverable ? 2u : 1u, pass.attempts);
+    ctx->module()->ToBinary(&after, false);
+    EXPECT_EQ(original, after);
+    EXPECT_TRUE(ctx->IsConsistent());
+  }
+}
+
+TEST_F(HwLowerToStandardTest, RecoversInvalidGeneratedModule) {
+  const auto text = MakeAsymmetricHwElementwiseModule(
+      "", "%sum = OpFAdd %fvec4 %hw_float %hw_float");
+  auto ctx = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), text);
+  FailingHwAttempt pass(true, false, true);
+  EXPECT_EQ(Pass::Status::SuccessWithChange, pass.Run(ctx.get()));
+  EXPECT_EQ(2u, pass.attempts);
+  std::vector<uint32_t> binary;
+  ctx->module()->ToBinary(&binary, false);
+  EXPECT_TRUE(SpirvTools(SPV_ENV_UNIVERSAL_1_3).Validate(binary));
+}
+
 void ExpectStrictNoContractionMatmul(const std::string& disassembly) {
   ExpectNoHwOrCoopMatrix(disassembly);
   EXPECT_EQ(0u, CountSubstring(disassembly, " Fma "));

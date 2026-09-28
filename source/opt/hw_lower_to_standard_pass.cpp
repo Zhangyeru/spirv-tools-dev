@@ -26,6 +26,7 @@
 
 #include "source/opcode.h"
 #include "source/opt/basic_block.h"
+#include "source/opt/build_module.h"
 #include "source/opt/constants.h"
 #include "source/opt/decoration_manager.h"
 #include "source/opt/def_use_manager.h"
@@ -46,6 +47,111 @@ namespace opt {
 using namespace hw_lower_internal;
 
 Pass::Status HwLowerToStandardPass::Process() {
+  if (!transactional_) return ProcessImpl();
+
+  if (completeness_mode_ == CompletenessMode::kExtensionFree &&
+      (!PreflightExtensionFreeMode() || !PreflightReplicatedComposites()))
+    return Status::Failure;
+  // Preserve precise diagnostics for malformed cooperative instructions used
+  // by defensive callers, before serializing their in-memory representation.
+  if (!CollectHwTypes()) return Status::Failure;
+  bool valid_extinst = true;
+  get_module()->ForEachInst([this, &valid_extinst](Instruction* inst) {
+    if (valid_extinst && inst->opcode() == spv::Op::OpExtInst &&
+        InstructionTouchesHw(inst))
+      valid_extinst = LegalizeCooperativeCoreInstruction(inst);
+  });
+  if (!valid_extinst) return Status::Failure;
+
+  std::vector<uint32_t> original;
+  get_module()->ToBinary(&original, false);
+  SpirvTools validator(context()->GetTargetEnv());
+  // Some internal callers deliberately pass pre-legalization input. Only use
+  // the target's ordinary validation rules when they accept the input itself.
+  const bool validate_output = validator.Validate(original);
+  struct Diagnostic {
+    spv_message_level_t level;
+    std::string source;
+    spv_position_t position;
+    std::string message;
+  };
+  std::vector<Diagnostic> diagnostics;
+  const auto capture = [&diagnostics](
+                           spv_message_level_t level, const char* source,
+                           const spv_position_t& pos, const char* text) {
+    diagnostics.push_back({level, source ? source : "", pos, text});
+  };
+  validator.SetMessageConsumer(capture);
+  auto flush = [&]() {
+    if (!consumer()) return;
+    for (const auto& d : diagnostics)
+      consumer()(d.level, d.source.c_str(), d.position, d.message.c_str());
+  };
+
+  LoweringMode mode = lowering_mode_;
+  for (;;) {
+    // Never reuse a partially rewritten attempt, including its cached analyses.
+    auto attempt = BuildModule(context()->GetTargetEnv(), capture,
+                               original.data(), original.size(), false);
+    if (!attempt) {
+      flush();
+      return Status::Failure;
+    }
+    attempt->set_max_id_bound(context()->max_id_bound());
+    attempt->set_preserve_bindings(context()->preserve_bindings());
+    attempt->set_preserve_spec_constants(context()->preserve_spec_constants());
+    bool recoverable = false;
+    Status status = RunLoweringAttempt(attempt.get(), mode, &recoverable);
+    std::vector<uint32_t> lowered;
+    if (status == Status::SuccessWithChange) {
+      attempt->module()->ToBinary(&lowered, false);
+      if (validate_output && !validator.Validate(lowered)) {
+        status = Status::Failure;
+        recoverable = true;
+      }
+    }
+    if (status != Status::Failure) {
+      if (status == Status::SuccessWithChange) {
+        if (!context()->ReplaceModule(lowered)) return Status::Failure;
+      }
+      flush();
+      return status;
+    }
+    if (!recoverable ||
+        (mode == LoweringMode::kForceScalar && !enable_direct_) ||
+        attempt->module()->IdBound() >= attempt->max_id_bound()) {
+      flush();
+      return Status::Failure;
+    }
+    if (consumer()) {
+      std::string message =
+          "HW optimized lowering failed; retrying scalar from the original "
+          "module";
+      if (!diagnostics.empty()) message += ": " + diagnostics.back().message;
+      consumer()(SPV_MSG_WARNING, "", {0, 0, 0}, message.c_str());
+    }
+    diagnostics.clear();
+    enable_direct_ = false;
+    enable_fusion_ = false;
+    mode = LoweringMode::kForceScalar;
+  }
+}
+
+Pass::Status HwLowerToStandardPass::RunLoweringAttempt(IRContext* attempt,
+                                                       LoweringMode mode,
+                                                       bool* recoverable) {
+  HwLowerToStandardPass worker(
+      mode, completeness_mode_, max_elements_, max_matmul_macs_,
+      max_unrolled_elements_, max_unrolled_matmul_macs_,
+      enable_direct_ && mode == lowering_mode_, enable_fusion_);
+  worker.transactional_ = false;
+  worker.SetMessageConsumer(attempt->consumer());
+  const Status status = worker.Run(attempt);
+  *recoverable = worker.recoverable_failure_;
+  return status;
+}
+
+Pass::Status HwLowerToStandardPass::ProcessImpl() {
   if (max_unrolled_elements_ == 0 || max_unrolled_matmul_macs_ == 0 ||
       (max_elements_ && max_unrolled_elements_ > max_elements_) ||
       (max_matmul_macs_ && max_unrolled_matmul_macs_ > max_matmul_macs_)) {
@@ -97,7 +203,14 @@ Pass::Status HwLowerToStandardPass::Process() {
     return Status::Failure;
   }
 
-  if (!AnalyzeLargeConstants() || !FoldLargeConstantExtracts()) return Status::Failure;
+  // Reject unsupported input and explicit resource policies before any attempt
+  // is classified as a recoverable code-generation failure.
+  // Constant-expression extracts must be resolved before checking the core
+  // use closure. All normalization still happens in the isolated attempt.
+  if (!AnalyzeLargeConstants() || !FoldLargeConstantExtracts() ||
+      !CollectHwTypes() || !LegalizeModule())
+    return Status::Failure;
+  recoverable_failure_ = true;
 
   RecordContractionOffFunctions();
 
@@ -105,7 +218,7 @@ Pass::Status HwLowerToStandardPass::Process() {
     RecordLoopCarriedPackedMemoryRoots();
   }
 
-  if (lowering_mode_ == LoweringMode::kPreferPackedVec2) {
+  if (enable_fusion_ && lowering_mode_ == LoweringMode::kPreferPackedVec2) {
     HwFuseTwoLayerVectorMatmulPass fusion(max_unrolled_matmul_macs_);
     fusion.SetMessageConsumer(consumer());
     if (fusion.Run(context()) == Status::Failure) return Status::Failure;
@@ -211,6 +324,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
     }
   });
   for (Instruction* inst : direct_matmuls) {
+    if (!enable_direct_) break;
     if (!inst || inst->IsNop()) continue;
     const ArithmeticContract saved_contract = active_arithmetic_contract_;
     active_arithmetic_contract_ = GetArithmeticContract(inst);

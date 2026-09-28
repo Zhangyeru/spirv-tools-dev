@@ -67,6 +67,13 @@ bool ParseHwLowerOptions(const std::string& pass_args,
         return false;
       }
       options->force_scalar_lowering = argument == "scalar";
+    } else if (argument == "no-direct" || argument == "no-fusion") {
+      if (!seen.insert(argument).second) {
+        *error = "duplicate argument '" + argument + "'";
+        return false;
+      }
+      if (argument == "no-direct") options->enable_direct = false;
+      if (argument == "no-fusion") options->enable_fusion = false;
     } else {
       const size_t equals = argument.find('=');
       if (equals == std::string::npos || equals == 0 ||
@@ -1240,7 +1247,8 @@ Optimizer::PassToken CreateHwLowerToStandardPass(
       MakeUnique<opt::HwLowerToStandardPass>(
           mode, completeness_mode, options.max_elements,
           options.max_matmul_macs, options.max_unrolled_elements,
-          options.max_unrolled_matmul_macs));
+          options.max_unrolled_matmul_macs, options.enable_direct,
+          options.enable_fusion));
 }
 
 Optimizer::PassToken CreateInterpolateFixupPass() {

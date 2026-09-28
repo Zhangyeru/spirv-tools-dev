@@ -971,6 +971,11 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec2(
   }
   if (!DirectKillListUsersAreClosed(inst, kill_list)) return true;
 
+  if (lowering_mode_ == LoweringMode::kForceScalar &&
+      (input_is_value || matrix_is_value || (has_bias && bias_is_value) ||
+       (has_bias && direct_bias.component_type_id != bias->component_type_id)))
+    return true;
+
   const uint32_t function_id = BuildDirectVectorMatmulFunctionPackedVec2(
       *result, *input, *matrix, bias, has_bias,
       input_is_value ? 0 : direct_input.pointer_id,

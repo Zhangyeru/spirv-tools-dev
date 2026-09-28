@@ -1066,8 +1066,9 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
+  auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+      text, true, true, HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+      HwLowerToStandardPass::CompletenessMode::kCooperativeOnly, 0, 0, 2);
   const std::string& disassembly = std::get<0>(result);
   EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
   ExpectNoHwOrCoopMatrix(disassembly);

@@ -202,6 +202,10 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
   EXPECT_TRUE(opt.RegisterPassFromFlag("--hw-lower-to-standard=pack"));
   EXPECT_TRUE(opt.RegisterPassFromFlag("--hw-lower-to-standard=scalar"));
   EXPECT_TRUE(
+      opt.RegisterPassFromFlag("--hw-lower-to-standard=no-direct,no-fusion"));
+  EXPECT_TRUE(
+      opt.RegisterPassFromFlag("--hw-lower-to-standard=scalar,no-fusion"));
+  EXPECT_TRUE(
       opt.RegisterPassFromFlag("--hw-lower-to-standard-extension-free"));
   EXPECT_TRUE(
       opt.RegisterPassFromFlag("--hw-lower-to-standard-extension-free=pack"));
@@ -259,6 +263,8 @@ TEST(Optimizer, CanRegisterPassesFromFlags) {
       "--hw-lower-to-standard=,pack",
       "--hw-lower-to-standard=pack,scalar",
       "--hw-lower-to-standard=pack,pack",
+      "--hw-lower-to-standard=no-direct,no-direct",
+      "--hw-lower-to-standard=no-fusion,no-fusion",
       "--hw-lower-to-standard=max-elements=1,max-elements=2",
       "--hw-lower-to-standard=unroll-elements=0",
       "--hw-lower-to-standard=unroll-macs=0",

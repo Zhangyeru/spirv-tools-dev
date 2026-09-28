@@ -137,6 +137,11 @@ class IRContext {
 
   Module* module() const { return module_.get(); }
 
+  // Replace the module from a binary snapshot. Parse failure leaves the old
+  // module intact. All module-dependent analyses are discarded on success;
+  // target environment, message consumer and optimizer policies are retained.
+  bool ReplaceModule(const std::vector<uint32_t>& binary);
+
   // Returns a vector of pointers to constant-creation instructions in this
   // context.
   inline std::vector<Instruction*> GetConstants();

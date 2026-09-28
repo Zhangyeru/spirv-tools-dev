@@ -311,10 +311,77 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     }
   }
 
-  const uint32_t small_scalar_unroll_limit =
-      std::min(max_unrolled_elements_, uint32_t(64));
+  // Small packed vector chains also avoid repeated dynamic Function-array
+  // staging. Keep each generated operation's original floating-point contract.
+  if (result_vector && result_packed &&
+      logical_element_count <= max_unrolled_elements_ &&
+      (kind == ElementwiseLoopKind::kArithmetic ||
+       kind == ElementwiseLoopKind::kScale ||
+       kind == ElementwiseLoopKind::kExtInst) &&
+      std::all_of(loop_operands.begin(), loop_operands.end(),
+                  [](const LoopOperand& operand) {
+                    return operand.layout.packed_vec2;
+                  })) {
+    InstructionBuilder builder(
+        context(), inst,
+        IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
+    std::vector<uint32_t> pieces;
+    for (uint32_t index = 0; index < result_piece_count; ++index) {
+      std::vector<uint32_t> operands;
+      for (const auto& operand : loop_operands) {
+        Instruction* value = builder.AddCompositeExtract(
+            operand.layout.piece_type_id, operand.value_id, {index});
+        if (!value) return false;
+        if (kind == ElementwiseLoopKind::kArithmetic &&
+            operand.layout.component_type_id != result_component_type_id) {
+          value = builder.AddUnaryOp(result_piece_type_id, spv::Op::OpFConvert,
+                                     value->result_id());
+          ApplyActiveFPFastMathMode(value);
+          if (!value) return false;
+        }
+        operands.push_back(value->result_id());
+      }
+      Instruction* value = nullptr;
+      if (kind == ElementwiseLoopKind::kArithmetic) {
+        value = operands.size() == 1
+                    ? builder.AddUnaryOp(result_piece_type_id, original_opcode,
+                                         operands[0])
+                    : builder.AddBinaryOp(result_piece_type_id, original_opcode,
+                                          operands[0], operands[1]);
+      } else if (kind == ElementwiseLoopKind::kScale) {
+        const uint32_t factor = BuildScalarSplat(&builder, result_piece_type_id,
+                                                 original_operand_ids[1]);
+        if (!factor) return false;
+        value = builder.AddBinaryOp(result_piece_type_id, spv::Op::OpFMul,
+                                    operands[0], factor);
+      } else {
+        const uint32_t id = TakeNextId();
+        if (!id) return false;
+        std::vector<Operand> args{
+            IdOperand(original_operand_ids[0]),
+            {SPV_OPERAND_TYPE_EXTENSION_INSTRUCTION_NUMBER,
+             {original_operand_ids[1]}}};
+        for (uint32_t operand : operands) args.push_back(IdOperand(operand));
+        value = builder.AddInstruction(MakeUnique<Instruction>(
+            context(), spv::Op::OpExtInst, result_piece_type_id, id, args));
+      }
+      if (!value) return false;
+      ApplyActiveFPFastMathMode(value);
+      if (kind != ElementwiseLoopKind::kExtInst)
+        ApplyActiveNoContraction(value);
+      pieces.push_back(value->result_id());
+    }
+    RebuildAsCompositeConstruct(inst, lowered_result_type_id, pieces);
+    return true;
+  }
+
+  // Use the configured element budget for scalar floating-point arithmetic in
+  // either layout mode. A second, smaller cutoff caused odd-width vectors to
+  // materialize an array and a separate dynamic-index loop for every operation.
+  const uint32_t small_scalar_unroll_limit = max_unrolled_elements_;
   const bool unroll_small_scalar_float =
-      lowering_mode_ == LoweringMode::kForceScalar && !result_packed &&
+      !result_packed &&
+      (result_vector || lowering_mode_ == LoweringMode::kForceScalar) &&
       (IsFloat16Type(result_component_type_id) ||
        IsFloat32Type(result_component_type_id)) &&
       result_piece_count <= small_scalar_unroll_limit;

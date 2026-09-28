@@ -1760,8 +1760,7 @@ bool HwLowerToStandardPass::CanUsePackedVec2VectorMatrixMul(
 bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
     const VectorTypeInfo& result, const VectorTypeInfo& input,
     const MatrixTypeInfo& matrix, const VectorTypeInfo* bias) const {
-  if (lowering_mode_ != LoweringMode::kPreferPackedVec2 ||
-      result.length != matrix.cols || input.length != matrix.rows ||
+  if (result.length != matrix.cols || input.length != matrix.rows ||
       (bias && bias->length != result.length)) {
     return false;
   }
@@ -1779,6 +1778,13 @@ bool HwLowerToStandardPass::CanUseDirectVectorMatrixMul(
       (IsFloat16Type(matrix.component_type_id) ||
        IsFloat32Type(matrix.component_type_id)) &&
       (!bias || IsFloat32Type(bias->component_type_id));
+  if (lowering_mode_ == LoweringMode::kForceScalar) {
+    // Stream large half-precision weights without staging the entire matrix
+    // in a dynamically indexed Function array. Arithmetic remains scalar.
+    return same_component && IsFloat16Type(result.component_type_id) &&
+           result.length <= 128 &&
+           uint64_t(input.length) * result.length > max_unrolled_matmul_macs_;
+  }
   return same_component || mixed_float_to_f32;
 }
 
