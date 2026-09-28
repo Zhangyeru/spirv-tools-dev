@@ -600,12 +600,19 @@ HwLowerToStandardPass::GetMatrixTypeForValue(const Instruction* value) const {
 const HwLowerToStandardPass::VectorTypeInfo*
 HwLowerToStandardPass::GetVectorType(uint32_t type_id) const {
   auto it = vector_types_.find(type_id);
-  if (it != vector_types_.end()) return &it->second;
-  for (const auto& id_and_info : vector_types_) {
-    if (id_and_info.second.lowered_type_id == type_id)
-      return &id_and_info.second;
+  return it == vector_types_.end() ? nullptr : &it->second;
+}
+
+const HwLowerToStandardPass::VectorTypeInfo*
+HwLowerToStandardPass::GetVectorTypeForValue(const Instruction* value) const {
+  if (!value) return nullptr;
+  // Lowered array types can be shared with ordinary GLSL arrays. Only the
+  // original value's type establishes cooperative-vector indexing semantics.
+  auto original = original_hw_value_types_.find(value->result_id());
+  if (original != original_hw_value_types_.end()) {
+    return GetVectorType(original->second);
   }
-  return nullptr;
+  return GetVectorType(value->type_id());
 }
 
 uint32_t HwLowerToStandardPass::GetLoweredType(uint32_t type_id) const {

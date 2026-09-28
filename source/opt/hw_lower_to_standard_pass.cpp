@@ -67,8 +67,9 @@ Pass::Status HwLowerToStandardPass::Process() {
   get_module()->ToBinary(&original, false);
   SpirvTools validator(context()->GetTargetEnv());
   // Some internal callers deliberately pass pre-legalization input. Only use
-  // the target's ordinary validation rules when they accept the input itself.
-  const bool validate_output = validator.Validate(original);
+  // the caller's validation rules when they accept the input itself.
+  const bool validate_output = validator.Validate(
+      original.data(), original.size(), context()->validator_options());
   struct Diagnostic {
     spv_message_level_t level;
     std::string source;
@@ -100,12 +101,15 @@ Pass::Status HwLowerToStandardPass::Process() {
     attempt->set_max_id_bound(context()->max_id_bound());
     attempt->set_preserve_bindings(context()->preserve_bindings());
     attempt->set_preserve_spec_constants(context()->preserve_spec_constants());
+    attempt->set_validator_options(context()->validator_options());
     bool recoverable = false;
     Status status = RunLoweringAttempt(attempt.get(), mode, &recoverable);
     std::vector<uint32_t> lowered;
     if (status == Status::SuccessWithChange) {
       attempt->module()->ToBinary(&lowered, false);
-      if (validate_output && !validator.Validate(lowered)) {
+      if (validate_output &&
+          !validator.Validate(lowered.data(), lowered.size(),
+                              context()->validator_options())) {
         status = Status::Failure;
         recoverable = true;
       }
@@ -395,7 +399,7 @@ bool HwLowerToStandardPass::LowerHwInstructions(
             inst->NumInOperands() >= 1
                 ? get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0))
                 : nullptr;
-        if (object && GetVectorType(object->type_id()))
+        if (GetVectorTypeForValue(object))
           worklist.push_back(inst);
         break;
       }

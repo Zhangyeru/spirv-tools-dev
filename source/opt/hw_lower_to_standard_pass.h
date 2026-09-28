@@ -700,6 +700,7 @@ class HwLowerToStandardPass : public Pass {
   const MatrixTypeInfo* GetMatrixType(uint32_t type_id) const;
   const MatrixTypeInfo* GetMatrixTypeForValue(const Instruction* value) const;
   const VectorTypeInfo* GetVectorType(uint32_t type_id) const;
+  const VectorTypeInfo* GetVectorTypeForValue(const Instruction* value) const;
   uint32_t GetLoweredType(uint32_t type_id) const;
   uint32_t GetPointerTypeId(uint32_t pointer_id) const;
   uint32_t GetPointeeType(uint32_t pointer_type_id) const;

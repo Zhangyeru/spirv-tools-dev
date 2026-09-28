@@ -68,7 +68,7 @@ bool HwLowerToStandardPass::ResolveDirectVectorLoad(
   source->constant_offset = offset;
 
   source->source_load = load;
-  const VectorTypeInfo* load_type = GetVectorType(load->type_id());
+  const VectorTypeInfo* load_type = GetVectorTypeForValue(load);
   if (!load_type) return false;
   source->pointer_id = load->GetSingleWordInOperand(kHwVectorLoadPointerInIdx);
   source->pointer_type_id = GetPointerTypeId(source->pointer_id);
@@ -99,9 +99,8 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
 
   Instruction* converted_value =
       get_def_use_mgr()->GetDef(conversion->GetSingleWordInOperand(0));
-  const VectorTypeInfo* result_type = GetVectorType(conversion->type_id());
-  const VectorTypeInfo* source_type =
-      converted_value ? GetVectorType(converted_value->type_id()) : nullptr;
+  const VectorTypeInfo* result_type = GetVectorTypeForValue(conversion);
+  const VectorTypeInfo* source_type = GetVectorTypeForValue(converted_value);
   if (!result_type || !source_type ||
       !IsFloat32Type(result_type->component_type_id) ||
       !IsFloat16Type(source_type->component_type_id) ||
@@ -116,7 +115,7 @@ bool HwLowerToStandardPass::ResolveDirectF16ToF32VectorLoad(
       !DirectTransportChainIsMovable(source_chain)) {
     return false;
   }
-  const VectorTypeInfo* load_type = GetVectorType(load->type_id());
+  const VectorTypeInfo* load_type = GetVectorTypeForValue(load);
   if (!load_type || load_type->type_id != source_type->type_id) return false;
 
   const uint32_t offset_id =
@@ -588,20 +587,19 @@ bool HwLowerToStandardPass::TryLowerDirectVectorMatrixMulPackedVec2(
     return false;
   }
   if (GetArithmeticContract(inst).strict_matmul) return true;
-  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result = GetVectorTypeForValue(inst);
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
-  const VectorTypeInfo* input =
-      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const VectorTypeInfo* input = GetVectorTypeForValue(input_inst);
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+    bias = GetVectorTypeForValue(bias_inst);
   }
   if (!result || !input || !matrix || (has_bias && !bias) ||
       !CanUseDirectVectorMatrixMul(*result, *input, *matrix, bias)) {
@@ -1740,9 +1738,9 @@ Instruction* HwLowerToStandardPass::TraceLosslessF16RoundTripSource(
       TraceFunctionValueSource(original_value, widen, &source_chain);
   if (!source) return nullptr;
 
-  const VectorTypeInfo* narrow_vector = GetVectorType(narrow->type_id());
-  const VectorTypeInfo* widen_vector = GetVectorType(widen->type_id());
-  const VectorTypeInfo* source_vector = GetVectorType(source->type_id());
+  const VectorTypeInfo* narrow_vector = GetVectorTypeForValue(narrow);
+  const VectorTypeInfo* widen_vector = GetVectorTypeForValue(widen);
+  const VectorTypeInfo* source_vector = GetVectorTypeForValue(source);
   const bool vector_round_trip =
       narrow_vector && widen_vector && source_vector &&
       IsFloat16Type(narrow_vector->component_type_id) &&

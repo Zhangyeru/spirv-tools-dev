@@ -99,7 +99,7 @@ bool HwLowerToStandardPass::LowerHwScale(Instruction* inst) {
 }
 
 bool HwLowerToStandardPass::LowerExtInstOnCooperativeVector(Instruction* inst) {
-  const VectorTypeInfo* info = GetVectorType(inst->type_id());
+  const VectorTypeInfo* info = GetVectorTypeForValue(inst);
   if (!info) return true;  // Not a cooperative vector result; nothing to do.
   return LowerElementwiseWithLoop(inst, ElementwiseLoopKind::kExtInst);
 }
@@ -108,7 +108,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
                                                      ElementwiseLoopKind kind) {
   if (!inst) return false;
 
-  const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
   const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
   if (!result_vector && !result_matrix) {
     ReportError(inst, "invalid HW element-wise result type");
@@ -226,12 +226,7 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
         ReportError(inst, "invalid HW cooperative vector OpExtInst operand");
         return false;
       }
-      uint32_t original_type_id = value->type_id();
-      auto original_type = original_hw_value_types_.find(value->result_id());
-      if (original_type != original_hw_value_types_.end()) {
-        original_type_id = original_type->second;
-      }
-      const VectorTypeInfo* operand_info = GetVectorType(original_type_id);
+      const VectorTypeInfo* operand_info = GetVectorTypeForValue(value);
       if (!operand_info) {
         ReportError(inst,
                     "HW cooperative vector OpExtInst operand must be a "

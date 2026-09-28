@@ -280,7 +280,7 @@ bool HwLowerToStandardPass::LowerMatrixStore(
 }
 
 bool HwLowerToStandardPass::LowerVectorLoad(Instruction* inst) {
-  const VectorTypeInfo* info = GetVectorType(inst->type_id());
+  const VectorTypeInfo* info = GetVectorTypeForValue(inst);
   if (!info || inst->NumInOperands() < 1) {
     ReportError(inst, "invalid OpCooperativeVectorLoadHW");
     return false;
@@ -398,8 +398,7 @@ bool HwLowerToStandardPass::LowerVectorStore(
 
   Instruction* object = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
-  const VectorTypeInfo* info =
-      object ? GetVectorType(object->type_id()) : nullptr;
+  const VectorTypeInfo* info = GetVectorTypeForValue(object);
   if (!info) {
     ReportError(inst, "invalid HW vector store object");
     return false;

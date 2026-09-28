@@ -244,7 +244,7 @@ bool HwLowerToStandardPass::EliminateHwFunctionVariables() {
 
 bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
   const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-  const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+  const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
   if (!matrix && !vector) {
     ReportError(inst, "invalid HW OpCompositeConstruct result type");
     return false;
@@ -334,7 +334,7 @@ bool HwLowerToStandardPass::LowerCompositeConstruct(Instruction* inst) {
 
 bool HwLowerToStandardPass::LowerConstantComposite(Instruction* inst) {
   const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-  const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+  const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
   if (!matrix && !vector) {
     ReportError(inst, "invalid HW OpConstantComposite result type");
     return false;
@@ -719,7 +719,7 @@ bool HwLowerToStandardPass::LowerAccessChain(Instruction* inst) {
 
 bool HwLowerToStandardPass::LowerSelect(Instruction* inst) {
   const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-  const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+  const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
   if ((!matrix && !vector) || !inst || inst->NumInOperands() != 3) {
     ReportError(inst, "invalid HW OpSelect");
     return false;
@@ -782,8 +782,7 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
   }
   Instruction* object =
       get_def_use_mgr()->GetDef(inst->GetSingleWordInOperand(0));
-  const VectorTypeInfo* vector =
-      object ? GetVectorType(object->type_id()) : nullptr;
+  const VectorTypeInfo* vector = GetVectorTypeForValue(object);
   if (!vector || inst->type_id() != vector->component_type_id) {
     ReportError(inst, "invalid HW OpVectorExtractDynamic object");
     return false;
@@ -861,8 +860,7 @@ bool HwLowerToStandardPass::LowerVectorExtractDynamic(Instruction* inst) {
 }
 
 bool HwLowerToStandardPass::LowerVectorInsertDynamic(Instruction* inst) {
-  const VectorTypeInfo* vector =
-      inst ? GetVectorType(inst->type_id()) : nullptr;
+  const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
   if (!vector || inst->NumInOperands() != 3) {
     ReportError(inst, "invalid HW OpVectorInsertDynamic");
     return false;
@@ -988,7 +986,7 @@ bool HwLowerToStandardPass::DescribeVectorValue(uint32_t value_id,
   Instruction* value = get_def_use_mgr()->GetDef(value_id);
   if (!value) return false;
 
-  if (const VectorTypeInfo* info = GetVectorType(value->type_id())) {
+  if (const VectorTypeInfo* info = GetVectorTypeForValue(value)) {
     if (info->length != expected_length) return false;
     layout->component_type_id = info->component_type_id;
     layout->piece_type_id = IsPackedVec2(*info) ? info->packed_vec2_type_id

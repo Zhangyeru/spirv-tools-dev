@@ -14,6 +14,8 @@
 
 #include "test/opt/hw_lower_to_standard_test_utils.h"
 
+#include "spirv-tools/optimizer.hpp"
+
 namespace spvtools {
 namespace opt {
 namespace {
@@ -32,6 +34,10 @@ class FailingHwAttempt : public HwLowerToStandardPass {
  protected:
   Status RunLoweringAttempt(IRContext* attempt, LoweringMode mode,
                             bool* recoverable) override {
+    EXPECT_EQ(context()->validator_options()->scalar_block_layout,
+              attempt->validator_options()->scalar_block_layout);
+    EXPECT_EQ(context()->validator_options()->universal_limits_.max_id_bound,
+              attempt->validator_options()->universal_limits_.max_id_bound);
     std::vector<uint32_t> before;
     attempt->module()->ToBinary(&before, false);
     if (attempts++ == 0)
@@ -118,6 +124,128 @@ TEST_F(HwLowerToStandardTest, RecoversInvalidGeneratedModule) {
   std::vector<uint32_t> binary;
   ctx->module()->ToBinary(&binary, false);
   EXPECT_TRUE(SpirvTools(SPV_ENV_UNIVERSAL_1_3).Validate(binary));
+}
+
+TEST_F(HwLowerToStandardTest,
+       RecoversInvalidGeneratedModuleWithScalarBlockLayout) {
+  // Generated from legal GLSL with glslang -V --target-env vulkan1.3:
+  // layout(scalar, set=0, binding=0) buffer Buf {
+  //   vec2 pad; vec3 extra; float value;
+  // } b;
+  // void main() {
+  //   coopvecHW<float, 4> v = coopvecHW<float, 4>(b.value);
+  //   b.value = (v + v)[0];
+  // }
+  const std::string text = R"(
+OpCapability Shader
+OpCapability VulkanMemoryModel
+OpCapability ReplicatedCompositesEXT
+OpCapability CooperativeVectorHW
+OpExtension "SPV_EXT_replicated_composites"
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical Vulkan
+OpEntryPoint GLCompute %main "main" %b
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %Buf Block
+OpMemberDecorate %Buf 0 Offset 0
+OpMemberDecorate %Buf 1 Offset 8
+OpMemberDecorate %Buf 2 Offset 20
+OpDecorate %b Binding 0
+OpDecorate %b DescriptorSet 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%uint = OpTypeInt 32 0
+%uint_4 = OpConstant %uint 4
+%hw = OpTypeCooperativeVectorHW %float %uint_4
+%hw_ptr = OpTypePointer Function %hw
+%v2float = OpTypeVector %float 2
+%v3float = OpTypeVector %float 3
+%Buf = OpTypeStruct %v2float %v3float %float
+%buf_ptr = OpTypePointer StorageBuffer %Buf
+%b = OpVariable %buf_ptr StorageBuffer
+%int = OpTypeInt 32 1
+%int_2 = OpConstant %int 2
+%float_ptr = OpTypePointer StorageBuffer %float
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%v = OpVariable %hw_ptr Function
+%value_ptr = OpAccessChain %float_ptr %b %int_2
+%value = OpLoad %float %value_ptr
+%init = OpCompositeConstructReplicateEXT %hw %value
+OpStore %v %init
+%a = OpLoad %hw %v
+%c = OpLoad %hw %v
+%sum = OpFAdd %hw %a %c
+%first = OpCompositeExtract %float %sum 0
+%out_ptr = OpAccessChain %float_ptr %b %int_2
+OpStore %out_ptr %first
+OpReturn
+OpFunctionEnd
+)";
+  SpirvTools tools(SPV_ENV_VULKAN_1_3);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(text, &binary));
+  ASSERT_FALSE(tools.Validate(binary));
+  spvtools::ValidatorOptions options;
+  options.SetScalarBlockLayout(true);
+  ASSERT_TRUE(tools.Validate(binary.data(), binary.size(), options));
+
+  for (bool skip_validation : {false, true}) {
+    SCOPED_TRACE(skip_validation);
+    Optimizer optimizer(SPV_ENV_VULKAN_1_3);
+    std::string diagnostics;
+    optimizer.SetMessageConsumer(
+        [&diagnostics](spv_message_level_t, const char*, const spv_position_t&,
+                       const char* message) { diagnostics += message; });
+    optimizer.RegisterPass(Optimizer::PassToken(
+        MakeUnique<FailingHwAttempt>(true, false, true)));
+    std::vector<uint32_t> lowered;
+    ASSERT_TRUE(optimizer.Run(binary.data(), binary.size(), &lowered, options,
+                              skip_validation))
+        << diagnostics;
+    EXPECT_NE(std::string::npos,
+              diagnostics.find("retrying scalar from the original module"));
+    EXPECT_TRUE(tools.Validate(lowered.data(), lowered.size(), options));
+    std::string disassembly;
+    ASSERT_TRUE(tools.Disassemble(lowered, &disassembly));
+    EXPECT_EQ(std::string::npos, disassembly.find("Float64"));
+    ExpectNoHwOrCoopMatrix(disassembly);
+  }
+}
+
+TEST_F(HwLowerToStandardTest, HonorsValidationLimitsForGeneratedModule) {
+  const auto text = MakeAsymmetricHwElementwiseModule(
+      "", "%sum = OpFAdd %fvec4 %hw_float %hw_float");
+  auto ctx = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), text);
+  ASSERT_NE(nullptr, ctx);
+  std::vector<uint32_t> original;
+  ctx->module()->ToBinary(&original, false);
+  {
+    spvtools::ValidatorOptions options;
+    options.SetUniversalLimit(spv_validator_limit_max_id_bound, original[3]);
+    ctx->set_validator_options(options);
+  }
+  // The context owns the options even after their source is destroyed.
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  ASSERT_TRUE(tools.Validate(original.data(), original.size(),
+                             ctx->validator_options()));
+  std::string diagnostics;
+  HwLowerToStandardPass pass;
+  pass.SetMessageConsumer(
+      [&diagnostics](spv_message_level_t, const char*, const spv_position_t&,
+                     const char* message) { diagnostics += message; });
+  // Both packed and scalar lowering allocate additional IDs. Neither output
+  // may be committed if it exceeds the caller's validation limit.
+  EXPECT_EQ(Pass::Status::Failure, pass.Run(ctx.get()));
+  EXPECT_NE(std::string::npos,
+            diagnostics.find("retrying scalar from the original module"));
+  EXPECT_NE(std::string::npos, diagnostics.find("bound"));
+  std::vector<uint32_t> after;
+  ctx->module()->ToBinary(&after, false);
+  EXPECT_EQ(original, after);
+  EXPECT_EQ(original[3],
+            ctx->validator_options()->universal_limits_.max_id_bound);
 }
 
 void ExpectStrictNoContractionMatmul(const std::string& disassembly) {

@@ -219,7 +219,7 @@ uint32_t HwLowerToStandardPass::MaterializeConstantValue(
   // through helpers and copying it for every dynamic extract can make driver
   // compilation quadratic even though the fill itself is a small loop.
   const auto* matrix_value = GetMatrixType(inst->type_id());
-  const auto* vector_value = GetVectorType(inst->type_id());
+  const auto* vector_value = GetVectorTypeForValue(inst);
   if (caller && (matrix_value || vector_value) && inst->NumInOperands() == 1 &&
       (IsReplicatedCompositeOpcode(inst->opcode()) ||
        inst->opcode() == spv::Op::OpConstantComposite ||
@@ -270,7 +270,7 @@ uint32_t HwLowerToStandardPass::MaterializeConstantValue(
     uint32_t value_id = 0;
     Instruction* type = get_def_use_mgr()->GetDef(type_id);
     const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-    const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+    const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
     if (IsReplicatedCompositeOpcode(inst->opcode()) || matrix) {
       uint32_t element =
           MaterializeConstantValue(&body, inst->GetSingleWordInOperand(0));

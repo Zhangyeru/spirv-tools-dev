@@ -947,20 +947,19 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
                                                  bool has_bias) {
   const ArithmeticContract saved_contract = active_arithmetic_contract_;
   active_arithmetic_contract_ = GetArithmeticContract(inst);
-  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result = GetVectorTypeForValue(inst);
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
-  const VectorTypeInfo* input =
-      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const VectorTypeInfo* input = GetVectorTypeForValue(input_inst);
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+    bias = GetVectorTypeForValue(bias_inst);
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
     ReportError(inst, "invalid HW vector matrix multiply");
@@ -991,20 +990,19 @@ bool HwLowerToStandardPass::LowerVectorMatrixMul(Instruction* inst,
 
 bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec2(Instruction* inst,
                                                            bool has_bias) {
-  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result = GetVectorTypeForValue(inst);
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
-  const VectorTypeInfo* input =
-      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const VectorTypeInfo* input = GetVectorTypeForValue(input_inst);
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+    bias = GetVectorTypeForValue(bias_inst);
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
     ReportError(inst, "invalid HW vector matrix multiply");
@@ -1030,20 +1028,19 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulPackedVec2(Instruction* inst,
 
 bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
     Instruction* inst, bool has_bias) {
-  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result = GetVectorTypeForValue(inst);
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
-  const VectorTypeInfo* input =
-      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const VectorTypeInfo* input = GetVectorTypeForValue(input_inst);
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+    bias = GetVectorTypeForValue(bias_inst);
   }
   if (!result || !input || !matrix || (has_bias && !bias)) {
     ReportError(inst, "invalid HW vector matrix multiply");
@@ -1122,20 +1119,19 @@ bool HwLowerToStandardPass::LowerVectorMatrixMulScalarFallback(
 
 bool HwLowerToStandardPass::LowerVectorMatrixMulWithLoop(Instruction* inst,
                                                          bool has_bias) {
-  const VectorTypeInfo* result = GetVectorType(inst->type_id());
+  const VectorTypeInfo* result = GetVectorTypeForValue(inst);
   Instruction* input_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulInputInIdx));
   Instruction* matrix_inst = get_def_use_mgr()->GetDef(
       inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx));
-  const VectorTypeInfo* input =
-      input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+  const VectorTypeInfo* input = GetVectorTypeForValue(input_inst);
   const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
   Instruction* bias_inst = nullptr;
   const VectorTypeInfo* bias = nullptr;
   if (has_bias) {
     bias_inst = get_def_use_mgr()->GetDef(
         inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-    bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+    bias = GetVectorTypeForValue(bias_inst);
   }
   BasicBlock* preheader_block = context()->get_instr_block(inst);
   Function* function = preheader_block ? preheader_block->GetParent() : nullptr;

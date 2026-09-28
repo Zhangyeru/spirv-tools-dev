@@ -44,6 +44,7 @@
 #include "source/opt/struct_cfg_analysis.h"
 #include "source/opt/type_manager.h"
 #include "source/opt/value_number_table.h"
+#include "source/spirv_validator_options.h"
 #include "source/util/make_unique.h"
 #include "source/util/string_utils.h"
 
@@ -624,6 +625,13 @@ class IRContext {
     preserve_spec_constants_ = should_preserve_spec_constants;
   }
 
+  // Keep an owned snapshot of the caller's validation rules for passes that
+  // validate intermediate modules. A null options pointer restores defaults.
+  spv_validator_options validator_options() { return &validator_options_; }
+  void set_validator_options(spv_const_validator_options options) {
+    validator_options_ = options ? *options : spv_validator_options_t();
+  }
+
   // Return id of input variable only decorated with |builtin|, if in module.
   // Create variable and return its id otherwise. If builtin not currently
   // supported, return 0.
@@ -935,6 +943,8 @@ class IRContext {
   // Whether all specialization constants within |module_|
   // should be preserved.
   bool preserve_spec_constants_;
+
+  spv_validator_options_t validator_options_;
 };
 
 inline IRContext::Analysis operator|(IRContext::Analysis lhs,

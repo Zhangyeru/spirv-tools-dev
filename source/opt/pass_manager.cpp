@@ -28,6 +28,7 @@ namespace opt {
 
 Pass::Status PassManager::Run(IRContext* context) {
   auto status = Pass::Status::SuccessWithoutChange;
+  if (val_options_) context->set_validator_options(val_options_);
 
   // If print_all_stream_ is not null, prints the disassembly of the module
   // to that stream, with the given preamble and optionally the pass name.

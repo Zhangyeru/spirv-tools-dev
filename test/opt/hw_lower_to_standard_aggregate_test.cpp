@@ -27,6 +27,77 @@ void ExpectNoReplicatedComposites(const std::string& text) {
   EXPECT_EQ(0u, CountSubstring(text, "OpCompositeConstructReplicateEXT"));
 }
 
+// Complements the GLSL ordinary-array return regression with a mixed nested
+// object: only the cooperative member's indices may change after type reuse.
+TEST_F(HwLowerToStandardTest,
+       PreservesOrdinaryArrayIndicesBesidePackedCooperativeValues) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%two = OpConstant %uint 2
+%four = OpConstant %uint 4
+%float = OpTypeFloat 32
+%v2 = OpTypeVector %float 2
+%ordinary = OpTypeArray %v2 %two
+%cooperative = OpTypeCooperativeVectorHW %float %four
+%payload = OpTypeStruct %ordinary %cooperative
+%one = OpConstant %float 1
+%pair = OpConstantComposite %v2 %one %one
+%array_value = OpConstantComposite %ordinary %pair %pair
+%hw_value = OpConstantComposite %cooperative %one %one %one %one
+%object = OpConstantComposite %payload %array_value %hw_value
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%plain_extract = OpCompositeExtract %v2 %object 0 1
+%hw_extract = OpCompositeExtract %float %object 1 3
+OpReturn
+OpFunctionEnd
+)";
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> binary;
+  ASSERT_TRUE(tools.Assemble(text, &binary));
+  ASSERT_TRUE(tools.Validate(binary));
+  auto ctx = BuildModule(SPV_ENV_UNIVERSAL_1_3, consumer(), binary.data(),
+                         binary.size());
+  ASSERT_NE(nullptr, ctx);
+  std::vector<uint32_t> extracts;
+  ctx->module()->ForEachInst([&](Instruction* inst) {
+    if (inst->opcode() == spv::Op::OpCompositeExtract)
+      extracts.push_back(inst->result_id());
+  });
+  ASSERT_EQ(2u, extracts.size());
+  std::string diagnostics;
+  ctx->SetMessageConsumer([&](spv_message_level_t, const char*,
+                              const spv_position_t&, const char* message) {
+    diagnostics += message;
+  });
+  HwLowerToStandardPass pass;
+  pass.SetMessageConsumer(ctx->consumer());
+  ASSERT_EQ(Pass::Status::SuccessWithChange, pass.Run(ctx.get())) << diagnostics;
+  EXPECT_TRUE(diagnostics.empty()) << diagnostics;
+  binary.clear();
+  ctx->module()->ToBinary(&binary, false);
+  ASSERT_TRUE(tools.Validate(binary));
+  auto* plain = ctx->get_def_use_mgr()->GetDef(extracts[0]);
+  auto* hw = ctx->get_def_use_mgr()->GetDef(extracts[1]);
+  ASSERT_NE(nullptr, plain);
+  ASSERT_NE(nullptr, hw);
+  ASSERT_EQ(3u, plain->NumInOperands());
+  EXPECT_EQ(0u, plain->GetSingleWordInOperand(1));
+  EXPECT_EQ(1u, plain->GetSingleWordInOperand(2));
+  ASSERT_EQ(4u, hw->NumInOperands());
+  EXPECT_EQ(1u, hw->GetSingleWordInOperand(1));
+  EXPECT_EQ(1u, hw->GetSingleWordInOperand(2));
+  EXPECT_EQ(1u, hw->GetSingleWordInOperand(3));
+}
+
 TEST_F(HwLowerToStandardTest,
        PreservesCopyLogicalBetweenDistinctNestedCooperativeTypes) {
   const std::string text = R"(

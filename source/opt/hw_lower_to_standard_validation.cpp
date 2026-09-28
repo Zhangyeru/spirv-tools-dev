@@ -285,7 +285,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
   };
   auto get_vector_value = [this, &get_value](uint32_t id) {
     Instruction* value = get_value(id);
-    return value ? GetVectorType(value->type_id()) : nullptr;
+    return GetVectorTypeForValue(value);
   };
   auto valid_integer_index = [this, &get_value](uint32_t id) {
     Instruction* value = get_value(id);
@@ -312,7 +312,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
     case spv::Op::OpCompositeConstruct:
     case spv::Op::OpCompositeConstructReplicateEXT: {
       const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+      const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
       if (!matrix && !vector) return true;
       const bool is_replicate =
           inst->opcode() == spv::Op::OpCompositeConstructReplicateEXT;
@@ -370,7 +370,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
     case spv::Op::OpConstantCompositeReplicateEXT:
     case spv::Op::OpSpecConstantCompositeReplicateEXT: {
       const MatrixTypeInfo* matrix = GetMatrixType(inst->type_id());
-      const VectorTypeInfo* vector = GetVectorType(inst->type_id());
+      const VectorTypeInfo* vector = GetVectorTypeForValue(inst);
       if (!matrix && !vector) return true;
       const bool is_replicate =
           inst->opcode() == spv::Op::OpConstantCompositeReplicateEXT ||
@@ -412,7 +412,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
 
     case spv::Op::OpSelect: {
       const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+      const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
       if (!result_matrix && !result_vector) return true;
       if (inst->NumInOperands() != 3) {
         ReportError(inst, "invalid HW OpSelect");
@@ -452,7 +452,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
     }
 
     case spv::Op::OpVectorInsertDynamic: {
-      const VectorTypeInfo* result = GetVectorType(inst->type_id());
+      const VectorTypeInfo* result = GetVectorTypeForValue(inst);
       if (!result || inst->NumInOperands() != 3) {
         ReportError(inst, "invalid HW OpVectorInsertDynamic");
         return false;
@@ -469,7 +469,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
     }
 
     case spv::Op::OpExtInst: {
-      const VectorTypeInfo* result = GetVectorType(inst->type_id());
+      const VectorTypeInfo* result = GetVectorTypeForValue(inst);
       if (!result) {
         ReportError(inst, "HW OpExtInst requires a cooperative vector result");
         return false;
@@ -539,7 +539,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
 
     case spv::Op::OpBitcast: {
       const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-      const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+      const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
       if ((!result_matrix && !result_vector) || inst->NumInOperands() != 1) {
         ReportError(inst, "unsupported HW OpBitcast");
         return false;
@@ -547,7 +547,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
       Instruction* object = get_value(inst->GetSingleWordInOperand(0));
       const MatrixTypeInfo* input_matrix = GetMatrixTypeForValue(object);
       const VectorTypeInfo* input_vector =
-          object ? GetVectorType(object->type_id()) : nullptr;
+          GetVectorTypeForValue(object);
       auto component_bit_width = [this](uint32_t type_id) {
         Instruction* type = get_def_use_mgr()->GetDef(type_id);
         return type && type->NumInOperands() >= 1
@@ -579,7 +579,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
       return false;
     }
     const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
     const MatrixTypeInfo* input_matrix =
         get_matrix_value(inst->GetSingleWordInOperand(0));
     const VectorTypeInfo* input_vector =
@@ -645,7 +645,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
       return false;
     }
     const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
     if (!result_matrix && !result_vector) {
       ReportError(inst, "unsupported HW arithmetic result type");
       return false;
@@ -732,7 +732,7 @@ bool HwLowerToStandardPass::LegalizeCooperativeCoreInstruction(
       return false;
     }
     const MatrixTypeInfo* result_matrix = GetMatrixType(inst->type_id());
-    const VectorTypeInfo* result_vector = GetVectorType(inst->type_id());
+    const VectorTypeInfo* result_vector = GetVectorTypeForValue(inst);
     const bool expects_matrix = inst->opcode() == spv::Op::OpMatrixTimesScalar;
     if ((expects_matrix && !result_matrix) ||
         (!expects_matrix && !result_vector)) {
@@ -878,11 +878,11 @@ bool HwLowerToStandardPass::LegalizeModule() {
       const uint32_t memory_index = is_load ? kHwVectorLoadMemoryOperandsInIdx
                                             : kHwVectorStoreMemoryOperandsInIdx;
       const VectorTypeInfo* info =
-          is_load ? GetVectorType(inst->type_id()) : nullptr;
+          is_load ? GetVectorTypeForValue(inst) : nullptr;
       if (!is_load && inst->NumInOperands() > kHwVectorStoreObjectInIdx) {
         Instruction* object = get_def_use_mgr()->GetDef(
             inst->GetSingleWordInOperand(kHwVectorStoreObjectInIdx));
-        info = object ? GetVectorType(object->type_id()) : nullptr;
+        info = GetVectorTypeForValue(object);
       }
       if (inst->NumInOperands() < minimum_operands || !info ||
           !integer_value_legal(inst->GetSingleWordInOperand(offset_index)) ||
@@ -997,7 +997,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
 
     if (inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulHW ||
         inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW) {
-      const VectorTypeInfo* result = GetVectorType(inst->type_id());
+      const VectorTypeInfo* result = GetVectorTypeForValue(inst);
       Instruction* input_inst =
           inst->NumInOperands() > kHwVectorMatrixMulInputInIdx
               ? get_def_use_mgr()->GetDef(
@@ -1009,7 +1009,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
                     inst->GetSingleWordInOperand(kHwVectorMatrixMulMatrixInIdx))
               : nullptr;
       const VectorTypeInfo* input =
-          input_inst ? GetVectorType(input_inst->type_id()) : nullptr;
+          GetVectorTypeForValue(input_inst);
       const MatrixTypeInfo* matrix = GetMatrixTypeForValue(matrix_inst);
       const bool has_bias =
           inst->opcode() == spv::Op::OpCooperativeVectorMatrixMulAddHW;
@@ -1017,7 +1017,7 @@ bool HwLowerToStandardPass::LegalizeModule() {
       if (has_bias && inst->NumInOperands() > kHwVectorMatrixMulAddBiasInIdx) {
         Instruction* bias_inst = get_def_use_mgr()->GetDef(
             inst->GetSingleWordInOperand(kHwVectorMatrixMulAddBiasInIdx));
-        bias = bias_inst ? GetVectorType(bias_inst->type_id()) : nullptr;
+        bias = GetVectorTypeForValue(bias_inst);
       }
       const uint32_t accumulator_type_id = has_bias && bias
                                                ? bias->component_type_id
