@@ -199,19 +199,29 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v2float %uint_8"));
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_16"));
-  EXPECT_NE(std::string::npos,
-            disassembly.find("OpTypeArray %v2float %uint_4"));
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_8"));
-  EXPECT_EQ(2u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(2u, CountSubstring(disassembly, "OpBitcast %uint"));
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result = unroll
+                      ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                            text, true, true)
+                      : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                            text, true, true,
+                            HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                            HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                            0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_NE(std::string::npos,
+              disassembly.find("OpTypeArray %v2float %uint_8"));
+    EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_16"));
+    EXPECT_NE(std::string::npos,
+              disassembly.find("OpTypeArray %v2float %uint_4"));
+    EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_8"));
+    // The scalar vector unrolls, while the default matrix path retains a loop.
+    EXPECT_EQ(unroll ? 1u : 2u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 9u : 2u, CountSubstring(disassembly, "OpBitcast %uint"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, SynthesizesArrayLengthConstant) {

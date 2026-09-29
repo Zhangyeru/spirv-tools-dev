@@ -78,13 +78,28 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpUConvert %uint"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %uint 4"));
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 1u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 8u : 1u,
+              CountSubstring(disassembly, "OpUConvert %uint"));
+    EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %uint 4"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersPackedVectorFAdd) {
@@ -174,14 +189,28 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpIMul %int"));
-  EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 1u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 8u : 1u, CountSubstring(disassembly, "OpIMul %int"));
+    EXPECT_EQ(0u, CountSubstring(disassembly, "OpFMul %int"));
+    EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorConvertFToSWithPackedInput) {
@@ -208,14 +237,30 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpConvertFToS %int"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 1u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 8u : 1u,
+              CountSubstring(disassembly, "OpConvertFToS %int"));
+    EXPECT_EQ(unroll ? 0u : 1u,
+              CountSubstring(disassembly, "OpVectorExtractDynamic %float"));
+    EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersVectorSNegateScalarFallback) {
@@ -240,13 +285,27 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  ExpectNoHwOrCoopMatrix(disassembly);
-  ExpectSingleElementwiseLoop(disassembly);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %int"));
-  EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 1u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 8u : 1u, CountSubstring(disassembly, "OpSNegate %int"));
+    EXPECT_EQ(std::string::npos, disassembly.find("OpTypeVector %int 2"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersMatrixIAdd) {
@@ -725,19 +784,40 @@ OpReturn
 OpFunctionEnd
 )";
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_5"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightLogical %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightArithmetic %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftLeftLogical %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseOr %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseXor %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseAnd %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpNot %uint"));
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 7u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %uint %uint_5"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftRightLogical %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftRightArithmetic %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftLeftLogical %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseOr %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseXor %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseAnd %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpNot %uint"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersMixedWidthFloatVectorArithmeticPacked) {
@@ -867,17 +947,26 @@ OpFunctionEnd
   ASSERT_TRUE(tools.Assemble(text, &original_binary));
   ASSERT_TRUE(tools.Validate(original_binary));
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(5u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_GT(CountSubstring(disassembly, "OpIAdd"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpISub"), 0u);
-  EXPECT_GT(CountSubstring(disassembly, "OpIMul"), 0u);
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSDiv %int"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpSNegate %uint"));
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 5u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 5u : 6u, CountSubstring(disassembly, "OpIAdd %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpISub %int"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpIMul %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpSDiv %int"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpSNegate %uint"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersMixedSignednessIntegerMatrixArithmetic) {
@@ -958,16 +1047,28 @@ OpFunctionEnd
   ASSERT_TRUE(tools.Assemble(text, &original_binary));
   ASSERT_TRUE(tools.Validate(original_binary));
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(3u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightLogical %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftRightArithmetic %int"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpShiftLeftLogical %uint"));
-  EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %char %uint_5"));
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 3u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftRightLogical %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftRightArithmetic %int"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpShiftLeftLogical %uint"));
+    EXPECT_NE(std::string::npos, disassembly.find("OpTypeArray %char %uint_5"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersMixedSignednessBitwiseOps) {
@@ -1002,16 +1103,28 @@ OpFunctionEnd
   ASSERT_TRUE(tools.Assemble(text, &original_binary));
   ASSERT_TRUE(tools.Validate(original_binary));
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(4u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseOr %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseXor %int"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpBitwiseAnd %uint"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, "OpNot %int"));
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 4u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseOr %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseXor %int"));
+    EXPECT_EQ(unroll ? 5u : 1u,
+              CountSubstring(disassembly, "OpBitwiseAnd %uint"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, "OpNot %int"));
+  }
 }
 
 TEST_F(HwLowerToStandardTest, LowersIntegerExtInstAcrossSignedness) {
@@ -1049,18 +1162,185 @@ OpFunctionEnd
   ASSERT_TRUE(tools.Assemble(text, &original_binary));
   ASSERT_TRUE(tools.Validate(original_binary));
 
-  auto result =
-      SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true, true);
-  const std::string& disassembly = std::get<0>(result);
-  EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
-  ExpectNoHwOrCoopMatrix(disassembly);
-  EXPECT_EQ(6u, CountSubstring(disassembly, "OpLoopMerge"));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " UMin "));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " UMax "));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " UClamp "));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " SMin "));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " SMax "));
-  EXPECT_EQ(1u, CountSubstring(disassembly, " SClamp "));
+  for (bool unroll : {false, true}) {
+    SCOPED_TRACE(unroll);
+    auto result =
+        unroll ? SinglePassRunAndDisassemble<HwLowerToStandardPass>(text, true,
+                                                                    true)
+               : SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+                     text, true, true,
+                     HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                     HwLowerToStandardPass::CompletenessMode::kCooperativeOnly,
+                     0, 0, 2);
+    const std::string& disassembly = std::get<0>(result);
+    EXPECT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    ExpectNoHwOrCoopMatrix(disassembly);
+    EXPECT_EQ(unroll ? 0u : 6u, CountSubstring(disassembly, "OpLoopMerge"));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " UMin "));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " UMax "));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " UClamp "));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " SMin "));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " SMax "));
+    EXPECT_EQ(unroll ? 5u : 1u, CountSubstring(disassembly, " SClamp "));
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       IntegerVectorUnrollingHonorsConfiguredElementBudget) {
+  constexpr uint32_t kUnrollLimit = 8;
+  for (uint32_t bits : {8u, 16u, 32u}) {
+    for (uint32_t width : {kUnrollLimit - 1, kUnrollLimit, kUnrollLimit + 1}) {
+      SCOPED_TRACE(bits);
+      SCOPED_TRACE(width);
+      std::ostringstream module;
+      module << "OpCapability Shader\n";
+      if (bits < 32) module << "OpCapability Int" << bits << '\n';
+      module << R"(
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+)";
+      module << "%count = OpConstant %uint " << width << '\n';
+      module << "%component = OpTypeInt " << bits << " 1\n";
+      module << R"(
+%vec = OpTypeCooperativeVectorHW %component %count
+%a = OpUndef %vec
+%b = OpUndef %vec
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%product = OpIMul %vec %a %b
+OpReturn
+OpFunctionEnd
+)";
+      const std::string text = module.str();
+      SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+      std::vector<uint32_t> original_binary;
+      ASSERT_TRUE(tools.Assemble(text, &original_binary));
+      ASSERT_TRUE(tools.Validate(original_binary));
+
+      for (auto mode : {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                        HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+        SCOPED_TRACE(static_cast<int>(mode));
+        auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+            text, true, true, mode,
+            HwLowerToStandardPass::CompletenessMode::kExtensionFree, 0, 0,
+            kUnrollLimit);
+        ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+        const auto& out = std::get<0>(result);
+        ExpectNoHwOrCoopMatrix(out);
+        const bool unrolled = width <= kUnrollLimit;
+        EXPECT_EQ(unrolled ? 0u : 1u, CountSubstring(out, "OpLoopMerge"));
+        EXPECT_EQ(unrolled ? width : 1u, CountSubstring(out, "OpIMul "));
+        EXPECT_EQ(0u, CountSubstring(out, "OpTypeVector"));
+      }
+    }
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       IntegerMatrixElementwiseUnrollRequiresForceScalar) {
+  const std::string text = R"(
+OpCapability Shader
+OpCapability CooperativeMatrixHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_2 = OpConstant %uint 2
+%uint_3 = OpConstant %uint 3
+%int = OpTypeInt 32 1
+%mat = OpTypeCooperativeMatrixHW %int %uint_2 %uint_3
+%a = OpUndef %mat
+%b = OpUndef %mat
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%sum = OpIAdd %mat %a %b
+%product = OpIMul %mat %sum %b
+OpReturn
+OpFunctionEnd
+)";
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (auto mode : {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                    HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+    for (uint32_t limit : {5u, 6u, 7u}) {
+      SCOPED_TRACE(static_cast<int>(mode));
+      SCOPED_TRACE(limit);
+      auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+          text, true, true, mode,
+          HwLowerToStandardPass::CompletenessMode::kExtensionFree, 0, 0, limit);
+      ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+      const auto& out = std::get<0>(result);
+      ExpectNoHwOrCoopMatrix(out);
+      const bool unrolled =
+          mode == HwLowerToStandardPass::LoweringMode::kForceScalar &&
+          limit >= 6;
+      EXPECT_EQ(unrolled ? 0u : 2u, CountSubstring(out, "OpLoopMerge"));
+      EXPECT_EQ(unrolled ? 6u : 1u, CountSubstring(out, "OpIAdd %int"));
+      EXPECT_EQ(unrolled ? 6u : 1u, CountSubstring(out, "OpIMul %int"));
+    }
+  }
+}
+
+TEST_F(HwLowerToStandardTest,
+       SmallIntegerVectorLongChainDoesNotIntroduceControlFlow) {
+  constexpr uint32_t kOperations = 256;
+  constexpr uint32_t kWidth = 5;
+  std::ostringstream module;
+  module << R"(
+OpCapability Shader
+OpCapability CooperativeVectorHW
+OpExtension "SPV_HW_neural_shader"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%uint_5 = OpConstant %uint 5
+%int = OpTypeInt 32 1
+%vec = OpTypeCooperativeVectorHW %int %uint_5
+%value0 = OpUndef %vec
+%increment = OpUndef %vec
+%main = OpFunction %void None %fn
+%entry = OpLabel
+)";
+  for (uint32_t i = 1; i <= kOperations; ++i) {
+    module << "%value" << i << " = OpIAdd %vec %value" << i - 1
+           << " %increment\n";
+  }
+  module << "OpReturn\nOpFunctionEnd\n";
+  const std::string text = module.str();
+  SpirvTools tools(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original_binary;
+  ASSERT_TRUE(tools.Assemble(text, &original_binary));
+  ASSERT_TRUE(tools.Validate(original_binary));
+
+  for (auto mode : {HwLowerToStandardPass::LoweringMode::kPreferPackedVec2,
+                    HwLowerToStandardPass::LoweringMode::kForceScalar}) {
+    SCOPED_TRACE(static_cast<int>(mode));
+    auto result = SinglePassRunAndDisassemble<HwLowerToStandardPass>(
+        text, true, true, mode,
+        HwLowerToStandardPass::CompletenessMode::kExtensionFree);
+    ASSERT_EQ(Pass::Status::SuccessWithChange, std::get<1>(result));
+    const auto& out = std::get<0>(result);
+    ExpectNoHwOrCoopMatrix(out);
+    EXPECT_EQ(kOperations * kWidth, CountSubstring(out, "OpIAdd %int"));
+    EXPECT_EQ(1u, CountSubstring(out, "OpLabel"));
+    EXPECT_EQ(0u, CountSubstring(out, "OpLoopMerge"));
+    EXPECT_EQ(0u, CountSubstring(out, "OpVariable"));
+  }
 }
 
 // Generated from Test/spv.hw_extfree_precise_arithmetic.comp (WIDTH=4).

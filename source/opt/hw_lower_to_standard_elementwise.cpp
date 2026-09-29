@@ -370,17 +370,17 @@ bool HwLowerToStandardPass::LowerElementwiseWithLoop(Instruction* inst,
     return true;
   }
 
-  // Use the configured element budget for scalar floating-point arithmetic in
-  // either layout mode. A second, smaller cutoff caused odd-width vectors to
-  // materialize an array and a separate dynamic-index loop for every operation.
-  const uint32_t small_scalar_unroll_limit = max_unrolled_elements_;
-  const bool unroll_small_scalar_float =
+  // Use the configured element budget for all scalar vector components,
+  // including integers, and for force-scalar matrices. Materializing Function
+  // arrays and splitting a block into a new loop for each small operation makes
+  // long straight-line chains expensive to generate and validate. Preserve the
+  // same per-component operations as the loop path below; larger values still
+  // use that path instead of expanding past the configured budget.
+  const bool unroll_small_scalar =
       !result_packed &&
       (result_vector || lowering_mode_ == LoweringMode::kForceScalar) &&
-      (IsFloat16Type(result_component_type_id) ||
-       IsFloat32Type(result_component_type_id)) &&
-      result_piece_count <= small_scalar_unroll_limit;
-  if (unroll_small_scalar_float) {
+      result_piece_count <= max_unrolled_elements_;
+  if (unroll_small_scalar) {
     InstructionBuilder builder(
         context(), inst,
         IRContext::kAnalysisDefUse | IRContext::kAnalysisInstrToBlockMapping);
